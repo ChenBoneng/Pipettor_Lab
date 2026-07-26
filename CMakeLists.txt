@@ -58,10 +58,12 @@ function(include_sub_directories_recursively root_dir)
     endforeach()
 endfunction()
 
+include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/bsp)
 include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/modules)
 include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/MyTask)
 
 file(GLOB_RECURSE USER_SOURCES
+    "bsp/*.c"
     "modules/*.c"
     "MyTask/*.c"
 )
