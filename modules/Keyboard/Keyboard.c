@@ -1,9 +1,8 @@
 //
-// 创建时间：26-7-25
+// Created by lenovo on 26-7-26.
 //
 
-#include "Task.h"
-#include "cmsis_os2.h"
+#include "Keyboard.h"
 #include "main.h"
 
 /*
@@ -16,7 +15,6 @@
 #define KEYPAD_COL_COUNT         6U
 #define KEYPAD_DEBOUNCE_COUNT    4U
 #define KEYPAD_MULTIPLE_KEYS     0xFFU
-#define KEYPAD_SCAN_PERIOD_MS    1U
 
 typedef struct
 {
@@ -58,19 +56,19 @@ static const uint8_t keypad_map[KEYPAD_ROW_COUNT][KEYPAD_COL_COUNT] = {
 
 /*
  * 当前最终确认得到的按键序号记录在这里：
- * - 变量名：g_keypad_last_key
+ * - 变量名：g_keypad_now_key
  * - 取值 1-30：当前通过消抖确认的有效按键编号
  * - 取值 0：当前没有按键，或者当前状态不是单个有效按键
  *
  * 其他模块如果要读取“当前最终得到的键盘按键序号”，就读取这个变量。
  */
-volatile uint8_t g_keypad_last_key = 0U;
+static volatile uint8_t g_keypad_now_key = 0U;
 
 /*
  * 消抖状态：
  * keypad_candidate      当前候选按键；
  * keypad_stable_count   候选按键连续稳定出现的次数；
- * g_keypad_last_key     只在候选状态稳定后更新。
+ * g_keypad_now_key     只在候选状态稳定后更新。
  */
 static uint8_t keypad_candidate = 0U;
 static uint8_t keypad_stable_count = 0U;
@@ -147,16 +145,16 @@ static uint8_t Keypad_Scan_Raw(void)
     return detected_key;
 }
 
-static void Keypad_Init(void)
+void Keypad_Init(void)
 {
     Keypad_GPIO_Init();
 
-    g_keypad_last_key = 0U;
+    g_keypad_now_key = 0U;
     keypad_candidate = 0U;
     keypad_stable_count = 0U;
 }
 
-static void Keypad_Process(void)
+void Keypad_Process(void)
 {
     const uint8_t raw_key = Keypad_Scan_Raw();
     uint8_t stable_key = 0U;
@@ -189,29 +187,23 @@ static void Keypad_Process(void)
     }
 
     /*
-     * g_keypad_last_key 表示“当前稳定按键”：
+     * g_keypad_now_key 表示“当前稳定按键”：
      * - 稳定无按键时写 0；
      * - 稳定单键时写对应编号；
      * - 多键或无效状态时也写 0，避免保留上一次按键。
      */
-    if (g_keypad_last_key != stable_key)
+    if (g_keypad_now_key != stable_key)
     {
-        g_keypad_last_key = stable_key;
+        g_keypad_now_key = stable_key;
     }
 }
 
-
-void KeyboardTask(void *argument)
+/*
+ * @brief 获取当前稳定的按键编号
+ * @return uint8_t 当前稳定按键编号，1-30 表示有效按键，0 表示无按键或多键状态
+ */
+uint8_t Keypad_GetNowKey()
 {
-    (void)argument;
-
-    Keypad_Init();
-
-    for(;;)
-    {
-        /* 每 1ms 扫描一次，连续 4 次稳定后确认按键。 */
-        Keypad_Process();
-        osDelay(KEYPAD_SCAN_PERIOD_MS);
-    }
-
+    return g_keypad_now_key;
 }
+

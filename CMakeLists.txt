@@ -58,10 +58,12 @@ function(include_sub_directories_recursively root_dir)
     endforeach()
 endfunction()
 
-include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}Task)
+include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/modules)
+include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/MyTask)
 
 file(GLOB_RECURSE USER_SOURCES
-    "Task/*.c"
+    "modules/*.c"
+    "MyTask/*.c"
 )
 
 # Add sources to executable
