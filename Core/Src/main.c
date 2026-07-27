@@ -108,14 +108,14 @@ int main(void)
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 32768U);
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  LCD12864_Init();
-  LCD12864_Fill(0xFFU);
-  HAL_Delay(2000U);
-  LCD12864_Clear();
-  LCD12864_WriteString(0U, 0U, "Pipettor Lab");
-  LCD12864_WriteString(1U, 0U, "LCD12864 OK");
-  LCD12864_WriteString(2U, 0U, "PC0 CS  PC1 SID");
-  LCD12864_WriteString(3U, 0U, "PC2 CLK PC3 RST");
+  // LCD12864_Init();
+  // LCD12864_Fill(0xFFU);
+  // HAL_Delay(2000U);
+  // LCD12864_Clear();
+  // LCD12864_WriteString(0U, 0U, "Pipettor Lab");
+  // LCD12864_WriteString(1U, 0U, "LCD12864 OK");
+  // LCD12864_WriteString(2U, 0U, "PC0 CS  PC1 SID");
+  // LCD12864_WriteString(3U, 0U, "PC2 CLK PC3 RST");
 
   //全局唯一初始化函数
   AllTaskInit();

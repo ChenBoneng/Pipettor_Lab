@@ -15,6 +15,7 @@ void AllTaskInit(void)
     DWT_Init(72); // 初始化DWT,用于获取时间间隔
     Keypad_Init();
     Communication_Init();
+    MachineInit();
 }
 
 
