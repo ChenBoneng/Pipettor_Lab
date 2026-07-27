@@ -39,7 +39,10 @@ void MachineTask(void *argument)
     for (;;)
     {
         /* 处理机器人的状态机逻辑 */
-        MachineControl();
+        // MachineControl();
+
+
+        DWT_SysTimeUpdate();
         osDelay(2); // 每 2ms 执行一次
     }
 }

@@ -20,34 +20,27 @@
 #define MACHINE_TEST_FORWARD_STEPS    ((MACHINE_TEST_SPEED_PPS * MACHINE_TEST_FORWARD_MS) / 1000U)
 #define MACHINE_TEST_REVERSE_STEPS    ((MACHINE_TEST_SPEED_PPS * MACHINE_TEST_REVERSE_MS) / 1000U)
 #define MACHINE_PUMP_DEVICE_ID        1U
+#define MACHINE_CMD_GAP_MS            50U
+#define MACHINE_TEST_REPEAT_COUNT     5U
+#define MACHINE_MS_TO_SECOND          0.001f
 
 /*
  * 如果你的 ISC1000 接的是 RS485 总线，把这里改成 PUMP_DRIVE_BUS_RS485。
- * 当前先按点对点串口模式处理，命令格式为：set spd=2000\n。
+ * 当前使用 RS485 模式，命令格式为：1 set spd=2000\n。
  */
 #define MACHINE_PUMP_BUS_MODE         PUMP_DRIVE_BUS_RS485
 
-typedef enum
-{
-    MACHINE_TEST_STATE_IDLE = 0,       // 空闲状态，通常表示初始化失败或测试未开始
-    MACHINE_TEST_STATE_FORWARD_START,  // 发送正转命令
-    MACHINE_TEST_STATE_FORWARD_WAIT,   // 等待正转 2 秒结束
-    MACHINE_TEST_STATE_STOP_WAIT,      // 中间停止 1 秒
-    MACHINE_TEST_STATE_REVERSE_START,  // 发送反转命令
-    MACHINE_TEST_STATE_REVERSE_WAIT,   // 等待反转 2 秒结束
-    MACHINE_TEST_STATE_FINISHED,       // 测试完成，保持停止
-} MachineTestState_e;
-
 static PumpDrive_s machine_pump;
-static MachineTestState_e machine_test_state = MACHINE_TEST_STATE_IDLE;
-static uint32_t machine_state_start_ms = 0U;
 static uint8_t machine_pump_ready = 0U;
+static uint8_t machine_test_finished = 0U;
 
-static uint8_t Machine_IsTimeReached(uint32_t duration_ms)
+static void Machine_DelayMs(uint32_t delay_ms)
 {
-    uint32_t now_ms = (uint32_t)DWT_GetTimeline_ms();
-
-    return ((uint32_t)(now_ms - machine_state_start_ms) >= duration_ms) ? 1U : 0U;
+    /*
+     * 本测试明确要求使用 DWT 模块做时间延时。
+     * DWT_Delay() 的单位是秒，所以这里把毫秒转换成秒。
+     */
+    DWT_Delay((float)delay_ms * MACHINE_MS_TO_SECOND);
 }
 
 void MachineInit(void)
@@ -62,82 +55,61 @@ void MachineInit(void)
 
     if (machine_pump_ready == 0U)
     {
-        machine_test_state = MACHINE_TEST_STATE_IDLE;
         return;
     }
-
-    /*
-     * 上电后先使能电机并设置测试速度。
-     * 后续正反转都使用同一个 2000pps 速度。
-     */
-    (void)PumpDrive_Enable(&machine_pump);
-    (void)PumpDrive_SetSpeed(&machine_pump, MACHINE_TEST_SPEED_PPS);
-
-    machine_state_start_ms = (uint32_t)DWT_GetTimeline_ms();
-    machine_test_state = MACHINE_TEST_STATE_FORWARD_START;
 }
 
 
 void MachineControl(void)
 {
-    if (machine_pump_ready == 0U)
+    if ((machine_pump_ready == 0U) || (machine_test_finished != 0U))
     {
         return;
     }
 
-    switch (machine_test_state)
+    /*
+     * 这是一次性电机测试流程，不做复杂状态机：
+     * 1. 任务启动后先使能电机；
+     * 2. 设置目标速度为 2000pps；
+     * 3. 循环 5 次执行：正转 4000 步 -> 停止 1 秒 -> 反转 4000 步；
+     * 4. 最后发送停止命令并结束测试，不重复执行。
+     *
+     * 命令之间保留 50ms 间隔，是为了让 ISC1000 有时间解析上一条 ASCII 命令，
+     * 避免连续发送过快时后一条命令被驱动器忽略。
+     */
+    machine_test_finished = 1U;
+
+    (void)PumpDrive_Enable(&machine_pump);
+    Machine_DelayMs(MACHINE_CMD_GAP_MS);
+
+    (void)PumpDrive_SetSpeed(&machine_pump, MACHINE_TEST_SPEED_PPS);
+    Machine_DelayMs(MACHINE_CMD_GAP_MS);
+
+    for (uint8_t i = 0U; i < MACHINE_TEST_REPEAT_COUNT; i++)
     {
-    case MACHINE_TEST_STATE_FORWARD_START:
         /*
-         * 正转测试：2000pps * 2s = 4000 step。
-         * 使用步数命令比“发送后强行延时再急停”更清楚，也更符合驱动器协议。
+         * out 4000 是定步正转运动，2000pps 下理论运行 2 秒。
+         * 驱动器完成定步运动后会自动停止，所以这里不额外发送 stp 0。
          */
         (void)PumpDrive_MoveOut(&machine_pump, MACHINE_TEST_FORWARD_STEPS);
-        machine_state_start_ms = (uint32_t)DWT_GetTimeline_ms();
-        machine_test_state = MACHINE_TEST_STATE_FORWARD_WAIT;
-        break;
+        Machine_DelayMs(MACHINE_TEST_FORWARD_MS);
 
-    case MACHINE_TEST_STATE_FORWARD_WAIT:
-        if (Machine_IsTimeReached(MACHINE_TEST_FORWARD_MS) != 0U)
-        {
-            /*
-             * 正转时间到后发送减速停止命令。
-             * 理论上 4000 step 已经正好跑完，这里再发 stop 是为了让测试状态明确进入停止段。
-             */
-            (void)PumpDrive_Stop(&machine_pump, 0U);
-            machine_state_start_ms = (uint32_t)DWT_GetTimeline_ms();
-            machine_test_state = MACHINE_TEST_STATE_STOP_WAIT;
-        }
-        break;
+        /* 正转结束后保持停止 1 秒，再切换到反转。 */
+        Machine_DelayMs(MACHINE_TEST_STOP_MS);
 
-    case MACHINE_TEST_STATE_STOP_WAIT:
-        if (Machine_IsTimeReached(MACHINE_TEST_STOP_MS) != 0U)
-        {
-            machine_test_state = MACHINE_TEST_STATE_REVERSE_START;
-        }
-        break;
-
-    case MACHINE_TEST_STATE_REVERSE_START:
-        /* 反转测试：仍然是 2000pps，持续 2 秒，对应 4000 step。 */
+        /* in 4000 是定步反转运动，2000pps 下理论运行 2 秒。 */
         (void)PumpDrive_MoveIn(&machine_pump, MACHINE_TEST_REVERSE_STEPS);
-        machine_state_start_ms = (uint32_t)DWT_GetTimeline_ms();
-        machine_test_state = MACHINE_TEST_STATE_REVERSE_WAIT;
-        break;
+        Machine_DelayMs(MACHINE_TEST_REVERSE_MS);
 
-    case MACHINE_TEST_STATE_REVERSE_WAIT:
-        if (Machine_IsTimeReached(MACHINE_TEST_REVERSE_MS) != 0U)
+        /*
+         * 如果还要进入下一轮，反转结束后也停 1 秒再重新正转。
+         * 这样每次换向前都有明确的静止间隔，减少驱动器忙状态下漏命令的概率。
+         */
+        if (i < (MACHINE_TEST_REPEAT_COUNT - 1U))
         {
-            (void)PumpDrive_Stop(&machine_pump, 0U);
-            machine_test_state = MACHINE_TEST_STATE_FINISHED;
+            Machine_DelayMs(MACHINE_TEST_STOP_MS);
         }
-        break;
-
-    case MACHINE_TEST_STATE_FINISHED:
-        /* 测试完成后保持停止状态，不重复发送命令。 */
-        break;
-
-    case MACHINE_TEST_STATE_IDLE:
-    default:
-        break;
     }
+
+    (void)PumpDrive_Stop(&machine_pump, 0U);
 }
