@@ -3,3 +3,15 @@
 //
 
 #include "machine.h"
+
+
+void MachineInit(void)
+{
+
+}
+
+
+void MachineControl(void)
+{
+
+}

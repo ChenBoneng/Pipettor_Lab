@@ -18,17 +18,16 @@
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
-#include "can.h"
 #include "FreeRTOS.h"
 #include "task.h"
 #include "main.h"
 #include "cmsis_os.h"
-#include "tim.h"
-#include "usart.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "can.h"
+#include "tim.h"
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -63,6 +62,13 @@ const osThreadAttr_t StartKeyboardTa_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
+/* Definitions for StartMachineTas */
+osThreadId_t StartMachineTasHandle;
+const osThreadAttr_t StartMachineTas_attributes = {
+  .name = "StartMachineTas",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -78,6 +84,7 @@ static void Buzzer_Off(void);
 /* USER CODE END FunctionPrototypes */
 
 void KeyboardTask(void *argument);
+void MachineTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -111,6 +118,9 @@ void MX_FREERTOS_Init(void) {
   /* creation of StartKeyboardTa */
   StartKeyboardTaHandle = osThreadNew(KeyboardTask, NULL, &StartKeyboardTa_attributes);
 
+  /* creation of StartMachineTas */
+  StartMachineTasHandle = osThreadNew(MachineTask, NULL, &StartMachineTas_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -137,6 +147,24 @@ __weak void KeyboardTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END KeyboardTask */
+}
+
+/* USER CODE BEGIN Header_MachineTask */
+/**
+* @brief Function implementing the StartMachineTas thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_MachineTask */
+__weak void MachineTask(void *argument)
+{
+  /* USER CODE BEGIN MachineTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END MachineTask */
 }
 
 /* Private application code --------------------------------------------------*/

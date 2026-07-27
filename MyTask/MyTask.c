@@ -8,6 +8,7 @@
 #include "main.h"
 #include "Keyboard.h"
 #include "Communication.h"
+#include "machine.h"
 
 void AllTaskInit(void)
 {
@@ -28,4 +29,16 @@ void KeyboardTask(void *argument)
         osDelay(1);
     }
 
+}
+
+void MachineTask(void *argument)
+{
+    (void)argument;
+
+    for (;;)
+    {
+        /* 处理机器人的状态机逻辑 */
+        MachineControl();
+        osDelay(2); // 每 2ms 执行一次
+    }
 }

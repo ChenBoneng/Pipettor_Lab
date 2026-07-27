@@ -5,4 +5,7 @@
 #ifndef MACHINE_H
 #define MACHINE_H
 
+void MachineControl(void);
+
+
 #endif //MACHINE_H
