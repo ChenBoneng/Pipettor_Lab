@@ -7,4 +7,8 @@
 
 #include <stdint.h>
 
+//所有任务的初始化，主函数唯一调用的初始化函数
+void AllTaskInit(void);
+
+
 #endif

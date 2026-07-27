@@ -3,19 +3,23 @@
 //
 
 #include "MyTask.h"
+#include "bsp_dwt.h"
 #include "cmsis_os2.h"
 #include "main.h"
 #include "Keyboard.h"
 #include "Communication.h"
 
+void AllTaskInit(void)
+{
+    DWT_Init(72); // 初始化DWT,用于获取时间间隔
+    Keypad_Init();
+    Communication_Init();
+}
 
 
 void KeyboardTask(void *argument)
 {
     (void)argument;
-
-    Keypad_Init();
-    Communication_Init();
 
     for(;;)
     {
