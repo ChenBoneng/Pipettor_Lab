@@ -6,6 +6,7 @@
 #include "cmsis_os2.h"
 #include "main.h"
 #include "Keyboard.h"
+#include "Communication.h"
 
 
 
@@ -14,6 +15,7 @@ void KeyboardTask(void *argument)
     (void)argument;
 
     Keypad_Init();
+    Communication_Init();
 
     for(;;)
     {
