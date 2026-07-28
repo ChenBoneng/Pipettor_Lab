@@ -13,7 +13,8 @@
  */
 #define KEYPAD_ROW_COUNT         5U
 #define KEYPAD_COL_COUNT         6U
-#define KEYPAD_DEBOUNCE_COUNT    4U
+#define KEYPAD_PRESS_DEBOUNCE_COUNT    8U
+#define KEYPAD_RELEASE_DEBOUNCE_COUNT  30U
 #define KEYPAD_MULTIPLE_KEYS     0xFFU
 
 typedef struct
@@ -63,15 +64,80 @@ static const uint8_t keypad_map[KEYPAD_ROW_COUNT][KEYPAD_COL_COUNT] = {
  * 其他模块如果要读取“当前最终得到的键盘按键序号”，就读取这个变量。
  */
 static volatile uint8_t g_keypad_now_key = 0U;
+static volatile KeypadState_e g_keypad_now_state = KEYPAD_STATE_NONE;
+static volatile KeypadState_e g_keypad_pressed_state = KEYPAD_STATE_NONE;
 
 /*
  * 消抖状态：
  * keypad_candidate      当前候选按键；
  * keypad_stable_count   候选按键连续稳定出现的次数；
+ * keypad_press_locked   已经确认一次按下后锁定，必须稳定释放后才允许下一次按下；
  * g_keypad_now_key     只在候选状态稳定后更新。
  */
 static uint8_t keypad_candidate = 0U;
 static uint8_t keypad_stable_count = 0U;
+static uint8_t keypad_press_locked = 0U;
+
+static KeypadState_e Keypad_KeyToState(uint8_t key)
+{
+    switch (key)
+    {
+    case 1U:
+        return KEYPAD_STATE_IN_TANK;
+    case 2U:
+        return KEYPAD_STATE_OUT_TANK;
+    case 3U:
+        return KEYPAD_STATE_NUM_7;
+    case 4U:
+        return KEYPAD_STATE_NUM_8;
+    case 5U:
+        return KEYPAD_STATE_NUM_9;
+    case 6U:
+        return KEYPAD_STATE_NUM_0;
+    case 7U:
+        return KEYPAD_STATE_FAULT;
+    case 8U:
+        return KEYPAD_STATE_DRAW_MEDICINE;
+    case 9U:
+        return KEYPAD_STATE_PREPARE_MEDICINE;
+    case 10U:
+        return KEYPAD_STATE_SEND_MEDICINE;
+    case 11U:
+        return KEYPAD_STATE_EXHAUST_FIXED;
+    case 12U:
+        return KEYPAD_STATE_CLEAR_ALL;
+    case 13U:
+        return KEYPAD_STATE_INSERT_NEEDLE;
+    case 14U:
+        return KEYPAD_STATE_RETRACT_NEEDLE;
+    case 15U:
+        return KEYPAD_STATE_NUM_4;
+    case 16U:
+        return KEYPAD_STATE_NUM_5;
+    case 17U:
+        return KEYPAD_STATE_NUM_6;
+    case 18U:
+        return KEYPAD_STATE_DOT;
+    case 21U:
+        return KEYPAD_STATE_NUM_1;
+    case 22U:
+        return KEYPAD_STATE_NUM_2;
+    case 23U:
+        return KEYPAD_STATE_NUM_3;
+    case 24U:
+        return KEYPAD_STATE_CLEAR_INPUT;
+    case 25U:
+        return KEYPAD_STATE_RESET;
+    case 26U:
+        return KEYPAD_STATE_START;
+    case 27U:
+        return KEYPAD_STATE_PAUSE;
+    case 28U:
+        return KEYPAD_STATE_REMOTE;
+    default:
+        return KEYPAD_STATE_NONE;
+    }
+}
 
 static void Keypad_GPIO_Init(void)
 {
@@ -150,19 +216,31 @@ void Keypad_Init(void)
     Keypad_GPIO_Init();
 
     g_keypad_now_key = 0U;
+    g_keypad_now_state = KEYPAD_STATE_NONE;
+    g_keypad_pressed_state = KEYPAD_STATE_NONE;
     keypad_candidate = 0U;
     keypad_stable_count = 0U;
+    keypad_press_locked = 0U;
 }
 
 void Keypad_Process(void)
 {
     const uint8_t raw_key = Keypad_Scan_Raw();
     uint8_t stable_key = 0U;
+    uint8_t debounce_count = KEYPAD_PRESS_DEBOUNCE_COUNT;
 
     /*
      * 消抖原则：
-     * 只有连续 KEYPAD_DEBOUNCE_COUNT 次扫描结果相同，
+     * 只有连续多次扫描结果相同，
      * 才认为这个按键状态稳定。
+     *
+     * 按下和释放分开处理：
+     * - 按下需要连续 KEYPAD_PRESS_DEBOUNCE_COUNT 次稳定；
+     * - 释放需要连续 KEYPAD_RELEASE_DEBOUNCE_COUNT 次稳定。
+     *
+     * 25 号复位键之前偶发“一次按下识别多次”，本质上是机械抖动过程中
+     * 出现了短暂释放再按下。这里要求必须稳定释放后才解锁下一次按下，
+     * 可以避免同一次物理按压被上层判断成多次。
      */
     if (raw_key != keypad_candidate)
     {
@@ -171,12 +249,43 @@ void Keypad_Process(void)
         return;
     }
 
-    if (keypad_stable_count < KEYPAD_DEBOUNCE_COUNT)
+    if (keypad_candidate == 0U)
+    {
+        debounce_count = KEYPAD_RELEASE_DEBOUNCE_COUNT;
+    }
+
+    if (keypad_stable_count < debounce_count)
     {
         keypad_stable_count++;
     }
 
-    if (keypad_stable_count < KEYPAD_DEBOUNCE_COUNT)
+    if (keypad_stable_count < debounce_count)
+    {
+        return;
+    }
+
+    if (keypad_candidate == 0U)
+    {
+        /*
+         * 只有稳定无按键达到释放消抖次数，才认为本次按压结束。
+         * 释放完成后解锁，下一次按下才能重新被识别。
+         */
+        g_keypad_now_key = 0U;
+        g_keypad_now_state = KEYPAD_STATE_NONE;
+        keypad_press_locked = 0U;
+        return;
+    }
+
+    if (keypad_candidate == KEYPAD_MULTIPLE_KEYS)
+    {
+        /*
+         * 多键或鬼键不当作有效按键，也不当作稳定释放。
+         * 这样按键抖动过程中短暂扫到多键，不会清掉当前按下状态。
+         */
+        return;
+    }
+
+    if (keypad_press_locked != 0U)
     {
         return;
     }
@@ -195,6 +304,9 @@ void Keypad_Process(void)
     if (g_keypad_now_key != stable_key)
     {
         g_keypad_now_key = stable_key;
+        g_keypad_now_state = Keypad_KeyToState(stable_key);
+        g_keypad_pressed_state = g_keypad_now_state;
+        keypad_press_locked = 1U;
     }
 }
 
@@ -207,3 +319,23 @@ uint8_t Keypad_GetNowKey()
     return g_keypad_now_key;
 }
 
+/*
+ * @brief 获取当前稳定按键对应的功能枚举
+ * @return KeypadState_e 当前按键功能，KEYPAD_STATE_NONE 表示没有按键或未映射功能
+ */
+KeypadState_e Keypad_GetNowState(void)
+{
+    return g_keypad_now_state;
+}
+
+/*
+ * @brief 获取一次稳定按下事件对应的功能枚举
+ * @return KeypadState_e 当前按下事件，读取后清除；没有新按下事件时返回 KEYPAD_STATE_NONE
+ */
+KeypadState_e Keypad_GetPressedState(void)
+{
+    KeypadState_e state = g_keypad_pressed_state;
+
+    g_keypad_pressed_state = KEYPAD_STATE_NONE;
+    return state;
+}
