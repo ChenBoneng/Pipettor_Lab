@@ -104,10 +104,6 @@ int main(void)
   MX_USB_PCD_Init();
   /* USER CODE BEGIN 2 */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 32768U);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 32768U);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
   // LCD12864_Init();
   // LCD12864_Fill(0xFFU);
   // HAL_Delay(2000U);

@@ -50,7 +50,7 @@ function(include_sub_directories_recursively root_dir)
         include_directories(${root_dir})
     endif()
 
-    file(GLOB ALL_SUB RELATIVE ${root_dir} ${root_dir}/*) # 获得当前目录下的所有文件，让如ALL_SUB列表中
+    file(GLOB ALL_SUB CONFIGURE_DEPENDS RELATIVE ${root_dir} ${root_dir}/*) # 获得当前目录下的所有文件，让如ALL_SUB列表中
     foreach(sub ${ALL_SUB})
         if (IS_DIRECTORY ${root_dir}/${sub})
             include_sub_directories_recursively(${root_dir}/${sub}) # 对子目录递归调用，包含
@@ -63,7 +63,7 @@ include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/modules)
 include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/application)
 include_sub_directories_recursively(${CMAKE_CURRENT_SOURCE_DIR}/MyTask)
 
-file(GLOB_RECURSE USER_SOURCES
+file(GLOB_RECURSE USER_SOURCES CONFIGURE_DEPENDS
     "bsp/*.c"
     "modules/*.c"
     "application/*.c"
