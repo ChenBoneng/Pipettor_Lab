@@ -19,6 +19,23 @@
 #define STEP_MOTOR_DIR_SETUP_DELAY_S   0.000010f
 #define STEP_MOTOR_MIN_PULSE_TICKS     4UL
 
+/*
+ * 位移换算校准值。
+ *
+ * 实测条件：
+ * - 驱动器细分数：1600 脉冲/圈；
+ * - 发送脉冲数：12000；
+ * - 实际移动距离：28.54mm = 28540um。
+ *
+ * 因此：
+ * - 脉冲/毫米 = 12000 / 28.54 ≈ 420.46 pulse/mm；
+ * - 应用层不直接使用浮点数，而是统一换算到 um 后用整数计算。
+ */
+#define STEP_MOTOR_CALIBRATION_PULSES       12000UL
+#define STEP_MOTOR_CALIBRATION_DISTANCE_UM  28540UL
+#define STEP_MOTOR_MM_X100_TO_UM            10UL
+#define STEP_MOTOR_CM_X100_TO_UM            100UL
+
 typedef struct
 {
     GPIO_TypeDef *dir_plus_port;
@@ -40,6 +57,8 @@ static uint8_t step_motor_inited = 0U;
 static uint8_t StepMotor_IsValidId(StepMotorId_e motor);
 static uint32_t StepMotor_GetTIM2ClockHz(void);
 static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel);
+static uint32_t StepMotor_UmToSteps(uint32_t distance_um);
+static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s);
 static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e direction);
 static void StepMotor_StopOutput(StepMotorId_e motor);
 static uint8_t StepMotor_Start(StepMotorId_e motor,
@@ -137,6 +156,43 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel)
     __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE | TIM_FLAG_CC1 | TIM_FLAG_CC2);
 
     return 1U;
+}
+
+/**
+ * @brief 把微米距离换算成脉冲数。
+ *
+ * @param distance_um 目标距离，单位 um。
+ * @return 换算后的脉冲数。
+ *
+ * @note 公式：steps = distance_um * 12000 / 28540。
+ *       这里加上除数的一半做四舍五入，减少整数截断误差。
+ */
+static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
+{
+    uint64_t numerator;
+
+    numerator = (uint64_t)distance_um * STEP_MOTOR_CALIBRATION_PULSES;
+    numerator += STEP_MOTOR_CALIBRATION_DISTANCE_UM / 2U;
+
+    return (uint32_t)(numerator / STEP_MOTOR_CALIBRATION_DISTANCE_UM);
+}
+
+/**
+ * @brief 把微米每秒速度换算成 PPS。
+ *
+ * @param speed_um_s 目标速度，单位 um/s。
+ * @return 换算后的 PPS。
+ *
+ * @note 公式：pps = speed_um_s * 12000 / 28540。
+ */
+static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s)
+{
+    uint64_t numerator;
+
+    numerator = (uint64_t)speed_um_s * STEP_MOTOR_CALIBRATION_PULSES;
+    numerator += STEP_MOTOR_CALIBRATION_DISTANCE_UM / 2U;
+
+    return (uint32_t)(numerator / STEP_MOTOR_CALIBRATION_DISTANCE_UM);
 }
 
 /**
@@ -296,6 +352,58 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
     }
 
     return StepMotor_Start(motor, direction, speed_pps, steps);
+}
+
+uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100)
+{
+    return StepMotor_UmToSteps(distance_mm_x100 * STEP_MOTOR_MM_X100_TO_UM);
+}
+
+uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100)
+{
+    return StepMotor_UmPerSecToPps(speed_mm_s_x100 * STEP_MOTOR_MM_X100_TO_UM);
+}
+
+uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
+                                    StepMotorDirection_e direction,
+                                    uint32_t distance_mm_x100,
+                                    uint32_t speed_mm_s_x100)
+{
+    uint32_t steps;
+    uint32_t speed_pps;
+
+    steps = StepMotor_MmX100ToSteps(distance_mm_x100);
+    speed_pps = StepMotor_MmPerSecX100ToPps(speed_mm_s_x100);
+
+    if ((steps == 0U) || (speed_pps == 0U))
+    {
+        return 0U;
+    }
+
+    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
+}
+
+uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
+                                    StepMotorDirection_e direction,
+                                    uint32_t distance_cm_x100,
+                                    uint32_t speed_cm_s_x100)
+{
+    uint32_t distance_um;
+    uint32_t speed_um_s;
+    uint32_t steps;
+    uint32_t speed_pps;
+
+    distance_um = distance_cm_x100 * STEP_MOTOR_CM_X100_TO_UM;
+    speed_um_s = speed_cm_s_x100 * STEP_MOTOR_CM_X100_TO_UM;
+    steps = StepMotor_UmToSteps(distance_um);
+    speed_pps = StepMotor_UmPerSecToPps(speed_um_s);
+
+    if ((steps == 0U) || (speed_pps == 0U))
+    {
+        return 0U;
+    }
+
+    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
 }
 
 void StepMotor_Stop(StepMotorId_e motor)

@@ -38,11 +38,20 @@ typedef enum
  * DM542 的 DIR 信号本质上只区分高低电平，实际正反方向还受电机接线影响。
  * 如果发现方向与机械定义相反，优先对调电机其中一相接线，或在本模块中
  * 调换对应方向的 GPIO 电平。
+ *
+ * 当前机械语义约定：
+ * - 正向等价于“拉”；
+ * - 反向等价于“推”。
+ *
+ * 因此业务层建议优先使用 STEP_MOTOR_DIR_PULL / STEP_MOTOR_DIR_PUSH，
+ * 少直接使用 FORWARD / REVERSE，避免阅读代码时还要再翻译机械动作。
  */
 typedef enum
 {
-    STEP_MOTOR_DIR_FORWARD = 0, /**< 正向：DIR+ 输出高电平，DIR- 输出低电平。 */
-    STEP_MOTOR_DIR_REVERSE      /**< 反向：DIR+ 输出低电平，DIR- 输出高电平。 */
+    STEP_MOTOR_DIR_FORWARD = 0,              /**< 正向：DIR+ 输出高电平，DIR- 输出低电平，机械动作定义为拉。 */
+    STEP_MOTOR_DIR_REVERSE = 1,              /**< 反向：DIR+ 输出低电平，DIR- 输出高电平，机械动作定义为推。 */
+    STEP_MOTOR_DIR_PULL = STEP_MOTOR_DIR_FORWARD, /**< 拉：业务语义方向，等价于当前正向。 */
+    STEP_MOTOR_DIR_PUSH = STEP_MOTOR_DIR_REVERSE, /**< 推：业务语义方向，等价于当前反向。 */
 } StepMotorDirection_e;
 
 /**
@@ -109,6 +118,59 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            StepMotorDirection_e direction,
                            uint32_t speed_pps,
                            uint32_t steps);
+
+/**
+ * @brief 把距离从 0.01mm 单位换算成脉冲数。
+ *
+ * @param distance_mm_x100 目标距离，单位 0.01mm。比如 2854 表示 28.54mm。
+ * @return 换算后的脉冲数。
+ *
+ * @note 当前换算基于实测结果：驱动器细分 1600 时，12000 个脉冲移动 28.54mm。
+ */
+uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100);
+
+/**
+ * @brief 把速度从 0.01mm/s 单位换算成 PPS。
+ *
+ * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 357 表示 3.57mm/s。
+ * @return 换算后的 PPS，即每秒需要输出的脉冲数。
+ *
+ * @note 当前换算基于实测结果：驱动器细分 1600 时，12000 个脉冲移动 28.54mm。
+ */
+uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
+
+/**
+ * @brief 按毫米距离和毫米每秒速度运行指定电机。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
+ * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。
+ * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 1500 表示 15.00mm/s。
+ * @return 1 表示启动成功；0 表示参数错误、换算结果为 0 或电机启动失败。
+ *
+ * @note 本函数非阻塞。内部会把距离换算成 steps，把速度换算成 pps，
+ *       再调用 StepMotor_RunSteps() 输出实际脉冲。
+ */
+uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
+                                    StepMotorDirection_e direction,
+                                    uint32_t distance_mm_x100,
+                                    uint32_t speed_mm_s_x100);
+
+/**
+ * @brief 按厘米距离和厘米每秒速度运行指定电机。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
+ * @param distance_cm_x100 目标距离，单位 0.01cm。比如 300 表示 3.00cm。
+ * @param speed_cm_s_x100 目标速度，单位 0.01cm/s。比如 150 表示 1.50cm/s。
+ * @return 1 表示启动成功；0 表示参数错误、换算结果为 0 或电机启动失败。
+ *
+ * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。
+ */
+uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
+                                    StepMotorDirection_e direction,
+                                    uint32_t distance_cm_x100,
+                                    uint32_t speed_cm_s_x100);
 
 /**
  * @brief 停止指定电机。
