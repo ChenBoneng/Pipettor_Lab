@@ -41,7 +41,7 @@ void MachineTask(void *argument)
     for (;;)
     {
         /* 处理机器人的状态机逻辑 */
-        // MachineControl();
+        MachineControl();
 
 
         DWT_SysTimeUpdate();
