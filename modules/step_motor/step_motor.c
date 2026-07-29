@@ -20,19 +20,36 @@
 #define STEP_MOTOR_MIN_PULSE_TICKS     4UL
 
 /*
- * 位移换算校准值。
+ * 梯形加减速参数。
  *
- * 实测条件：
+ * 当前策略：
+ * - 从 STEP_MOTOR_START_PPS 起步，避免电机从 0 直接跳到目标速度；
+ * - 每 STEP_MOTOR_ACC_UPDATE_MS 调整一次速度；
+ * - 每次调整 STEP_MOTOR_ACC_STEP_PPS；
+ * - 接近目标步数时按同样斜率减速。
+ */
+#define STEP_MOTOR_START_PPS           200UL
+#define STEP_MOTOR_ACC_STEP_PPS        50UL
+#define STEP_MOTOR_ACC_UPDATE_MS       10UL
+
+/*
+ * 丝杆位移换算参数。
+ *
+ * 已确认机械数据：
  * - 驱动器细分数：1600 脉冲/圈；
- * - 发送脉冲数：12000；
- * - 实际移动距离：28.54mm = 28540um。
+ * - 丝杆导程：4mm/圈，也就是电机转 1 圈滑台移动 4mm；
+ * - 电机 A 所在滑台有效行程：100mm；
+ * - 电机 B 所在滑台有效行程：150mm。
  *
  * 因此：
- * - 脉冲/毫米 = 12000 / 28.54 ≈ 420.46 pulse/mm；
+ * - 脉冲/毫米 = 1600 / 4 = 400 pulse/mm；
+ * - 30mm 位移 = 30 * 400 = 12000 pulse；
  * - 应用层不直接使用浮点数，而是统一换算到 um 后用整数计算。
  */
-#define STEP_MOTOR_CALIBRATION_PULSES       12000UL
-#define STEP_MOTOR_CALIBRATION_DISTANCE_UM  28540UL
+#define STEP_MOTOR_DRIVER_MICROSTEP_PPR     1600UL
+#define STEP_MOTOR_SCREW_LEAD_UM            4000UL
+#define STEP_MOTOR_A_TRAVEL_UM              100000UL
+#define STEP_MOTOR_B_TRAVEL_UM              150000UL
 #define STEP_MOTOR_MM_X100_TO_UM            10UL
 #define STEP_MOTOR_CM_X100_TO_UM            100UL
 
@@ -45,18 +62,37 @@ typedef struct
     uint32_t tim_channel;
 } StepMotorHw_s;
 
+typedef struct
+{
+    uint8_t enabled;          // 1 表示当前需要 StepMotor_Process() 调整速度
+    uint32_t target_speed_pps; // 应用层要求的目标速度
+    uint32_t current_speed_pps; // 当前实际输出速度
+    uint32_t last_update_ms;   // 上一次调整速度的时间戳
+} StepMotorRamp_s;
+
 static const StepMotorHw_s step_motor_hw[STEP_MOTOR_ID_MAX] = {
     {GPIOA, GPIO_PIN_7, GPIOA, GPIO_PIN_6, TIM_CHANNEL_1},
     {GPIOA, GPIO_PIN_5, GPIOA, GPIO_PIN_4, TIM_CHANNEL_2},
 };
 
+static const uint32_t step_motor_max_travel_um[STEP_MOTOR_ID_MAX] = {
+    STEP_MOTOR_A_TRAVEL_UM,
+    STEP_MOTOR_B_TRAVEL_UM,
+};
+
 static volatile StepMotorStatus_s step_motor_status[STEP_MOTOR_ID_MAX];
 static volatile StepMotorId_e step_motor_active_id = STEP_MOTOR_ID_MAX;
+static StepMotorRamp_s step_motor_ramp = {0};
 static uint8_t step_motor_inited = 0U;
 
 static uint8_t StepMotor_IsValidId(StepMotorId_e motor);
+static uint32_t StepMotor_GetDwtMs(void);
 static uint32_t StepMotor_GetTIM2ClockHz(void);
 static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel);
+static uint32_t StepMotor_LimitStartSpeed(uint32_t target_speed_pps);
+static uint32_t StepMotor_CalcDecelSteps(uint32_t current_speed_pps);
+static uint32_t StepMotor_GetMaxTravelUm(StepMotorId_e motor);
+static uint8_t StepMotor_IsDistanceAllowed(StepMotorId_e motor, uint32_t distance_um);
 static uint32_t StepMotor_UmToSteps(uint32_t distance_um);
 static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s);
 static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e direction);
@@ -75,6 +111,16 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
 static uint8_t StepMotor_IsValidId(StepMotorId_e motor)
 {
     return (motor < STEP_MOTOR_ID_MAX) ? 1U : 0U;
+}
+
+/**
+ * @brief 获取 DWT 毫秒时间轴。
+ *
+ * @return 从 DWT_Init() 后累计的毫秒数。
+ */
+static uint32_t StepMotor_GetDwtMs(void)
+{
+    return (uint32_t)(DWT_GetTimeline_us() / 1000ULL);
 }
 
 /**
@@ -111,6 +157,7 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel)
     uint32_t prescaler;
     uint32_t period_ticks;
     uint32_t pulse_ticks;
+    uint32_t timer_was_enabled;
 
     if (speed_pps == 0U)
     {
@@ -137,9 +184,11 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel)
     }
 
     /*
-     * 修改 PSC/ARR/CCR 前先停表，避免运行中改周期造成毛刺。
+     * 修改 PSC/ARR/CCR 前先短暂停表，避免运行中改周期造成毛刺。
      * PSC 寄存器实际写入的是“分频值 - 1”。
+     * 如果调用前定时器正在运行，修改完成后会恢复运行。
      */
+    timer_was_enabled = htim2.Instance->CR1 & TIM_CR1_CEN;
     __HAL_TIM_DISABLE(&htim2);
     __HAL_TIM_SET_PRESCALER(&htim2, prescaler - 1U);
     __HAL_TIM_SET_AUTORELOAD(&htim2, period_ticks - 1U);
@@ -155,6 +204,101 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel)
     HAL_TIM_GenerateEvent(&htim2, TIM_EVENTSOURCE_UPDATE);
     __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_UPDATE | TIM_FLAG_CC1 | TIM_FLAG_CC2);
 
+    if (timer_was_enabled != 0U)
+    {
+        __HAL_TIM_ENABLE(&htim2);
+    }
+
+    return 1U;
+}
+
+/**
+ * @brief 根据目标速度得到起步速度。
+ *
+ * @param target_speed_pps 目标速度，单位 PPS。
+ * @return 实际起步速度，目标速度低于起步速度时直接用目标速度。
+ */
+static uint32_t StepMotor_LimitStartSpeed(uint32_t target_speed_pps)
+{
+    if (target_speed_pps < STEP_MOTOR_START_PPS)
+    {
+        return target_speed_pps;
+    }
+
+    return STEP_MOTOR_START_PPS;
+}
+
+/**
+ * @brief 估算从当前速度减到起步速度所需的步数。
+ *
+ * @param current_speed_pps 当前速度，单位 PPS。
+ * @return 估算减速步数。
+ *
+ * @note 这是给梯形减速用的轻量估算：
+ *       减速次数 = (当前速度 - 起步速度) / 每次降速；
+ *       减速时间 = 减速次数 * 调速周期；
+ *       减速距离 = 平均速度 * 减速时间。
+ */
+static uint32_t StepMotor_CalcDecelSteps(uint32_t current_speed_pps)
+{
+    uint32_t decel_count;
+    uint32_t average_speed_pps;
+    uint64_t decel_steps;
+
+    if (current_speed_pps <= STEP_MOTOR_START_PPS)
+    {
+        return 0U;
+    }
+
+    decel_count = (current_speed_pps - STEP_MOTOR_START_PPS + STEP_MOTOR_ACC_STEP_PPS - 1U) /
+                  STEP_MOTOR_ACC_STEP_PPS;
+    average_speed_pps = (current_speed_pps + STEP_MOTOR_START_PPS) / 2U;
+
+    decel_steps = (uint64_t)average_speed_pps * decel_count * STEP_MOTOR_ACC_UPDATE_MS;
+    decel_steps = (decel_steps + 999U) / 1000U;
+
+    return (uint32_t)decel_steps;
+}
+
+/**
+ * @brief 获取指定电机对应滑台的有效行程。
+ *
+ * @param motor 电机编号。
+ * @return 有效行程，单位 um；电机编号非法时返回 0。
+ */
+static uint32_t StepMotor_GetMaxTravelUm(StepMotorId_e motor)
+{
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    return step_motor_max_travel_um[motor];
+}
+
+/**
+ * @brief 判断单次目标位移是否超过对应滑台的有效行程。
+ *
+ * @param motor 电机编号。
+ * @param distance_um 本次目标位移，单位 um。
+ * @return 1 表示允许执行；0 表示参数非法、距离为 0 或超过单次有效行程。
+ *
+ * @note 当前没有原点、限位或绝对位置反馈，所以这里仅限制“单次命令距离”
+ *       不超过滑台总有效行程。若要防止累计移动撞端点，还需要增加回零、
+ *       当前位置记录或限位开关检测。
+ */
+static uint8_t StepMotor_IsDistanceAllowed(StepMotorId_e motor, uint32_t distance_um)
+{
+    uint32_t max_travel_um;
+
+    max_travel_um = StepMotor_GetMaxTravelUm(motor);
+    if ((max_travel_um == 0U) ||
+        (distance_um == 0U) ||
+        (distance_um > max_travel_um))
+    {
+        return 0U;
+    }
+
     return 1U;
 }
 
@@ -164,17 +308,17 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel)
  * @param distance_um 目标距离，单位 um。
  * @return 换算后的脉冲数。
  *
- * @note 公式：steps = distance_um * 12000 / 28540。
+ * @note 公式：steps = distance_um * 1600 / 4000。
  *       这里加上除数的一半做四舍五入，减少整数截断误差。
  */
 static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
 {
     uint64_t numerator;
 
-    numerator = (uint64_t)distance_um * STEP_MOTOR_CALIBRATION_PULSES;
-    numerator += STEP_MOTOR_CALIBRATION_DISTANCE_UM / 2U;
+    numerator = (uint64_t)distance_um * STEP_MOTOR_DRIVER_MICROSTEP_PPR;
+    numerator += STEP_MOTOR_SCREW_LEAD_UM / 2U;
 
-    return (uint32_t)(numerator / STEP_MOTOR_CALIBRATION_DISTANCE_UM);
+    return (uint32_t)(numerator / STEP_MOTOR_SCREW_LEAD_UM);
 }
 
 /**
@@ -183,16 +327,16 @@ static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
  * @param speed_um_s 目标速度，单位 um/s。
  * @return 换算后的 PPS。
  *
- * @note 公式：pps = speed_um_s * 12000 / 28540。
+ * @note 公式：pps = speed_um_s * 1600 / 4000。
  */
 static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s)
 {
     uint64_t numerator;
 
-    numerator = (uint64_t)speed_um_s * STEP_MOTOR_CALIBRATION_PULSES;
-    numerator += STEP_MOTOR_CALIBRATION_DISTANCE_UM / 2U;
+    numerator = (uint64_t)speed_um_s * STEP_MOTOR_DRIVER_MICROSTEP_PPR;
+    numerator += STEP_MOTOR_SCREW_LEAD_UM / 2U;
 
-    return (uint32_t)(numerator / STEP_MOTOR_CALIBRATION_DISTANCE_UM);
+    return (uint32_t)(numerator / STEP_MOTOR_SCREW_LEAD_UM);
 }
 
 /**
@@ -242,6 +386,11 @@ static void StepMotor_StopOutput(StepMotorId_e motor)
     {
         step_motor_active_id = STEP_MOTOR_ID_MAX;
     }
+
+    step_motor_ramp.enabled = 0U;
+    step_motor_ramp.target_speed_pps = 0U;
+    step_motor_ramp.current_speed_pps = 0U;
+    step_motor_ramp.last_update_ms = 0U;
 }
 
 /**
@@ -258,6 +407,8 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
                                uint32_t speed_pps,
                                uint32_t steps)
 {
+    uint32_t start_speed_pps;
+
     if ((step_motor_inited == 0U) ||
         (StepMotor_IsValidId(motor) == 0U) ||
         (speed_pps == 0U))
@@ -276,7 +427,9 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
 
     StepMotor_StopAll();
 
-    if (StepMotor_ConfigTimer(speed_pps, step_motor_hw[motor].tim_channel) == 0U)
+    start_speed_pps = StepMotor_LimitStartSpeed(speed_pps);
+
+    if (StepMotor_ConfigTimer(start_speed_pps, step_motor_hw[motor].tim_channel) == 0U)
     {
         return 0U;
     }
@@ -291,10 +444,15 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
 
     step_motor_status[motor].state = STEP_MOTOR_STATE_RUNNING;
     step_motor_status[motor].direction = direction;
-    step_motor_status[motor].speed_pps = speed_pps;
+    step_motor_status[motor].speed_pps = start_speed_pps;
     step_motor_status[motor].target_steps = steps;
     step_motor_status[motor].finished_steps = 0U;
     step_motor_active_id = motor;
+
+    step_motor_ramp.enabled = 1U;
+    step_motor_ramp.target_speed_pps = speed_pps;
+    step_motor_ramp.current_speed_pps = start_speed_pps;
+    step_motor_ramp.last_update_ms = StepMotor_GetDwtMs();
 
     if (steps == 0U)
     {
@@ -320,6 +478,7 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
 void StepMotor_Init(void)
 {
     memset((void *)step_motor_status, 0, sizeof(step_motor_status));
+    memset(&step_motor_ramp, 0, sizeof(step_motor_ramp));
 
     StepMotor_StopAll();
 
@@ -334,6 +493,97 @@ void StepMotor_Init(void)
     step_motor_inited = 1U;
 }
 
+void StepMotor_Process(void)
+{
+    StepMotorId_e motor;
+    uint32_t now_ms;
+    uint32_t elapsed_ms;
+    uint32_t current_speed_pps;
+    uint32_t next_speed_pps;
+    uint32_t remaining_steps;
+    uint32_t decel_steps;
+
+    if ((step_motor_inited == 0U) ||
+        (step_motor_ramp.enabled == 0U) ||
+        (step_motor_active_id >= STEP_MOTOR_ID_MAX))
+    {
+        return;
+    }
+
+    motor = step_motor_active_id;
+    if (step_motor_status[motor].state != STEP_MOTOR_STATE_RUNNING)
+    {
+        return;
+    }
+
+    now_ms = StepMotor_GetDwtMs();
+    elapsed_ms = now_ms - step_motor_ramp.last_update_ms;
+    if (elapsed_ms < STEP_MOTOR_ACC_UPDATE_MS)
+    {
+        return;
+    }
+
+    step_motor_ramp.last_update_ms = now_ms;
+    current_speed_pps = step_motor_ramp.current_speed_pps;
+    next_speed_pps = current_speed_pps;
+
+    if ((step_motor_status[motor].target_steps != 0U) &&
+        (step_motor_status[motor].finished_steps < step_motor_status[motor].target_steps))
+    {
+        remaining_steps = step_motor_status[motor].target_steps -
+                          step_motor_status[motor].finished_steps;
+        decel_steps = StepMotor_CalcDecelSteps(current_speed_pps);
+
+        /*
+         * 剩余步数小于等于估算减速步数时开始减速。
+         * 如果距离较短，电机会自动形成“加速后马上减速”的三角速度曲线。
+         */
+        if ((remaining_steps <= decel_steps) && (current_speed_pps > STEP_MOTOR_START_PPS))
+        {
+            if ((current_speed_pps - STEP_MOTOR_START_PPS) <= STEP_MOTOR_ACC_STEP_PPS)
+            {
+                next_speed_pps = STEP_MOTOR_START_PPS;
+            }
+            else
+            {
+                next_speed_pps = current_speed_pps - STEP_MOTOR_ACC_STEP_PPS;
+            }
+        }
+        else if (current_speed_pps < step_motor_ramp.target_speed_pps)
+        {
+            next_speed_pps = current_speed_pps + STEP_MOTOR_ACC_STEP_PPS;
+            if (next_speed_pps > step_motor_ramp.target_speed_pps)
+            {
+                next_speed_pps = step_motor_ramp.target_speed_pps;
+            }
+        }
+    }
+    else if ((step_motor_status[motor].target_steps == 0U) &&
+             (current_speed_pps < step_motor_ramp.target_speed_pps))
+    {
+        /*
+         * 连续运行没有目标步数，只做缓启动加速。
+         * 停止时由业务层调用 Stop 接口。
+         */
+        next_speed_pps = current_speed_pps + STEP_MOTOR_ACC_STEP_PPS;
+        if (next_speed_pps > step_motor_ramp.target_speed_pps)
+        {
+            next_speed_pps = step_motor_ramp.target_speed_pps;
+        }
+    }
+
+    if (next_speed_pps == current_speed_pps)
+    {
+        return;
+    }
+
+    if (StepMotor_ConfigTimer(next_speed_pps, step_motor_hw[motor].tim_channel) != 0U)
+    {
+        step_motor_ramp.current_speed_pps = next_speed_pps;
+        step_motor_status[motor].speed_pps = next_speed_pps;
+    }
+}
+
 uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
                                 StepMotorDirection_e direction,
                                 uint32_t speed_pps)
@@ -346,7 +596,9 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            uint32_t speed_pps,
                            uint32_t steps)
 {
-    if (steps == 0U)
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (steps == 0U) ||
+        (steps > StepMotor_UmToSteps(StepMotor_GetMaxTravelUm(motor))))
     {
         return 0U;
     }
@@ -369,10 +621,17 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     uint32_t distance_mm_x100,
                                     uint32_t speed_mm_s_x100)
 {
+    uint32_t distance_um;
     uint32_t steps;
     uint32_t speed_pps;
 
-    steps = StepMotor_MmX100ToSteps(distance_mm_x100);
+    distance_um = distance_mm_x100 * STEP_MOTOR_MM_X100_TO_UM;
+    if (StepMotor_IsDistanceAllowed(motor, distance_um) == 0U)
+    {
+        return 0U;
+    }
+
+    steps = StepMotor_UmToSteps(distance_um);
     speed_pps = StepMotor_MmPerSecX100ToPps(speed_mm_s_x100);
 
     if ((steps == 0U) || (speed_pps == 0U))
@@ -395,6 +654,11 @@ uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
 
     distance_um = distance_cm_x100 * STEP_MOTOR_CM_X100_TO_UM;
     speed_um_s = speed_cm_s_x100 * STEP_MOTOR_CM_X100_TO_UM;
+    if (StepMotor_IsDistanceAllowed(motor, distance_um) == 0U)
+    {
+        return 0U;
+    }
+
     steps = StepMotor_UmToSteps(distance_um);
     speed_pps = StepMotor_UmPerSecToPps(speed_um_s);
 
@@ -424,6 +688,7 @@ void StepMotor_StopAll(void)
     }
 
     step_motor_active_id = STEP_MOTOR_ID_MAX;
+    memset(&step_motor_ramp, 0, sizeof(step_motor_ramp));
 }
 
 uint8_t StepMotor_IsBusy(StepMotorId_e motor)

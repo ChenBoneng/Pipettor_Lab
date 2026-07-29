@@ -88,6 +88,18 @@ typedef struct
 void StepMotor_Init(void);
 
 /**
+ * @brief 步进电机周期处理函数。
+ *
+ * @note 本函数用于处理梯形加减速：
+ *       - 刚启动时从低 PPS 逐步升到目标速度；
+ *       - 接近目标步数时逐步降速；
+ *       - PWM 脉冲计数仍然由 TIM2 中断完成。
+ *
+ *       建议在 MachineTask() 这类周期任务中调用，当前任务周期 2ms 足够使用。
+ */
+void StepMotor_Process(void);
+
+/**
  * @brief 让指定电机按固定速度连续运行。
  *
  * @param motor 电机编号，取值见 StepMotorId_e。
@@ -109,10 +121,11 @@ uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
  * @param direction 运行方向，取值见 StepMotorDirection_e。
  * @param speed_pps 脉冲频率，单位 PPS。
  * @param steps 目标步数，也就是要输出的 PUL 上升沿数量。
- * @return 1 表示启动成功；0 表示参数错误、模块未初始化或已有电机正在运行。
+ * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、模块未初始化或已有电机正在运行。
  *
  * @note 本函数非阻塞。启动成功后立即返回，步数统计在 TIM2 PWM 中断中完成，
- *       达到 steps 后自动停止 PWM。
+ *       达到 steps 后自动停止 PWM。当前按 A 轴 100mm、B 轴 150mm 的滑台有效行程
+ *       限制单次输出步数，但不记录滑台绝对位置。
  */
 uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            StepMotorDirection_e direction,
@@ -122,10 +135,11 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
 /**
  * @brief 把距离从 0.01mm 单位换算成脉冲数。
  *
- * @param distance_mm_x100 目标距离，单位 0.01mm。比如 2854 表示 28.54mm。
+ * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。
  * @return 换算后的脉冲数。
  *
- * @note 当前换算基于实测结果：驱动器细分 1600 时，12000 个脉冲移动 28.54mm。
+ * @note 当前换算基于丝杆数据：驱动器细分 1600 脉冲/圈，丝杆导程 4mm/圈，
+ *       因此 1mm = 400 个脉冲，30mm = 12000 个脉冲。
  */
 uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100);
 
@@ -135,7 +149,8 @@ uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100);
  * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 357 表示 3.57mm/s。
  * @return 换算后的 PPS，即每秒需要输出的脉冲数。
  *
- * @note 当前换算基于实测结果：驱动器细分 1600 时，12000 个脉冲移动 28.54mm。
+ * @note 当前换算基于丝杆数据：驱动器细分 1600 脉冲/圈，丝杆导程 4mm/圈，
+ *       因此 1mm/s = 400 PPS。
  */
 uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
 
@@ -146,10 +161,11 @@ uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
  * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
  * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。
  * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 1500 表示 15.00mm/s。
- * @return 1 表示启动成功；0 表示参数错误、换算结果为 0 或电机启动失败。
+ * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
  *
  * @note 本函数非阻塞。内部会把距离换算成 steps，把速度换算成 pps，
- *       再调用 StepMotor_RunSteps() 输出实际脉冲。
+ *       再调用 StepMotor_RunSteps() 输出实际脉冲。当前 A 轴单次最大 100mm，
+ *       B 轴单次最大 150mm。
  */
 uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
@@ -163,9 +179,10 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
  * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
  * @param distance_cm_x100 目标距离，单位 0.01cm。比如 300 表示 3.00cm。
  * @param speed_cm_s_x100 目标速度，单位 0.01cm/s。比如 150 表示 1.50cm/s。
- * @return 1 表示启动成功；0 表示参数错误、换算结果为 0 或电机启动失败。
+ * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
  *
- * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。
+ * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。当前 A 轴单次最大 10cm，
+ *       B 轴单次最大 15cm。
  */
 uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
