@@ -54,3 +54,13 @@ void MachineTask(void *argument)
         osDelay(2); // 每 2ms 执行一次
     }
 }
+
+void LCDTask(void *argument)
+{
+    (void)argument;
+    for (;;)
+    {
+
+        osDelay(10); // 每 10ms 执行一次
+    }
+}

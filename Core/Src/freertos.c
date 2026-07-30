@@ -69,6 +69,13 @@ const osThreadAttr_t StartMachineTas_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
+/* Definitions for StartLCDTask */
+osThreadId_t StartLCDTaskHandle;
+const osThreadAttr_t StartLCDTask_attributes = {
+  .name = "StartLCDTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -85,6 +92,7 @@ static void Buzzer_Off(void);
 
 void KeyboardTask(void *argument);
 void MachineTask(void *argument);
+void LCDTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -120,6 +128,9 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of StartMachineTas */
   StartMachineTasHandle = osThreadNew(MachineTask, NULL, &StartMachineTas_attributes);
+
+  /* creation of StartLCDTask */
+  StartLCDTaskHandle = osThreadNew(LCDTask, NULL, &StartLCDTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -165,6 +176,24 @@ __weak void MachineTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END MachineTask */
+}
+
+/* USER CODE BEGIN Header_LCDTask */
+/**
+* @brief Function implementing the StartLCDTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_LCDTask */
+__weak void LCDTask(void *argument)
+{
+  /* USER CODE BEGIN LCDTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END LCDTask */
 }
 
 /* Private application code --------------------------------------------------*/
