@@ -32,13 +32,13 @@ typedef enum
 
     KEYPAD_STATE_INSERT_NEEDLE = 13U,    // 插针
     KEYPAD_STATE_RETRACT_NEEDLE = 14U,   // 收针
-    KEYPAD_STATE_NUM_4 = 15U,            // 数字 4
-    KEYPAD_STATE_NUM_5 = 16U,            // 数字 5
+    KEYPAD_STATE_NUM_4 = 15U,            // 数字 4，手动调试模式下为水出
+    KEYPAD_STATE_NUM_5 = 16U,            // 数字 5，手动调试模式下为药出
     KEYPAD_STATE_NUM_6 = 17U,            // 数字 6
     KEYPAD_STATE_DOT = 18U,              // 小数点 .
 
-    KEYPAD_STATE_NUM_1 = 21U,            // 数字 1
-    KEYPAD_STATE_NUM_2 = 22U,            // 数字 2
+    KEYPAD_STATE_NUM_1 = 21U,            // 数字 1,手动调试模式下为水进
+    KEYPAD_STATE_NUM_2 = 22U,            // 数字 2，手动调试模式下为药进
     KEYPAD_STATE_NUM_3 = 23U,            // 数字 3
     KEYPAD_STATE_CLEAR_INPUT = 24U,      // 清除
     KEYPAD_STATE_RESET = 25U,            // 复位
