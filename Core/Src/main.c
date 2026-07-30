@@ -111,7 +111,7 @@ int main(void)
   // LCD12864_WriteString(1U, 0U, "LCD12864 OK");
   // LCD12864_WriteString(2U, 0U, "PC0 CS  PC1 SID");
   // LCD12864_WriteString(3U, 0U, "PC2 CLK PC3 RST");
-HAL_Delay(2000);
+  HAL_Delay(1000);
   //全局唯一初始化函数
   AllTaskInit();
 
