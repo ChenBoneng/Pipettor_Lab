@@ -8,12 +8,17 @@
 #include "main.h"
 #include "Keyboard.h"
 #include "Communication.h"
+#include "display_lcd.h"
 #include "machine.h"
 #include "step_motor.h"
 
 void AllTaskInit(void)
 {
     DWT_Init(72); // 初始化DWT,用于获取时间间隔
+    DisplayLcd_Init();
+    DisplayLcd_UpdateLine(DISPLAY_LCD_ROW_1,
+                          (const uint8_t *)"hellow world",
+                          sizeof("hellow world") - 1U);
     Keypad_Init();
     Communication_Init();
     StepMotor_Init();
@@ -42,7 +47,7 @@ void MachineTask(void *argument)
     {
         /* 处理机器人的状态机逻辑 */
         StepMotor_Process();
-        MachineControl();
+        // MachineControl();
 
 
         DWT_SysTimeUpdate();

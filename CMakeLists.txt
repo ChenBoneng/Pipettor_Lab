@@ -73,7 +73,6 @@ file(GLOB_RECURSE USER_SOURCES CONFIGURE_DEPENDS
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
-    Core/Src/lcd12864.c
     ${USER_SOURCES}
 )
 
