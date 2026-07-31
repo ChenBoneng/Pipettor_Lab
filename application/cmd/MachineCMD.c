@@ -10,11 +10,13 @@
 #include "Keyboard.h"
 #include "main.h"
 #include "MachineCMD_Text.h"
+#include "step_motor.h"
 
 #define MACHINE_CMD_LCD_LINE_BYTES        16U
-#define MACHINE_CMD_INPUT_MAX_LEN         8U
-#define MACHINE_CMD_PREP_BOTTLE_COUNT     3U
+#define MACHINE_CMD_INPUT_MAX_LEN         5U
+#define MACHINE_CMD_PREP_BOTTLE_COUNT     1U
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
+#define MACHINE_CMD_MEASURE_HOLD_MS       15000U
 
 /*
  * 当前硬件表中能确认的三路 24V 输出：
@@ -53,8 +55,9 @@ typedef struct
     MachineCmdPage_e page;                              // 当前 LCD 页面
     uint32_t boot_start_ms;                             // 开机页进入时间
     uint8_t manual_switches;                            // 手动调试开关位
-    uint8_t prep_index;                                 // 当前正在输入的瓶号：0~2
-    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 配药瓶体积，单位 0.01ml
+    uint32_t measure_start_ms;                           // 活度计测量页进入时间
+    MachineCmdPage_e paused_page;                        // 暂停前所在运行页
+    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 配药体积，单位 0.01ml
     uint16_t dispense_ml_x100;                          // 发药体积，单位 0.01ml
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
     MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
@@ -72,26 +75,38 @@ static void MachineCMD_AppendDot(void);
 static uint16_t MachineCMD_InputToMlX100(void);
 static void MachineCMD_HandleStandbyKey(KeypadState_e key);
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key);
+static void MachineCMD_HandlePrepRunningKey(KeypadState_e key);
+static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key);
 static void MachineCMD_HandleDispSettingKey(KeypadState_e key);
+static void MachineCMD_HandleDispRunningKey(KeypadState_e key);
 static void MachineCMD_HandleManualKey(KeypadState_e key);
+static void MachineCMD_HandlePausedKey(KeypadState_e key);
 static void MachineCMD_SetManualAction(KeypadState_e key);
+static uint8_t MachineCMD_GetManualSwitchMask(MachineCmdManualAction_e action);
+static uint8_t MachineCMD_IsManualSwitchAction(MachineCmdManualAction_e action);
 static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask);
 static void MachineCMD_ClearManualSwitches(void);
 static void MachineCMD_ApplyManualOutputs(void);
+static void MachineCMD_PauseCurrentFlow(void);
 static uint8_t MachineCMD_LineAppendBytes(uint8_t *line, uint8_t offset, const uint8_t *data, uint8_t len);
 static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const MachineCmdText_s *text);
 static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const char *text);
+static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, uint8_t switch_mask);
 static void MachineCMD_WriteBytes(DisplayLcdRow_e row, const uint8_t *data, uint8_t len);
 static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *text);
+static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, uint8_t switch_mask);
 static const MachineCmdText_s *MachineCMD_GetManualActionText(void);
 static void MachineCMD_ShowBootPage(void);
 static void MachineCMD_ShowReadyPage(void);
 static void MachineCMD_ShowStandbyPage(void);
 static void MachineCMD_ShowPrepSettingPage(void);
 static void MachineCMD_ShowPrepRunningPage(void);
+static void MachineCMD_ShowPrepMeasurePage(void);
 static void MachineCMD_ShowDispSettingPage(void);
 static void MachineCMD_ShowDispRunningPage(void);
 static void MachineCMD_ShowManualPage(void);
+static void MachineCMD_ShowCleanPage(void);
+static void MachineCMD_ShowPausedPage(void);
 static void MachineCMD_ShowAlarmPage(void);
 
 /**
@@ -129,6 +144,12 @@ void MachineCMD_Process(void)
         ((MachineCMD_GetMs() - machine_cmd.boot_start_ms) >= MACHINE_CMD_BOOT_HOLD_MS))
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_READY);
+    }
+
+    if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) &&
+        ((MachineCMD_GetMs() - machine_cmd.measure_start_ms) >= MACHINE_CMD_MEASURE_HOLD_MS))
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
     }
 
     key = Keypad_GetPressedState();
@@ -171,16 +192,31 @@ void MachineCMD_Process(void)
         MachineCMD_HandlePrepSettingKey(key);
         break;
 
+    case MACHINE_CMD_PAGE_PREP_RUNNING:
+        MachineCMD_HandlePrepRunningKey(key);
+        break;
+
+    case MACHINE_CMD_PAGE_PREP_MEASURE:
+        MachineCMD_HandlePrepMeasureKey(key);
+        break;
+
     case MACHINE_CMD_PAGE_DISP_SETTING:
         MachineCMD_HandleDispSettingKey(key);
+        break;
+
+    case MACHINE_CMD_PAGE_DISP_RUNNING:
+        MachineCMD_HandleDispRunningKey(key);
         break;
 
     case MACHINE_CMD_PAGE_MANUAL:
         MachineCMD_HandleManualKey(key);
         break;
 
-    case MACHINE_CMD_PAGE_PREP_RUNNING:
-    case MACHINE_CMD_PAGE_DISP_RUNNING:
+    case MACHINE_CMD_PAGE_PAUSED:
+        MachineCMD_HandlePausedKey(key);
+        break;
+
+    case MACHINE_CMD_PAGE_CLEAN:
     case MACHINE_CMD_PAGE_ALARM:
     case MACHINE_CMD_PAGE_READY:
     case MACHINE_CMD_PAGE_BOOT:
@@ -219,6 +255,10 @@ void MachineCMD_LCDTask(void)
         MachineCMD_ShowPrepRunningPage();
         break;
 
+    case MACHINE_CMD_PAGE_PREP_MEASURE:
+        MachineCMD_ShowPrepMeasurePage();
+        break;
+
     case MACHINE_CMD_PAGE_DISP_SETTING:
         MachineCMD_ShowDispSettingPage();
         break;
@@ -229,6 +269,14 @@ void MachineCMD_LCDTask(void)
 
     case MACHINE_CMD_PAGE_MANUAL:
         MachineCMD_ShowManualPage();
+        break;
+
+    case MACHINE_CMD_PAGE_CLEAN:
+        MachineCMD_ShowCleanPage();
+        break;
+
+    case MACHINE_CMD_PAGE_PAUSED:
+        MachineCMD_ShowPausedPage();
         break;
 
     case MACHINE_CMD_PAGE_ALARM:
@@ -283,6 +331,16 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
         (page == MACHINE_CMD_PAGE_DISP_SETTING))
     {
         MachineCMD_ClearInput();
+    }
+
+    if (page == MACHINE_CMD_PAGE_PREP_SETTING)
+    {
+        memset(machine_cmd.prep_bottle_ml_x100, 0, sizeof(machine_cmd.prep_bottle_ml_x100));
+    }
+
+    if (page == MACHINE_CMD_PAGE_PREP_MEASURE)
+    {
+        machine_cmd.measure_start_ms = MachineCMD_GetMs();
     }
 }
 
@@ -387,9 +445,22 @@ static void MachineCMD_AppendDot(void)
 {
     uint32_t len = strlen(machine_cmd.input);
 
-    if ((len == 0U) || (len >= MACHINE_CMD_INPUT_MAX_LEN) ||
+    if ((len >= MACHINE_CMD_INPUT_MAX_LEN) ||
         (strchr(machine_cmd.input, '.') != NULL))
     {
+        return;
+    }
+
+    if (len == 0U)
+    {
+        if (MACHINE_CMD_INPUT_MAX_LEN < 2U)
+        {
+            return;
+        }
+
+        machine_cmd.input[0] = '0';
+        machine_cmd.input[1] = '.';
+        machine_cmd.input[2] = '\0';
         return;
     }
 
@@ -467,12 +538,29 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
     switch (key)
     {
     case KEYPAD_STATE_PREPARE_MEDICINE:
-        machine_cmd.prep_index = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_SETTING);
         break;
 
     case KEYPAD_STATE_SEND_MEDICINE:
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        break;
+
+    case KEYPAD_STATE_CLEAR_ALL:
+        MachineCMD_ClearManualSwitches();
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_CLEAN);
+        break;
+
+    case KEYPAD_STATE_FAULT:
+        MachineCMD_ClearManualSwitches();
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_ALARM);
+        break;
+
+    case KEYPAD_STATE_NUM_1:
+    case KEYPAD_STATE_NUM_2:
+    case KEYPAD_STATE_NUM_4:
+    case KEYPAD_STATE_NUM_5:
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_MANUAL);
+        MachineCMD_HandleManualKey(key);
         break;
 
     case KEYPAD_STATE_IN_TANK:
@@ -496,8 +584,8 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
  *
  * @param key 当前一次性按下事件。
  *
- * @note 数字和小数点写入 input；启动键保存当前瓶号输入值。
- *       3 个瓶号依次输入完成后，页面进入配药运行提示页。
+ * @note 数字和小数点写入 input；启动键保存当前配药量输入值。
+ *       当前流程每次只配一瓶，确认后直接进入配药运行提示页。
  */
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 {
@@ -521,23 +609,46 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
         return;
     }
 
-    /*
-     * 启动键在本页面不是立即驱动流程，而是作为“确认当前输入”的按键。
-     * 前两个瓶号确认后跳到下一格，第三个瓶号确认后才进入运行提示页。
-     */
     if (key == KEYPAD_STATE_START)
     {
-        machine_cmd.prep_bottle_ml_x100[machine_cmd.prep_index] = MachineCMD_InputToMlX100();
+        machine_cmd.prep_bottle_ml_x100[0] = MachineCMD_InputToMlX100();
         MachineCMD_ClearInput();
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
+    }
+}
 
-        if (machine_cmd.prep_index < (MACHINE_CMD_PREP_BOTTLE_COUNT - 1U))
-        {
-            machine_cmd.prep_index++;
-        }
-        else
-        {
-            MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
-        }
+/**
+ * @brief 处理配药运行提示页按键。
+ *
+ * @param key 当前一次性按下事件。
+ *
+ * @note 启动键表示用户已经确认铅罐放置，页面进入活度计测量倒计时。
+ *       暂停键用于先挂起 UI 流程，真实流程暂停后续应由 machine 层同步执行。
+ */
+static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
+{
+    if (key == KEYPAD_STATE_START)
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_MEASURE);
+        return;
+    }
+
+    if (key == KEYPAD_STATE_PAUSE)
+    {
+        MachineCMD_PauseCurrentFlow();
+    }
+}
+
+/**
+ * @brief 处理配药活度测量页按键。
+ *
+ * @param key 当前一次性按下事件。
+ */
+static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key)
+{
+    if (key == KEYPAD_STATE_PAUSE)
+    {
+        MachineCMD_PauseCurrentFlow();
     }
 }
 
@@ -575,6 +686,19 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key)
         machine_cmd.dispense_ml_x100 = MachineCMD_InputToMlX100();
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_RUNNING);
+    }
+}
+
+/**
+ * @brief 处理发药运行提示页按键。
+ *
+ * @param key 当前一次性按下事件。
+ */
+static void MachineCMD_HandleDispRunningKey(KeypadState_e key)
+{
+    if (key == KEYPAD_STATE_PAUSE)
+    {
+        MachineCMD_PauseCurrentFlow();
     }
 }
 
@@ -623,6 +747,21 @@ static void MachineCMD_HandleManualKey(KeypadState_e key)
 }
 
 /**
+ * @brief 处理流程暂停页按键。
+ *
+ * @param key 当前一次性按下事件。
+ *
+ * @note 启动键只恢复到暂停前的提示页。真实运动继续由 machine 层接管后再补。
+ */
+static void MachineCMD_HandlePausedKey(KeypadState_e key)
+{
+    if (key == KEYPAD_STATE_START)
+    {
+        MachineCMD_EnterPage(machine_cmd.paused_page);
+    }
+}
+
+/**
  * @brief 根据动作键更新手动调试页当前动作说明。
  *
  * @param key 当前动作按键。
@@ -662,6 +801,44 @@ static void MachineCMD_SetManualAction(KeypadState_e key)
     default:
         break;
     }
+}
+
+/**
+ * @brief 获取手动动作对应的逻辑开关位。
+ *
+ * @param action 当前手动动作。
+ * @return 逻辑开关位；0 表示该动作不是阀/泵开关。
+ */
+static uint8_t MachineCMD_GetManualSwitchMask(MachineCmdManualAction_e action)
+{
+    switch (action)
+    {
+    case MACHINE_CMD_MANUAL_ACTION_WATER_IN:
+        return MACHINE_CMD_MANUAL_WATER_IN;
+
+    case MACHINE_CMD_MANUAL_ACTION_MED_IN:
+        return MACHINE_CMD_MANUAL_MED_IN;
+
+    case MACHINE_CMD_MANUAL_ACTION_WATER_OUT:
+        return MACHINE_CMD_MANUAL_WATER_OUT;
+
+    case MACHINE_CMD_MANUAL_ACTION_MED_OUT:
+        return MACHINE_CMD_MANUAL_MED_OUT;
+
+    default:
+        return 0U;
+    }
+}
+
+/**
+ * @brief 判断当前手动动作是否属于数字键开关动作。
+ *
+ * @param action 当前手动动作。
+ * @return 1 表示是开关动作；0 表示不是。
+ */
+static uint8_t MachineCMD_IsManualSwitchAction(MachineCmdManualAction_e action)
+{
+    return (MachineCMD_GetManualSwitchMask(action) != 0U) ? 1U : 0U;
 }
 
 /**
@@ -728,6 +905,20 @@ static void MachineCMD_ApplyManualOutputs(void)
 }
 
 /**
+ * @brief 暂停当前运行提示页。
+ *
+ * @note 当前能直接停止的是 DM542 步进电机和 MachineCMD 管理的三路手动输出。
+ *       ISC1000 定量泵没有在本模块保存实例，后续接入 machine 层后应在那里统一停泵。
+ */
+static void MachineCMD_PauseCurrentFlow(void)
+{
+    machine_cmd.paused_page = machine_cmd.page;
+    StepMotor_StopAll();
+    MachineCMD_ClearManualSwitches();
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_PAUSED);
+}
+
+/**
  * @brief 向 16 字节 LCD 行缓冲追加一段原始字节。
  *
  * @param line 目标行缓冲，长度至少 MACHINE_CMD_LCD_LINE_BYTES。
@@ -769,6 +960,11 @@ static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const Ma
         return offset;
     }
 
+    if ((offset + text->len) > MACHINE_CMD_LCD_LINE_BYTES)
+    {
+        return offset;
+    }
+
     return MachineCMD_LineAppendBytes(line, offset, text->data, text->len);
 }
 
@@ -788,6 +984,42 @@ static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const 
     }
 
     return MachineCMD_LineAppendBytes(line, offset, (const uint8_t *)text, (uint8_t)strlen(text));
+}
+
+/**
+ * @brief 向行缓冲追加一个开关状态。
+ *
+ * @param line 目标行缓冲。
+ * @param offset 当前写入偏移。
+ * @param switch_mask 手动调试开关位。
+ * @return 追加后的偏移。
+ */
+static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, uint8_t switch_mask)
+{
+    const MachineCmdText_s *state_text;
+
+    state_text = ((machine_cmd.manual_switches & switch_mask) != 0U) ?
+                 &machine_cmd_text_on :
+                 &machine_cmd_text_off;
+
+    return MachineCMD_LineAppendText(line, offset, state_text);
+}
+
+/**
+ * @brief 向行缓冲追加一个 ASCII 开关状态。
+ *
+ * @param line 目标行缓冲。
+ * @param offset 当前写入偏移。
+ * @param switch_mask 手动调试开关位。
+ * @return 追加后的偏移。
+ *
+ * @note 手动页第 3 行使用纯 ASCII，避免中文开关状态被数字挤到奇数字节位置。
+ */
+static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, uint8_t switch_mask)
+{
+    return MachineCMD_LineAppendString(line,
+                                       offset,
+                                       ((machine_cmd.manual_switches & switch_mask) != 0U) ? "1" : "0");
 }
 
 /**
@@ -925,32 +1157,23 @@ static void MachineCMD_ShowStandbyPage(void)
 /**
  * @brief 显示配药参数输入页。
  *
- * @note 第 2 行显示当前正在输入的瓶号，第 3 行显示已经确认的前两个瓶号整数 ml。
- *       动态数字仍用 ASCII，中文前缀使用 GB2312 字节。
+ * @note 当前配药流程每次只输入一瓶配药量。
+ *       中文文案从偶数字节位置开始，避免 ST7920 中文双字节错位。
  */
 static void MachineCMD_ShowPrepSettingPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
-    char ascii[12];
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_title);
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_bottle);
-    (void)snprintf(ascii, sizeof(ascii), "%u:", (unsigned int)(machine_cmd.prep_index + 1U));
-    offset = MachineCMD_LineAppendString(line, offset, ascii);
-    offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "__");
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_prep_volume);
+    offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
     (void)MachineCMD_LineAppendString(line, offset, "ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_saved);
-    (void)snprintf(ascii, sizeof(ascii), "%u/%u",
-                   (unsigned int)(machine_cmd.prep_bottle_ml_x100[0] / 100U),
-                   (unsigned int)(machine_cmd.prep_bottle_ml_x100[1] / 100U));
-    (void)MachineCMD_LineAppendString(line, offset, ascii);
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_number_input);
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start);
 }
@@ -963,9 +1186,43 @@ static void MachineCMD_ShowPrepSettingPage(void)
 static void MachineCMD_ShowPrepRunningPage(void)
 {
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, NULL);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_in_tank);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_put_tank);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start_ok);
+}
+
+/**
+ * @brief 显示配药活度计测量页。
+ */
+static void MachineCMD_ShowPrepMeasurePage(void)
+{
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    uint32_t elapsed_ms;
+    uint32_t left_sec;
+    char ascii[8];
+
+    elapsed_ms = MachineCMD_GetMs() - machine_cmd.measure_start_ms;
+    if (elapsed_ms >= MACHINE_CMD_MEASURE_HOLD_MS)
+    {
+        left_sec = 0U;
+    }
+    else
+    {
+        left_sec = (MACHINE_CMD_MEASURE_HOLD_MS - elapsed_ms + 999U) / 1000U;
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_measure);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_activity);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_countdown);
+    (void)snprintf(ascii, sizeof(ascii), "%2u", (unsigned int)left_sec);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    (void)MachineCMD_LineAppendString(line, offset, "s");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
 }
 
 /**
@@ -998,7 +1255,7 @@ static void MachineCMD_ShowDispRunningPage(void)
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_disp_run);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_pump2);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_progress);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_dont_move);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
 }
 
 /**
@@ -1011,18 +1268,68 @@ static void MachineCMD_ShowManualPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
+    uint8_t switch_mask;
     const MachineCmdText_s *text;
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_manual);
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_current);
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_last);
+    offset = MachineCMD_LineAppendString(line, offset, "  ");
     text = MachineCMD_GetManualActionText();
-    (void)MachineCMD_LineAppendText(line, offset, text);
+    offset = MachineCMD_LineAppendText(line, offset, text);
+    if (MachineCMD_IsManualSwitchAction(machine_cmd.manual_action) != 0U)
+    {
+        switch_mask = MachineCMD_GetManualSwitchMask(machine_cmd.manual_action);
+        (void)MachineCMD_LineAppendSwitchState(line, offset, switch_mask);
+    }
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_key_wi);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_key_wo);
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendString(line, 0U, "1:");
+    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_WATER_IN);
+    offset = MachineCMD_LineAppendString(line, offset, " 2:");
+    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_MED_IN);
+    offset = MachineCMD_LineAppendString(line, offset, " 4:");
+    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_WATER_OUT);
+    offset = MachineCMD_LineAppendString(line, offset, " 5:");
+    (void)MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_MED_OUT);
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_reset_exit_manual);
+}
+
+/**
+ * @brief 显示自动清洗页。
+ *
+ * @note 当前页只完成 UI 入口提示，泵 1 的实际冲洗动作应由后续 machine 层接管。
+ */
+static void MachineCMD_ShowCleanPage(void)
+{
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_clean_title);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_clean_pipe);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_pump1_run);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_waste_cup);
+}
+
+/**
+ * @brief 显示流程暂停页。
+ */
+static void MachineCMD_ShowPausedPage(void)
+{
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_paused_title);
+
+    if (machine_cmd.paused_page == MACHINE_CMD_PAGE_DISP_RUNNING)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_disp_paused);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_prep_paused);
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_start_continue);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_reset_stop);
 }
 
 /**

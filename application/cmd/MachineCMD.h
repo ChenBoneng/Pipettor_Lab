@@ -20,9 +20,12 @@ typedef enum
     MACHINE_CMD_PAGE_STANDBY,        // 待机看板页
     MACHINE_CMD_PAGE_PREP_SETTING,   // 配药参数输入页
     MACHINE_CMD_PAGE_PREP_RUNNING,   // 配药运行提示页
+    MACHINE_CMD_PAGE_PREP_MEASURE,   // 配药活度测量页
     MACHINE_CMD_PAGE_DISP_SETTING,   // 发药参数输入页
     MACHINE_CMD_PAGE_DISP_RUNNING,   // 发药运行提示页
     MACHINE_CMD_PAGE_MANUAL,         // 手动调试页
+    MACHINE_CMD_PAGE_CLEAN,          // 自动清洗页
+    MACHINE_CMD_PAGE_PAUSED,         // 流程暂停页
     MACHINE_CMD_PAGE_ALARM,          // 报警页
 } MachineCmdPage_e;
 
