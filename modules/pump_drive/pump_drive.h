@@ -22,6 +22,27 @@
 /** 保存握手、参数配置、离线时序脚本等文本反馈的最大长度。 */
 #define PUMP_DRIVE_TEXT_MAX            220U
 
+/** 当前设备最多挂接两台 ISC1000，分别对应 300ul 和 100ul 定量泵。 */
+#define PUMP_DRIVE_MAX_INSTANCE        2U
+
+/** ID=1 对应 300ul 定量泵。 */
+#define PUMP_DRIVE_300UL_DEVICE_ID     1U
+
+/** ID=2 对应 100ul 定量泵。 */
+#define PUMP_DRIVE_100UL_DEVICE_ID     2U
+
+/** ID=1 定量泵量程，单位 ul。 */
+#define PUMP_DRIVE_ID1_FULL_STROKE_UL  300U
+
+/** ID=2 定量泵量程，单位 ul。 */
+#define PUMP_DRIVE_ID2_FULL_STROKE_UL  100U
+
+/** 两台定量泵满行程命令步数。 */
+#define PUMP_DRIVE_FULL_STROKE_STEPS   1600U
+
+/** RS485 一问一答保护超时时间，单位 ms。 */
+#define PUMP_DRIVE_BUS_TIMEOUT_MS      100U
+
 /** ISC1000 二进制反馈帧固定帧头，所有反馈帧都以 0xFF 开始。 */
 #define PUMP_DRIVE_FRAME_HEADER        0xFFU
 
@@ -113,8 +134,8 @@ typedef struct
 /**
  * @brief ISC1000 驱动实例。
  *
- * 当前工程只使用 USART3 和一个 ISC1000 模块，因此驱动内部按单实例设计；
- * 仍然保留结构体，是为了集中保存串口实例、通讯模式、最近反馈和解析状态。
+ * 当前工程用 USART3 挂一条 RS485 总线，总线上允许存在两台不同 ID 的 ISC1000。
+ * 每个 PumpDrive_s 代表一台驱动器，接收回调会按反馈帧中的设备 ID 分发状态。
  */
 typedef struct
 {
@@ -128,6 +149,8 @@ typedef struct
     uint32_t sequence_count;                  /**< `act 0 rdcnt` 返回的离线时序运行次数。 */
     uint8_t frame_ready;                      /**< 成功解析到一帧后置 1，上层处理完可手动清 0。 */
     uint8_t last_rx_id;                       /**< 最近一次反馈帧中的设备 ID。 */
+    uint32_t full_stroke_ul;                  /**< 该泵满行程体积，单位 ul。 */
+    uint32_t full_stroke_steps;               /**< 该泵满行程命令步数。 */
     uint16_t text_len;                        /**< text_feedback 中的有效字符数量，不含结尾 `\0`。 */
     char text_feedback[PUMP_DRIVE_TEXT_MAX];  /**< 握手、配置、离线时序脚本等 ASCII 文本反馈。 */
 } PumpDrive_s;
@@ -143,6 +166,44 @@ typedef struct
  * @note 本函数只注册 USART3，不会占用 USART2 或其它串口。
  */
 uint8_t PumpDrive_Init(PumpDrive_s *pump, PumpDriveBusMode_e mode, uint8_t device_id);
+
+/**
+ * @brief 初始化本机两台定量泵。
+ *
+ * @return 1 表示两台泵都已经注册完成；0 表示 USART3 注册失败或 ID 冲突。
+ *
+ * @note 当前硬件约定：ID1=300ul，ID2=100ul，两台泵共用 USART3 RS485 总线。
+ */
+uint8_t PumpDrive_BoardInit(void);
+
+/**
+ * @brief 获取 300ul 定量泵实例。
+ *
+ * @return 初始化完成后返回 ID1 泵实例；未初始化时返回 NULL。
+ */
+PumpDrive_s *PumpDrive_Get300ulPump(void);
+
+/**
+ * @brief 获取 100ul 定量泵实例。
+ *
+ * @return 初始化完成后返回 ID2 泵实例；未初始化时返回 NULL。
+ */
+PumpDrive_s *PumpDrive_Get100ulPump(void);
+
+/**
+ * @brief 按 RS485 设备 ID 获取定量泵实例。
+ *
+ * @param device_id RS485 设备 ID。
+ * @return 找到时返回对应泵实例；找不到时返回 NULL。
+ */
+PumpDrive_s *PumpDrive_GetByDeviceId(uint8_t device_id);
+
+/**
+ * @brief ISC1000 总线周期维护。
+ *
+ * @note 当前只做 RS485 一问一答超时释放。即使不周期调用，下一次发送前也会自动检查超时。
+ */
+void PumpDrive_Process(void);
 
 /**
  * @brief 发送一条 ISC1000 原始 ASCII 命令。
@@ -231,6 +292,89 @@ uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps);
  * @return 1 表示发送成功；0 表示发送失败。
  */
 uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps);
+
+/**
+ * @brief 设置泵体标定参数。
+ *
+ * @param pump 驱动实例指针。
+ * @param full_stroke_ul 满行程体积，单位 ul。
+ * @param full_stroke_steps 满行程命令步数。
+ *
+ * @note 当前默认：ID1=300ul/1600步，ID2=100ul/1600步。
+ */
+void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32_t full_stroke_steps);
+
+/**
+ * @brief 将吸入/排出体积换算成命令步数。
+ *
+ * @param pump 驱动实例指针。
+ * @param volume_ul 目标体积，单位 ul。
+ * @return 四舍五入后的命令步数。
+ */
+uint32_t PumpDrive_VolumeUlToSteps(PumpDrive_s *pump, uint32_t volume_ul);
+
+/**
+ * @brief 将旋转角度换算成命令步数。
+ *
+ * @param pump 驱动实例指针。
+ * @param angle_deg_x10 角度放大 10 倍，例如 900 表示 90.0 度。
+ * @return 四舍五入后的命令步数。
+ */
+uint32_t PumpDrive_AngleDegX10ToSteps(PumpDrive_s *pump, uint32_t angle_deg_x10);
+
+/**
+ * @brief 将转速换算成 ISC1000 的 spd 参数。
+ *
+ * @param pump 驱动实例指针。
+ * @param rpm_x10 转速放大 10 倍，例如 3000 表示 300.0 RPM。
+ * @return 四舍五入后的 PPS。
+ */
+uint32_t PumpDrive_RpmX10ToPps(PumpDrive_s *pump, uint32_t rpm_x10);
+
+/**
+ * @brief 按 RPM 设置运行速度。
+ *
+ * @param pump 驱动实例指针。
+ * @param rpm_x10 转速放大 10 倍，例如 3000 表示 300.0 RPM。
+ * @return 1 表示发送成功；0 表示参数错误或总线忙。
+ */
+uint8_t PumpDrive_SetSpeedRpmX10(PumpDrive_s *pump, uint32_t rpm_x10);
+
+/**
+ * @brief 按体积吸入液体。
+ *
+ * @param pump 驱动实例指针。
+ * @param volume_ul 目标体积，单位 ul。
+ * @return 1 表示发送成功；0 表示参数错误或总线忙。
+ */
+uint8_t PumpDrive_MoveInVolumeUl(PumpDrive_s *pump, uint32_t volume_ul);
+
+/**
+ * @brief 按体积排出液体。
+ *
+ * @param pump 驱动实例指针。
+ * @param volume_ul 目标体积，单位 ul。
+ * @return 1 表示发送成功；0 表示参数错误或总线忙。
+ */
+uint8_t PumpDrive_MoveOutVolumeUl(PumpDrive_s *pump, uint32_t volume_ul);
+
+/**
+ * @brief 按角度执行吸入方向运动。
+ *
+ * @param pump 驱动实例指针。
+ * @param angle_deg_x10 角度放大 10 倍。
+ * @return 1 表示发送成功；0 表示参数错误或总线忙。
+ */
+uint8_t PumpDrive_MoveInAngleDegX10(PumpDrive_s *pump, uint32_t angle_deg_x10);
+
+/**
+ * @brief 按角度执行排出方向运动。
+ *
+ * @param pump 驱动实例指针。
+ * @param angle_deg_x10 角度放大 10 倍。
+ * @return 1 表示发送成功；0 表示参数错误或总线忙。
+ */
+uint8_t PumpDrive_MoveOutAngleDegX10(PumpDrive_s *pump, uint32_t angle_deg_x10);
 
 /**
  * @brief 控制输出通道 1 / 阀 1。
@@ -409,7 +553,7 @@ uint32_t PumpDrive_Decode5ByteToUint32(const uint8_t raw_5bytes[5]);
  * @brief 计算 ISC1000 反馈帧 BCC 异或校验。
  * @param data 参与校验的数据起始地址，不包含帧头 0xFF 和帧尾 0xFE。
  * @param len 参与校验的数据长度，单位 byte。
- * @return 1 字节 BCC 原始值；发送/接收时会被拆成两个 4-bit 字节。
+ * @return 1 字节 BCC 原始值；反馈帧中拆成高 1bit 和低 7bit 两个字节。
  */
 uint8_t PumpDrive_CalcBcc(const uint8_t *data, uint16_t len);
 

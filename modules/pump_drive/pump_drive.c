@@ -11,18 +11,45 @@
 /*
  * ISC1000 的发送方向是 ASCII 命令，接收方向是二进制反馈帧。
  * 本驱动固定注册 USART3：PB10=TX，PB11=RX，对应 Core/Src/usart.c 里的 huart3。
+ * RS485 模式下，两台驱动器共用同一条总线，反馈帧按设备 ID 分发到对应实例。
  */
 #define PUMP_DRIVE_TX_BUFFER_SIZE 96U
 
-static PumpDrive_s *s_active_pump = NULL;
+static USARTInstance *s_pump_usart = NULL;
+static PumpDrive_s *s_pump_list[PUMP_DRIVE_MAX_INSTANCE] = {0};
+static PumpDrive_s s_pump_300ul = {0};
+static PumpDrive_s s_pump_100ul = {0};
+static uint8_t s_pump_count = 0U;
+static uint8_t s_board_inited = 0U;
+static uint8_t s_bus_waiting = 0U;
+static uint8_t s_bus_waiting_id = 0U;
+static uint32_t s_bus_wait_start_ms = 0U;
 
 /**
  * @brief USART3 接收完成回调入口。
  *
  * bsp_usart 在 USART3 收到一帧 DMA + IDLE 数据后，会调用此函数。
- * 该函数不直接处理串口寄存器，只把接收缓冲区交给 PumpDrive_ParseStream()。
+ * 该函数不直接处理串口寄存器，只把接收缓冲区交给总线解析函数。
  */
 static void PumpDrive_UsartRxCallback(void);
+
+static uint32_t PumpDrive_GetMs(void);
+
+static uint8_t PumpDrive_RegisterBus(void);
+
+static uint8_t PumpDrive_AddInstance(PumpDrive_s *pump);
+
+static PumpDrive_s *PumpDrive_FindById(uint8_t device_id);
+
+static void PumpDrive_SetDefaultCalibration(PumpDrive_s *pump);
+
+static uint8_t PumpDrive_IsBusReady(PumpDrive_s *pump);
+
+static void PumpDrive_StartBusWait(PumpDrive_s *pump);
+
+static void PumpDrive_ClearBusWait(uint8_t device_id);
+
+static uint8_t PumpDrive_ParseBusStream(const uint8_t *data, uint16_t len);
 
 /**
  * @brief 使用 printf 风格格式化命令，然后发送到 ISC1000。
@@ -45,6 +72,192 @@ static uint8_t PumpDrive_ParseOneFrame(PumpDrive_s *pump,
                                        const uint8_t *data,
                                        uint16_t len,
                                        uint16_t *used_len);
+
+/**
+ * @brief 获取当前毫秒时间轴。
+ *
+ * @return HAL_GetTick() 返回的系统毫秒数。
+ */
+static uint32_t PumpDrive_GetMs(void)
+{
+    return HAL_GetTick();
+}
+
+/**
+ * @brief 注册 USART3 总线。
+ *
+ * @return 1 表示总线已经可用；0 表示底层 USART 注册失败。
+ */
+static uint8_t PumpDrive_RegisterBus(void)
+{
+    USART_Init_Config_s usart_config;
+
+    if (s_pump_usart != NULL)
+    {
+        return 1U;
+    }
+
+    /*
+     * USART3 只注册一次。
+     * 后续两台不同 ID 的泵共享同一个 USARTInstance，避免重复注册被 bsp_usart 拒绝。
+     */
+    usart_config.recv_buff_size = PUMP_DRIVE_RX_BUFFER_SIZE;
+    usart_config.usart_handle = &huart3;
+    usart_config.module_callback = PumpDrive_UsartRxCallback;
+
+    s_pump_usart = USARTRegister(&usart_config);
+    return (s_pump_usart != NULL) ? 1U : 0U;
+}
+
+/**
+ * @brief 把泵实例加入 RS485 设备表。
+ *
+ * @param pump 驱动实例指针。
+ * @return 1 表示加入成功；0 表示数量已满或 ID 重复。
+ */
+static uint8_t PumpDrive_AddInstance(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    for (uint8_t i = 0U; i < s_pump_count; i++)
+    {
+        if (s_pump_list[i] == pump)
+        {
+            return 1U;
+        }
+
+        if ((pump->bus_mode == PUMP_DRIVE_BUS_RS485) &&
+            (pump->device_id != 0U) &&
+            (s_pump_list[i]->device_id == pump->device_id))
+        {
+            return 0U;
+        }
+    }
+
+    if (s_pump_count >= PUMP_DRIVE_MAX_INSTANCE)
+    {
+        return 0U;
+    }
+
+    s_pump_list[s_pump_count] = pump;
+    s_pump_count++;
+    return 1U;
+}
+
+/**
+ * @brief 根据反馈帧中的设备 ID 查找泵实例。
+ *
+ * @param device_id 反馈帧 Byte1 设备 ID。
+ * @return 对应的 PumpDrive_s；找不到时返回 NULL。
+ */
+static PumpDrive_s *PumpDrive_FindById(uint8_t device_id)
+{
+    for (uint8_t i = 0U; i < s_pump_count; i++)
+    {
+        if ((s_pump_list[i] != NULL) && (s_pump_list[i]->device_id == device_id))
+        {
+            return s_pump_list[i];
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief 根据设备 ID 写入默认泵体标定。
+ *
+ * @param pump 驱动实例指针。
+ */
+static void PumpDrive_SetDefaultCalibration(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    pump->full_stroke_steps = PUMP_DRIVE_FULL_STROKE_STEPS;
+
+    if (pump->device_id == PUMP_DRIVE_100UL_DEVICE_ID)
+    {
+        pump->full_stroke_ul = PUMP_DRIVE_ID2_FULL_STROKE_UL;
+    }
+    else
+    {
+        pump->full_stroke_ul = PUMP_DRIVE_ID1_FULL_STROKE_UL;
+    }
+}
+
+/**
+ * @brief 释放超时等待中的 RS485 总线。
+ */
+void PumpDrive_Process(void)
+{
+    if ((s_bus_waiting != 0U) &&
+        ((PumpDrive_GetMs() - s_bus_wait_start_ms) >= PUMP_DRIVE_BUS_TIMEOUT_MS))
+    {
+        s_bus_waiting = 0U;
+        s_bus_waiting_id = 0U;
+    }
+}
+
+/**
+ * @brief 判断总线是否允许发送下一条命令。
+ *
+ * @param pump 驱动实例指针。
+ * @return 1 表示可以发送；0 表示参数错误、串口忙或仍在等待上一台设备反馈。
+ */
+static uint8_t PumpDrive_IsBusReady(PumpDrive_s *pump)
+{
+    if ((pump == NULL) || (pump->usart == NULL))
+    {
+        return 0U;
+    }
+
+    PumpDrive_Process();
+
+    if (s_bus_waiting != 0U)
+    {
+        return 0U;
+    }
+
+    return USARTIsReady(pump->usart);
+}
+
+/**
+ * @brief 发送命令后记录等待反馈的设备 ID。
+ *
+ * @param pump 驱动实例指针。
+ */
+static void PumpDrive_StartBusWait(PumpDrive_s *pump)
+{
+    if ((pump == NULL) ||
+        (pump->bus_mode != PUMP_DRIVE_BUS_RS485) ||
+        (pump->device_id == 0U))
+    {
+        return;
+    }
+
+    s_bus_waiting = 1U;
+    s_bus_waiting_id = pump->device_id;
+    s_bus_wait_start_ms = PumpDrive_GetMs();
+}
+
+/**
+ * @brief 收到反馈后释放对应设备的总线等待。
+ *
+ * @param device_id 反馈帧设备 ID。
+ */
+static void PumpDrive_ClearBusWait(uint8_t device_id)
+{
+    if ((s_bus_waiting != 0U) && (s_bus_waiting_id == device_id))
+    {
+        s_bus_waiting = 0U;
+        s_bus_waiting_id = 0U;
+    }
+}
 
 /**
  * @brief 判断离线时序步骤序号是否合法。
@@ -88,8 +301,6 @@ static void PumpDrive_UpdateStatus(PumpDrive_s *pump, uint32_t raw_value)
  */
 uint8_t PumpDrive_Init(PumpDrive_s *pump, PumpDriveBusMode_e mode, uint8_t device_id)
 {
-    USART_Init_Config_s usart_config;
-
     if (pump == NULL)
     {
         return 0U;
@@ -100,24 +311,80 @@ uint8_t PumpDrive_Init(PumpDrive_s *pump, PumpDriveBusMode_e mode, uint8_t devic
     pump->bus_mode = mode;
     pump->device_id = device_id;
 
-    /*
-     * 这里故意硬编码为 huart3：
-     * 1. 满足“只用 USART3 与模块交互”的要求；
-     * 2. 防止后续调用者误把 USART2 等其它串口传进来。
-     */
-    usart_config.recv_buff_size = PUMP_DRIVE_RX_BUFFER_SIZE;
-    usart_config.usart_handle = &huart3;
-    usart_config.module_callback = PumpDrive_UsartRxCallback;
-
-    pump->usart = USARTRegister(&usart_config);
-    if (pump->usart == NULL)
+    if (PumpDrive_RegisterBus() == 0U)
     {
         pump->last_error = PUMP_DRIVE_ERR_SHORT_FRAME;
         return 0U;
     }
 
-    s_active_pump = pump;
+    pump->usart = s_pump_usart;
+    PumpDrive_SetDefaultCalibration(pump);
+
+    if (PumpDrive_AddInstance(pump) == 0U)
+    {
+        pump->last_error = PUMP_DRIVE_ERR_UNSUPPORTED_TYPE;
+        return 0U;
+    }
+
     return 1U;
+}
+
+/**
+ * @brief 初始化本机两台定量泵。
+ *
+ * @return 1 表示两台泵都已经注册完成；0 表示 USART3 注册失败或 ID 冲突。
+ */
+uint8_t PumpDrive_BoardInit(void)
+{
+    if (s_board_inited != 0U)
+    {
+        return 1U;
+    }
+
+    /*
+     * 当前硬件两台 ISC1000 共享 USART3 RS485 总线。
+     * 这里只绑定项目固定 ID 和泵体量程，不在业务层重复写这些常量。
+     */
+    if (PumpDrive_Init(&s_pump_300ul,
+                       PUMP_DRIVE_BUS_RS485,
+                       PUMP_DRIVE_300UL_DEVICE_ID) == 0U)
+    {
+        return 0U;
+    }
+
+    if (PumpDrive_Init(&s_pump_100ul,
+                       PUMP_DRIVE_BUS_RS485,
+                       PUMP_DRIVE_100UL_DEVICE_ID) == 0U)
+    {
+        return 0U;
+    }
+
+    s_board_inited = 1U;
+    return 1U;
+}
+
+/**
+ * @brief 获取 300ul 定量泵实例。
+ */
+PumpDrive_s *PumpDrive_Get300ulPump(void)
+{
+    return PumpDrive_FindById(PUMP_DRIVE_300UL_DEVICE_ID);
+}
+
+/**
+ * @brief 获取 100ul 定量泵实例。
+ */
+PumpDrive_s *PumpDrive_Get100ulPump(void)
+{
+    return PumpDrive_FindById(PUMP_DRIVE_100UL_DEVICE_ID);
+}
+
+/**
+ * @brief 按设备 ID 获取定量泵实例。
+ */
+PumpDrive_s *PumpDrive_GetByDeviceId(uint8_t device_id)
+{
+    return PumpDrive_FindById(device_id);
 }
 
 /**
@@ -136,6 +403,11 @@ uint8_t PumpDrive_SendCommand(PumpDrive_s *pump, const char *command)
     int tx_len;
 
     if ((pump == NULL) || (pump->usart == NULL) || (command == NULL))
+    {
+        return 0U;
+    }
+
+    if (PumpDrive_IsBusReady(pump) == 0U)
     {
         return 0U;
     }
@@ -160,6 +432,8 @@ uint8_t PumpDrive_SendCommand(PumpDrive_s *pump, const char *command)
     }
 
     USARTSend(pump->usart, (uint8_t *)tx_buffer, (uint16_t)tx_len, USART_TRANSFER_BLOCKING);
+    PumpDrive_StartBusWait(pump);
+
     return 1U;
 }
 
@@ -289,6 +563,110 @@ uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps)
 uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps)
 {
     return PumpDrive_SendFormatted(pump, "out %lu", (unsigned long)steps);
+}
+
+/**
+ * @brief 设置泵体体积和步数标定。
+ */
+void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32_t full_stroke_steps)
+{
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    if ((full_stroke_ul == 0U) || (full_stroke_steps == 0U))
+    {
+        return;
+    }
+
+    pump->full_stroke_ul = full_stroke_ul;
+    pump->full_stroke_steps = full_stroke_steps;
+}
+
+/**
+ * @brief 将体积换算成命令步数。
+ */
+uint32_t PumpDrive_VolumeUlToSteps(PumpDrive_s *pump, uint32_t volume_ul)
+{
+    uint32_t steps;
+
+    if ((pump == NULL) || (pump->full_stroke_ul == 0U))
+    {
+        return 0U;
+    }
+
+    steps = (volume_ul * pump->full_stroke_steps + pump->full_stroke_ul / 2U) / pump->full_stroke_ul;
+    return steps;
+}
+
+/**
+ * @brief 将旋转角度换算成命令步数。
+ */
+uint32_t PumpDrive_AngleDegX10ToSteps(PumpDrive_s *pump, uint32_t angle_deg_x10)
+{
+    uint32_t steps_per_turn;
+
+    if ((pump == NULL) || (pump->full_stroke_steps == 0U))
+    {
+        return 0U;
+    }
+
+    steps_per_turn = pump->full_stroke_steps;
+    return (angle_deg_x10 * steps_per_turn + 1800U) / 3600U;
+}
+
+/**
+ * @brief 将转速换算成 ISC1000 的 PPS。
+ */
+uint32_t PumpDrive_RpmX10ToPps(PumpDrive_s *pump, uint32_t rpm_x10)
+{
+    if ((pump == NULL) || (pump->full_stroke_steps == 0U))
+    {
+        return 0U;
+    }
+
+    return (rpm_x10 * pump->full_stroke_steps + 300U) / 600U;
+}
+
+/**
+ * @brief 按 RPM 设置运行速度。
+ */
+uint8_t PumpDrive_SetSpeedRpmX10(PumpDrive_s *pump, uint32_t rpm_x10)
+{
+    return PumpDrive_SetSpeed(pump, PumpDrive_RpmX10ToPps(pump, rpm_x10));
+}
+
+/**
+ * @brief 按体积吸入液体。
+ */
+uint8_t PumpDrive_MoveInVolumeUl(PumpDrive_s *pump, uint32_t volume_ul)
+{
+    return PumpDrive_MoveIn(pump, PumpDrive_VolumeUlToSteps(pump, volume_ul));
+}
+
+/**
+ * @brief 按体积排出液体。
+ */
+uint8_t PumpDrive_MoveOutVolumeUl(PumpDrive_s *pump, uint32_t volume_ul)
+{
+    return PumpDrive_MoveOut(pump, PumpDrive_VolumeUlToSteps(pump, volume_ul));
+}
+
+/**
+ * @brief 按角度执行吸入方向运动。
+ */
+uint8_t PumpDrive_MoveInAngleDegX10(PumpDrive_s *pump, uint32_t angle_deg_x10)
+{
+    return PumpDrive_MoveIn(pump, PumpDrive_AngleDegX10ToSteps(pump, angle_deg_x10));
+}
+
+/**
+ * @brief 按角度执行排出方向运动。
+ */
+uint8_t PumpDrive_MoveOutAngleDegX10(PumpDrive_s *pump, uint32_t angle_deg_x10)
+{
+    return PumpDrive_MoveOut(pump, PumpDrive_AngleDegX10ToSteps(pump, angle_deg_x10));
 }
 
 /**
@@ -605,8 +983,8 @@ uint8_t PumpDrive_CalcBcc(const uint8_t *data, uint16_t len)
  * @brief 检查反馈帧中的两个 BCC 传输字节是否正确。
  * @param payload 参与校验的数据，通常从设备 ID 字节开始。
  * @param payload_len payload 长度。
- * @param bcc_high 反馈帧中的 BCC 高 4 位传输字节。
- * @param bcc_low 反馈帧中的 BCC 低 4 位传输字节。
+ * @param bcc_high 反馈帧中的 BCC 高 1 位传输字节。
+ * @param bcc_low 反馈帧中的 BCC 低 7 位传输字节。
  * @return 1 表示校验通过；0 表示校验失败。
  */
 static uint8_t PumpDrive_CheckBcc(const uint8_t *payload,
@@ -618,11 +996,12 @@ static uint8_t PumpDrive_CheckBcc(const uint8_t *payload,
 
     /*
      * 手册写法为：
-     * Byte1 = BCC 高 4 位，Byte0 = BCC 低 4 位。
-     * 反馈帧中两个校验传输字节按“高 nibble、低 nibble”顺序保存。
+     * Byte1 = (BCC >> 7) & 0x01；
+     * Byte0 = BCC & 0x7F。
+     * 也就是把 8bit BCC 拆成高 1bit 和低 7bit 两个小于 0x80 的字节。
      */
-    return (((bcc >> 4) & 0x0FU) == (bcc_high & 0x0FU)) &&
-           ((bcc & 0x0FU) == (bcc_low & 0x0FU));
+    return (((bcc >> 7U) & 0x01U) == bcc_high) &&
+           ((bcc & 0x7FU) == bcc_low);
 }
 
 /**
@@ -699,6 +1078,13 @@ static uint8_t PumpDrive_ParseOneFrame(PumpDrive_s *pump,
     if (len < 4U)
     {
         pump->last_error = PUMP_DRIVE_ERR_SHORT_FRAME;
+        return 0U;
+    }
+
+    if ((pump->bus_mode == PUMP_DRIVE_BUS_RS485) &&
+        (pump->device_id != 0U) &&
+        (data[1] != pump->device_id))
+    {
         return 0U;
     }
 
@@ -821,22 +1207,74 @@ static uint8_t PumpDrive_ParseOneFrame(PumpDrive_s *pump,
 }
 
 /**
+ * @brief 在 USART3 接收流中按设备 ID 分发 ISC1000 反馈帧。
+ *
+ * @param data 接收缓冲区。
+ * @param len 接收长度。
+ * @return 成功解析出的反馈帧数量。
+ */
+static uint8_t PumpDrive_ParseBusStream(const uint8_t *data, uint16_t len)
+{
+    uint16_t offset = 0U;
+    uint16_t used_len = 0U;
+    uint8_t parsed_count = 0U;
+    PumpDrive_s *pump;
+
+    if (data == NULL)
+    {
+        return 0U;
+    }
+
+    while (offset < len)
+    {
+        if (data[offset] != PUMP_DRIVE_FRAME_HEADER)
+        {
+            offset++;
+            continue;
+        }
+
+        if ((len - offset) < 3U)
+        {
+            break;
+        }
+
+        pump = PumpDrive_FindById(data[offset + 1U]);
+        if (pump == NULL)
+        {
+            offset++;
+            continue;
+        }
+
+        if (PumpDrive_ParseOneFrame(pump, &data[offset], (uint16_t)(len - offset), &used_len) != 0U)
+        {
+            parsed_count++;
+            PumpDrive_ClearBusWait(pump->last_rx_id);
+            offset = (uint16_t)(offset + used_len);
+        }
+        else
+        {
+            offset++;
+        }
+    }
+
+    return parsed_count;
+}
+
+/**
  * @brief USART3 收到一帧数据后的回调处理。
  *
  * bsp_usart 会在 DMA + IDLE 接收完成后调用该函数。
- * 这里取出 USART3 的完成缓冲区和长度，再交给 PumpDrive_ParseStream() 做协议解析。
+ * 这里取出 USART3 的完成缓冲区和长度，再按设备 ID 分发给对应泵实例。
  */
 static void PumpDrive_UsartRxCallback(void)
 {
-    if ((s_active_pump == NULL) ||
-        (s_active_pump->usart == NULL) ||
-        (s_active_pump->usart->rx_buffer_finished == NULL) ||
-        (s_active_pump->usart->rx_len == 0U))
+    if ((s_pump_usart == NULL) ||
+        (s_pump_usart->rx_buffer_finished == NULL) ||
+        (s_pump_usart->rx_len == 0U))
     {
         return;
     }
 
-    (void)PumpDrive_ParseStream(s_active_pump,
-                                s_active_pump->usart->rx_buffer_finished,
-                                s_active_pump->usart->rx_len);
+    (void)PumpDrive_ParseBusStream(s_pump_usart->rx_buffer_finished,
+                                   s_pump_usart->rx_len);
 }
