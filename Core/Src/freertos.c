@@ -256,85 +256,6 @@ __weak void ModuleTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
-static void CAN_TestStart(void)
-{
-  CAN_FilterTypeDef filter = {0};
-
-  filter.FilterActivation = CAN_FILTER_ENABLE;
-  filter.FilterBank = 0;
-  filter.FilterFIFOAssignment = CAN_RX_FIFO0;
-  filter.FilterIdHigh = 0x0000;
-  filter.FilterIdLow = 0x0000;
-  filter.FilterMaskIdHigh = 0x0000;
-  filter.FilterMaskIdLow = 0x0000;
-  filter.FilterMode = CAN_FILTERMODE_IDMASK;
-  filter.FilterScale = CAN_FILTERSCALE_32BIT;
-
-  (void)HAL_CAN_ConfigFilter(&hcan, &filter);
-  (void)HAL_CAN_Start(&hcan);
-}
-
-static void CAN_SendTestFrame(void)
-{
-  static uint8_t decimalCounter[8] = {0U};
-  CAN_TxHeaderTypeDef txHeader = {0};
-  uint8_t data[8];
-  uint32_t txMailbox;
-
-  if (HAL_CAN_GetState(&hcan) != HAL_CAN_STATE_READY &&
-      HAL_CAN_GetState(&hcan) != HAL_CAN_STATE_LISTENING)
-  {
-    return;
-  }
-
-  txHeader.StdId = 0x123U;
-  txHeader.ExtId = 0x00000000U;
-  txHeader.IDE = CAN_ID_STD;
-  txHeader.RTR = CAN_RTR_DATA;
-  txHeader.DLC = 8U;
-  txHeader.TransmitGlobalTime = DISABLE;
-
-  for (uint32_t i = 0U; i < sizeof(data); ++i)
-  {
-    data[i] = decimalCounter[i];
-  }
-
-  if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan) > 0U)
-  {
-    if (HAL_CAN_AddTxMessage(&hcan, &txHeader, data, &txMailbox) == HAL_OK)
-    {
-      for (int32_t i = (int32_t)sizeof(decimalCounter) - 1; i >= 0; --i)
-      {
-        decimalCounter[i]++;
-        if (decimalCounter[i] <= 9U)
-        {
-          break;
-        }
-
-        decimalCounter[i] = 0U;
-      }
-    }
-  }
-}
-
-static void RS485_Send(const uint8_t *data, uint16_t length)
-{
-  (void)HAL_UART_Transmit(&huart3, (uint8_t *)data, length, 100U);
-  while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TC) == RESET)
-  {
-  }
-}
-
-static void RS485_SendTestFrame(void)
-{
-  static const uint8_t frame[] = {
-    0x55U, 0x55U, 0x55U, 0x55U,
-    0x55U, 0x55U, 0x55U, 0x55U
-  };
-
-  RS485_Send(frame, (uint16_t)sizeof(frame));
-}
-
 #if 0
 static void Buzzer_PlaySong(const Note_t *song)
 {
@@ -380,11 +301,6 @@ static void Buzzer_PlayNote(uint32_t freqHz, uint32_t durationMs)
   Buzzer_Off();
 }
 #endif
-
-static void Buzzer_Off(void)
-{
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0U);
-}
 
 /* USER CODE END Application */
 

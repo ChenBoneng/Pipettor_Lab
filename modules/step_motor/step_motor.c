@@ -38,8 +38,8 @@
  * 已确认机械数据：
  * - 驱动器细分数：1600 脉冲/圈；
  * - 丝杆导程：4mm/圈，也就是电机转 1 圈滑台移动 4mm；
- * - 电机 A 所在滑台有效行程：100mm；
- * - 电机 B 所在滑台有效行程：150mm。
+ * - 电机 A 所在滑台有效行程：150mm；
+ * - 电机 B 所在滑台有效行程：300mm。
  *
  * 因此：
  * - 脉冲/毫米 = 1600 / 4 = 400 pulse/mm；
@@ -48,8 +48,8 @@
  */
 #define STEP_MOTOR_DRIVER_MICROSTEP_PPR     1600UL
 #define STEP_MOTOR_SCREW_LEAD_UM            4000UL
-#define STEP_MOTOR_A_TRAVEL_UM              100000UL
-#define STEP_MOTOR_B_TRAVEL_UM              150000UL
+#define STEP_MOTOR_A_TRAVEL_UM              150000UL
+#define STEP_MOTOR_B_TRAVEL_UM              300000UL
 #define STEP_MOTOR_MM_X100_TO_UM            10UL
 #define STEP_MOTOR_CM_X100_TO_UM            100UL
 

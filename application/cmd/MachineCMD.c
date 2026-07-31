@@ -9,6 +9,7 @@
 #include "display_lcd.h"
 #include "Keyboard.h"
 #include "MachineCMD_Text.h"
+#include "activity_meter.h"
 #include "solenoid_valve.h"
 #include "step_motor.h"
 #include "water_pump.h"
@@ -80,6 +81,7 @@ static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, u
 static void MachineCMD_WriteBytes(DisplayLcdRow_e row, const uint8_t *data, uint8_t len);
 static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *text);
 static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, uint8_t switch_mask);
+static void MachineCMD_FormatActivityAscii(char *buffer, uint8_t size, float value, const char *unit);
 static const MachineCmdText_s *MachineCMD_GetManualActionText(void);
 static void MachineCMD_ShowBootPage(void);
 static void MachineCMD_ShowReadyPage(void);
@@ -1008,6 +1010,39 @@ static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, u
 }
 
 /**
+ * @brief 把活度值转换成 LCD 可显示的 ASCII 文本。
+ *
+ * @param buffer 输出缓冲区。
+ * @param size 输出缓冲区长度。
+ * @param value 活度计返回的浮点值。
+ * @param unit 单位字符串，例如 uCi、mCi。
+ *
+ * @note 这里不用 printf 的浮点格式，避免在 STM32F103 上额外拉入较大的格式化代码。
+ */
+static void MachineCMD_FormatActivityAscii(char *buffer, uint8_t size, float value, const char *unit)
+{
+    uint32_t value_x10;
+
+    if ((buffer == NULL) || (size == 0U))
+    {
+        return;
+    }
+
+    if (value < 0.0f)
+    {
+        value = 0.0f;
+    }
+
+    value_x10 = (uint32_t)(value * 10.0f + 0.5f);
+    (void)snprintf(buffer,
+                   size,
+                   "%lu.%01lu%s",
+                   (unsigned long)(value_x10 / 10U),
+                   (unsigned long)(value_x10 % 10U),
+                   unit);
+}
+
+/**
  * @brief 更新 LCD 指定行的原始字节。
  *
  * @param row LCD 行号。
@@ -1185,7 +1220,8 @@ static void MachineCMD_ShowPrepMeasurePage(void)
     uint8_t offset;
     uint32_t elapsed_ms;
     uint32_t left_sec;
-    char ascii[8];
+    char ascii[12];
+    ActivityMeterData_s activity_data;
 
     elapsed_ms = MachineCMD_GetMs() - machine_cmd.measure_start_ms;
     if (elapsed_ms >= MACHINE_CMD_MEASURE_HOLD_MS)
@@ -1198,7 +1234,27 @@ static void MachineCMD_ShowPrepMeasurePage(void)
     }
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_measure);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_activity);
+
+    if ((ActivityMeter_GetData(&activity_data) != 0U) &&
+        (activity_data.state == ACTIVITY_METER_STATE_OK))
+    {
+        memset(line, ' ', sizeof(line));
+        offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_activity);
+        MachineCMD_FormatActivityAscii(ascii,
+                                       sizeof(ascii),
+                                       activity_data.activity,
+                                       ActivityMeter_GetUnitString(activity_data.activity_unit));
+        (void)MachineCMD_LineAppendString(line, offset, ascii);
+        MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
+    }
+    else if (ActivityMeter_GetState() == ACTIVITY_METER_STATE_TIMEOUT)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_activity_timeout);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_activity);
+    }
 
     memset(line, ' ', sizeof(line));
     offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_countdown);
