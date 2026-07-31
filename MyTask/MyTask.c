@@ -53,7 +53,7 @@ void MachineTask(void *argument)
         /* 处理机器人的状态机逻辑 */
         StepMotor_Process();
         MachineCMD_Process();
-        // MachineControl();
+        MachineControl();
 
 
         DWT_SysTimeUpdate();

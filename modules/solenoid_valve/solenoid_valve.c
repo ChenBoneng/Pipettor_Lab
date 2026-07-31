@@ -126,6 +126,15 @@ void SolenoidValve_Off(SolenoidValveId_e valve)
         return;
     }
 
+    /*
+     * 如果阀本来就是掉电状态，不重复更新时间戳。
+     * 否则测试流程启动前的 AllOff() 会让第一次打开阀门被 30ms 保护误挡。
+     */
+    if (solenoid_valve_state[valve] == SOLENOID_VALVE_STATE_OFF_NO_OPEN)
+    {
+        return;
+    }
+
     SolenoidValve_WriteOutput(valve, SOLENOID_VALVE_STATE_OFF_NO_OPEN);
 }
 
