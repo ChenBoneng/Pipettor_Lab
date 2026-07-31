@@ -8,31 +8,16 @@
 #include "bsp_dwt.h"
 #include "display_lcd.h"
 #include "Keyboard.h"
-#include "main.h"
 #include "MachineCMD_Text.h"
+#include "solenoid_valve.h"
 #include "step_motor.h"
+#include "water_pump.h"
 
 #define MACHINE_CMD_LCD_LINE_BYTES        16U
 #define MACHINE_CMD_INPUT_MAX_LEN         5U
 #define MACHINE_CMD_PREP_BOTTLE_COUNT     1U
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
-
-/*
- * 当前硬件表中能确认的三路 24V 输出：
- * - PC13：阀 1；
- * - PC14：阀 2；
- * - PC15：抽水泵。
- *
- * 手动页先把“水进/药进/水出/药出”作为逻辑开关保存，再映射到这三路硬件。
- * 如果后续增加独立药出泵或陶瓷泵方向控制，只需要改 MachineCMD_ApplyManualOutputs()。
- */
-#define MACHINE_CMD_VALVE_WATER_PORT      GPIOC
-#define MACHINE_CMD_VALVE_WATER_PIN       GPIO_PIN_13
-#define MACHINE_CMD_VALVE_MED_PORT        GPIOC
-#define MACHINE_CMD_VALVE_MED_PIN         GPIO_PIN_14
-#define MACHINE_CMD_WATER_PUMP_PORT       GPIOC
-#define MACHINE_CMD_WATER_PUMP_PIN        GPIO_PIN_15
 
 typedef enum
 {
@@ -846,7 +831,7 @@ static uint8_t MachineCMD_IsManualSwitchAction(MachineCmdManualAction_e action)
  *
  * @param switch_mask 要翻转的开关位，见 MACHINE_CMD_MANUAL_xxx。
  *
- * @note 每次开关变化后立即调用 MachineCMD_ApplyManualOutputs() 同步到底层 GPIO。
+ * @note 每次开关变化后立即调用 MachineCMD_ApplyManualOutputs() 同步到底层输出模块。
  */
 static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask)
 {
@@ -862,15 +847,14 @@ static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask)
 static void MachineCMD_ClearManualSwitches(void)
 {
     machine_cmd.manual_switches = 0U;
-    MachineCMD_ApplyManualOutputs();
+    SolenoidValve_AllOff();
+    WaterPump_StopAll();
 }
 
 /**
- * @brief 将手动调试逻辑开关同步到 GPIO 输出。
+ * @brief 将手动调试逻辑开关同步到底层阀门和抽水泵。
  *
- * @note 这里是目前唯一直接碰手动输出 GPIO 的地方。
- *       后续如果独立出阀门 BSP 或泵 BSP，应优先只替换本函数内部实现，
- *       不让 LCD 页面和按键处理代码直接依赖具体引脚。
+ * @note LCD 页面和按键处理只关心“水进/药进/水出/药出”，不再直接依赖具体引脚。
  */
 static void MachineCMD_ApplyManualOutputs(void)
 {
@@ -879,9 +863,9 @@ static void MachineCMD_ApplyManualOutputs(void)
     uint8_t pump_on;
 
     /*
-     * 三路已确认硬件输出的临时映射：
-     * - 水进/水出打开阀 1；
-     * - 药进/药出打开阀 2；
+     * 三路已确认硬件输出映射：
+     * - 水进/水出打开水路阀；
+     * - 药进/药出打开药路阀；
      * - 水出/药出打开抽水泵。
      *
      * “进”方向目前只作为阀门开关，不额外打开泵，避免没有方向控制时误动作。
@@ -893,15 +877,16 @@ static void MachineCMD_ApplyManualOutputs(void)
     pump_on = ((machine_cmd.manual_switches &
                 (MACHINE_CMD_MANUAL_WATER_OUT | MACHINE_CMD_MANUAL_MED_OUT)) != 0U) ? 1U : 0U;
 
-    HAL_GPIO_WritePin(MACHINE_CMD_VALVE_WATER_PORT,
-                      MACHINE_CMD_VALVE_WATER_PIN,
-                      water_valve_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(MACHINE_CMD_VALVE_MED_PORT,
-                      MACHINE_CMD_VALVE_MED_PIN,
-                      med_valve_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(MACHINE_CMD_WATER_PUMP_PORT,
-                      MACHINE_CMD_WATER_PUMP_PIN,
-                      pump_on ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
+                                 water_valve_on ?
+                                 SOLENOID_VALVE_STATE_ON_NC_OPEN :
+                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
+                                 med_valve_on ?
+                                 SOLENOID_VALVE_STATE_ON_NC_OPEN :
+                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+    (void)WaterPump_SetState(WATER_PUMP_ID_MAIN,
+                             pump_on ? WATER_PUMP_STATE_ON : WATER_PUMP_STATE_OFF);
 }
 
 /**

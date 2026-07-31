@@ -11,7 +11,10 @@
 #include "display_lcd.h"
 #include "MachineCMD.h"
 #include "machine.h"
+#include "io_output.h"
+#include "solenoid_valve.h"
 #include "step_motor.h"
+#include "water_pump.h"
 
 void AllTaskInit(void)
 {
@@ -20,6 +23,9 @@ void AllTaskInit(void)
     Keypad_Init();
     Communication_Init();
     StepMotor_Init();
+    IoOutput_Init();
+    SolenoidValve_Init();
+    WaterPump_Init();
     MachineInit();
     MachineCMD_Init();
 }
