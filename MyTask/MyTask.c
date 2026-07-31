@@ -26,8 +26,8 @@ void AllTaskInit(void)
     IoOutput_Init();
     SolenoidValve_Init();
     WaterPump_Init();
-    MachineInit();
     MachineCMD_Init();
+    MachineInit();
 }
 
 
@@ -50,14 +50,9 @@ void MachineTask(void *argument)
 
     for (;;)
     {
-        /* 处理机器人的状态机逻辑 */
-        StepMotor_Process();
-        MachineCMD_Process();
+        /* 处理机器主流程状态机，不直接扫描按键或维护底层模块。 */
         MachineControl();
-
-
-        DWT_SysTimeUpdate();
-        osDelay(2); // 每 2ms 执行一次
+        osDelay(2);
     }
 }
 
@@ -69,5 +64,41 @@ void LCDTask(void *argument)
         MachineCMD_LCDTask();
 
         osDelay(100); // 每 100ms 刷新一次 LCD 内容
+    }
+}
+
+void MachineCMDTask(void *argument)
+{
+    (void)argument;
+
+    for (;;)
+    {
+        /*
+         * 处理控制信号：
+         * - 当前先处理矩阵键盘产生的一次性按键事件；
+         * - 后续上位机 CAN 指令、远控接管也放在这里统一分发。
+         */
+        MachineCMD_Process();
+        osDelay(2);
+    }
+}
+
+void ModuleTask(void *argument)
+{
+    (void)argument;
+
+    for (;;)
+    {
+        /*
+         * 底层模块周期维护任务：
+         * - StepMotor_Process() 负责步进电机加减速状态维护；
+         * - DWT_SysTimeUpdate() 周期更新时间轴，防止 CYCCNT 长时间无人读取。
+         *
+         * 这里不处理业务流程，也不处理按键/CAN 控制命令。
+         */
+        StepMotor_Process();
+        DWT_SysTimeUpdate();
+
+        osDelay(2);
     }
 }

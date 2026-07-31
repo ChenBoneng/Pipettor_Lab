@@ -76,6 +76,20 @@ const osThreadAttr_t StartLCDTask_attributes = {
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
+/* Definitions for StartMachineCMD */
+osThreadId_t StartMachineCMDHandle;
+const osThreadAttr_t StartMachineCMD_attributes = {
+  .name = "StartMachineCMD",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for StartModuleTask */
+osThreadId_t StartModuleTaskHandle;
+const osThreadAttr_t StartModuleTask_attributes = {
+  .name = "StartModuleTask",
+  .stack_size = 256 * 4,
+  .priority = (osPriority_t) osPriorityLow,
+};
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
@@ -93,6 +107,8 @@ static void Buzzer_Off(void);
 void KeyboardTask(void *argument);
 void MachineTask(void *argument);
 void LCDTask(void *argument);
+void MachineCMDTask(void *argument);
+void ModuleTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -131,6 +147,12 @@ void MX_FREERTOS_Init(void) {
 
   /* creation of StartLCDTask */
   StartLCDTaskHandle = osThreadNew(LCDTask, NULL, &StartLCDTask_attributes);
+
+  /* creation of StartMachineCMD */
+  StartMachineCMDHandle = osThreadNew(MachineCMDTask, NULL, &StartMachineCMD_attributes);
+
+  /* creation of StartModuleTask */
+  StartModuleTaskHandle = osThreadNew(ModuleTask, NULL, &StartModuleTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -194,6 +216,42 @@ __weak void LCDTask(void *argument)
     osDelay(1);
   }
   /* USER CODE END LCDTask */
+}
+
+/* USER CODE BEGIN Header_MachineCMDTask */
+/**
+* @brief Function implementing the StartMachineCMD thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_MachineCMDTask */
+__weak void MachineCMDTask(void *argument)
+{
+  /* USER CODE BEGIN MachineCMDTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END MachineCMDTask */
+}
+
+/* USER CODE BEGIN Header_ModuleTask */
+/**
+* @brief Function implementing the StartModuleTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_ModuleTask */
+__weak void ModuleTask(void *argument)
+{
+  /* USER CODE BEGIN ModuleTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END ModuleTask */
 }
 
 /* Private application code --------------------------------------------------*/
