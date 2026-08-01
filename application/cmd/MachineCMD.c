@@ -9,7 +9,9 @@
 #include "display_lcd.h"
 #include "Keyboard.h"
 #include "MachineCMD_Text.h"
+#include "Communication.h"
 #include "activity_meter.h"
+#include "pump_drive.h"
 #include "solenoid_valve.h"
 #include "step_motor.h"
 #include "water_pump.h"
@@ -20,6 +22,17 @@
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
 #define MACHINE_CMD_DEFAULT_LEFT_ML_X100  12050U
+#define MACHINE_CMD_REMOTE_DIR_PULL       0U
+#define MACHINE_CMD_REMOTE_PUMP_STOP      0U
+#define MACHINE_CMD_REMOTE_PUMP_IN        1U
+#define MACHINE_CMD_REMOTE_PUMP_OUT       2U
+#define MACHINE_CMD_REMOTE_MOTOR_A_BUSY   (1U << 0)
+#define MACHINE_CMD_REMOTE_MOTOR_B_BUSY   (1U << 1)
+#define MACHINE_CMD_REMOTE_PUMP_300_BUSY  (1U << 2)
+#define MACHINE_CMD_REMOTE_PUMP_100_BUSY  (1U << 3)
+#define MACHINE_CMD_REMOTE_WATER_VALVE_ON (1U << 0)
+#define MACHINE_CMD_REMOTE_MED_VALVE_ON   (1U << 1)
+#define MACHINE_CMD_REMOTE_WATER_PUMP_ON  (1U << 2)
 
 typedef enum
 {
@@ -57,6 +70,8 @@ typedef struct
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
     uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
     uint8_t dispense_input_error;                         // 发药输入超余量提示标志
+    uint8_t remote_enabled;                               // 上位机远控接管标志
+    uint8_t remote_paused;                                // 远控暂停标志，本地暂停键置位
     MachineCmdPrepFocus_e prep_focus;                     // 配药设置页当前输入焦点
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
     MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
@@ -83,6 +98,7 @@ static void MachineCMD_HandlePrepRunningKey(KeypadState_e key);
 static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key);
 static void MachineCMD_HandleDispSettingKey(KeypadState_e key);
 static void MachineCMD_HandleDispRunningKey(KeypadState_e key);
+static void MachineCMD_HandleRemoteKey(KeypadState_e key);
 static void MachineCMD_HandleManualKey(KeypadState_e key);
 static void MachineCMD_HandlePausedKey(KeypadState_e key);
 static void MachineCMD_SetManualAction(KeypadState_e key);
@@ -92,6 +108,16 @@ static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask);
 static void MachineCMD_ClearManualSwitches(void);
 static void MachineCMD_ApplyManualOutputs(void);
 static void MachineCMD_PauseCurrentFlow(void);
+static void MachineCMD_EnterRemoteMode(void);
+static void MachineCMD_StopRemoteOutputs(void);
+static void MachineCMD_PauseRemoteMode(void);
+static void MachineCMD_ProcessRemoteCommand(void);
+static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *command);
+static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *command);
+static uint8_t MachineCMD_HandleRemoteValve(const CommunicationHostCommand_s *command);
+static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *command);
+static uint8_t MachineCMD_HandleRemoteStopObject(const CommunicationHostCommand_s *command);
+static void MachineCMD_SendRemoteStatus(uint8_t seq);
 static uint8_t MachineCMD_LineAppendBytes(uint8_t *line, uint8_t offset, const uint8_t *data, uint8_t len);
 static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const MachineCmdText_s *text);
 static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const char *text);
@@ -109,6 +135,7 @@ static void MachineCMD_ShowPrepRunningPage(void);
 static void MachineCMD_ShowPrepMeasurePage(void);
 static void MachineCMD_ShowDispSettingPage(void);
 static void MachineCMD_ShowDispRunningPage(void);
+static void MachineCMD_ShowRemotePage(void);
 static void MachineCMD_ShowManualPage(void);
 static void MachineCMD_ShowCleanPage(void);
 static void MachineCMD_ShowPausedPage(void);
@@ -129,6 +156,8 @@ void MachineCMD_Init(void)
     machine_cmd.left_ml_x100 = MACHINE_CMD_DEFAULT_LEFT_ML_X100;
     machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
+    machine_cmd.remote_enabled = 0U;
+    machine_cmd.remote_paused = 0U;
     MachineCMD_ClearManualSwitches();
 }
 
@@ -162,6 +191,7 @@ void MachineCMD_Process(void)
     key = Keypad_GetPressedState();
     if (key == KEYPAD_STATE_NONE)
     {
+        MachineCMD_ProcessRemoteCommand();
         return;
     }
 
@@ -185,10 +215,13 @@ void MachineCMD_Process(void)
     {
         MachineCMD_ClearInput();
         MachineCMD_ClearManualSwitches();
+        MachineCMD_StopRemoteOutputs();
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
         machine_cmd.dispense_input_error = 0U;
         machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+        machine_cmd.remote_enabled = 0U;
+        machine_cmd.remote_paused = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
         return;
     }
@@ -217,6 +250,10 @@ void MachineCMD_Process(void)
 
     case MACHINE_CMD_PAGE_DISP_RUNNING:
         MachineCMD_HandleDispRunningKey(key);
+        break;
+
+    case MACHINE_CMD_PAGE_REMOTE:
+        MachineCMD_HandleRemoteKey(key);
         break;
 
     case MACHINE_CMD_PAGE_MANUAL:
@@ -278,6 +315,10 @@ void MachineCMD_LCDTask(void)
         MachineCMD_ShowDispRunningPage();
         break;
 
+    case MACHINE_CMD_PAGE_REMOTE:
+        MachineCMD_ShowRemotePage();
+        break;
+
     case MACHINE_CMD_PAGE_MANUAL:
         MachineCMD_ShowManualPage();
         break;
@@ -315,6 +356,16 @@ MachineCmdPage_e MachineCMD_GetPage(void)
 uint8_t MachineCMD_GetManualSwitches(void)
 {
     return machine_cmd.manual_switches;
+}
+
+/**
+ * @brief 判断当前是否已经交给上位机远控。
+ *
+ * @return 1 表示远控接管中；0 表示本机普通 UI 控制。
+ */
+uint8_t MachineCMD_IsRemoteMode(void)
+{
+    return machine_cmd.remote_enabled;
 }
 
 /**
@@ -672,6 +723,10 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_ALARM);
         break;
 
+    case KEYPAD_STATE_REMOTE:
+        MachineCMD_EnterRemoteMode();
+        break;
+
     case KEYPAD_STATE_NUM_1:
     case KEYPAD_STATE_NUM_2:
     case KEYPAD_STATE_NUM_4:
@@ -686,7 +741,6 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
     case KEYPAD_STATE_RETRACT_NEEDLE:
     case KEYPAD_STATE_DRAW_MEDICINE:
     case KEYPAD_STATE_EXHAUST_FIXED:
-    case KEYPAD_STATE_REMOTE:
         MachineCMD_SetManualAction(key);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_MANUAL);
         break;
@@ -1066,15 +1120,514 @@ static void MachineCMD_ApplyManualOutputs(void)
 /**
  * @brief 暂停当前运行提示页。
  *
- * @note 当前能直接停止的是 DM542 步进电机和 MachineCMD 管理的三路手动输出。
- *       ISC1000 定量泵没有在本模块保存实例，后续接入 machine 层后应在那里统一停泵。
+ * @note 暂停必须先让所有已知执行器停到安全状态，再切换 UI 页面。
+ *       这里直接停 DM542、两只电磁阀、抽水泵和两台 ISC1000 定量泵。
  */
 static void MachineCMD_PauseCurrentFlow(void)
 {
     machine_cmd.paused_page = machine_cmd.page;
-    StepMotor_StopAll();
     MachineCMD_ClearManualSwitches();
+    MachineCMD_StopRemoteOutputs();
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_PAUSED);
+}
+
+/**
+ * @brief 处理上位机远控接管页的本机按键。
+ *
+ * @param key 当前一次性按下事件。
+ *
+ * @note 远控页只保留本机安全相关按键：
+ *       - 暂停键：立即停止当前输出，但仍保持远控模式；
+ *       - 复位键：在 MachineCMD_Process() 的统一复位分支中退出远控模式。
+ *       其它按键不再触发本机流程，避免本机和上位机同时抢控制权。
+ */
+static void MachineCMD_HandleRemoteKey(KeypadState_e key)
+{
+    if (key == KEYPAD_STATE_PAUSE)
+    {
+        MachineCMD_PauseRemoteMode();
+    }
+}
+
+/**
+ * @brief 从本机待机页进入上位机远控接管模式。
+ *
+ * @note 进入远控时先清掉本机输入事件和手动输出，再交给上位机。
+ *       这样可以避免用户刚才在配药/发药页留下的确认事件继续被 machine 层消费。
+ */
+static void MachineCMD_EnterRemoteMode(void)
+{
+    MachineCMD_ClearInput();
+    MachineCMD_ClearManualSwitches();
+    MachineCMD_StopRemoteOutputs();
+
+    machine_cmd.prep_confirmed = 0U;
+    machine_cmd.dispense_confirmed = 0U;
+    machine_cmd.dispense_input_error = 0U;
+    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
+    machine_cmd.remote_enabled = 1U;
+    machine_cmd.remote_paused = 0U;
+
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+}
+
+/**
+ * @brief 停止远控模式能直接管理的所有执行器。
+ *
+ * @note 本函数只调用各 modules 层公开接口，不接触 BSP 和具体引脚。
+ *       这样远控暂停、复位、上位机 STOP_OBJECT 都能复用同一套停机动作。
+ */
+static void MachineCMD_StopRemoteOutputs(void)
+{
+    PumpDrive_s *pump;
+
+    StepMotor_StopAll();
+    SolenoidValve_AllOff();
+    WaterPump_StopAll();
+
+    pump = PumpDrive_Get300ulPump();
+    if (pump != NULL)
+    {
+        (void)PumpDrive_Stop(pump, 1U);
+    }
+
+    pump = PumpDrive_Get100ulPump();
+    if (pump != NULL)
+    {
+        (void)PumpDrive_Stop(pump, 1U);
+    }
+}
+
+/**
+ * @brief 暂停上位机远控模式。
+ *
+ * @note 暂停后仍保持 remote_enabled=1，上位机仍可查询状态或发送停止/复位类命令。
+ *       本机复位键才会真正退出远控模式并回到待机页。
+ */
+static void MachineCMD_PauseRemoteMode(void)
+{
+    MachineCMD_StopRemoteOutputs();
+    machine_cmd.remote_enabled = 1U;
+    machine_cmd.remote_paused = 1U;
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+}
+
+/**
+ * @brief 周期消费一帧上位机命令。
+ *
+ * @note Communication 层只负责收帧、授权和缓存最新命令，不直接驱动机械动作。
+ *       MachineCMD 作为“命令解释层”，只在远控接管后执行这些命令。
+ */
+static void MachineCMD_ProcessRemoteCommand(void)
+{
+    CommunicationHostCommand_s command;
+
+    if (Communication_HasNewCommand() == 0U)
+    {
+        return;
+    }
+
+    if (Communication_GetHostCommand(&command) == 0U)
+    {
+        Communication_ClearNewCommandFlag();
+        return;
+    }
+
+    /*
+     * 查询类命令不改变机械状态，允许上位机在未接管前读取状态/版本/活度。
+     * 动作类命令必须先按【远控】进入接管页后才执行，避免旧命令或误发命令抢走本机控制权。
+     */
+    Communication_ClearNewCommandFlag();
+    if ((machine_cmd.remote_enabled == 0U) &&
+        (command.cmd != COMMUNICATION_CMD_QUERY_STATUS) &&
+        (command.cmd != COMMUNICATION_CMD_QUERY_VERSION) &&
+        (command.cmd != COMMUNICATION_CMD_READ_ACTIVITY))
+    {
+        return;
+    }
+
+    MachineCMD_ExecuteRemoteCommand(&command);
+}
+
+/**
+ * @brief 根据协议命令分发上位机远控动作。
+ *
+ * @param command 已通过 Communication 层授权检查的上位机命令。
+ *
+ * @note 当前只落地底层执行器直控和查询类命令。START_PROCESS/SET_PARAM 这类完整流程命令
+ *       后续应交给 machine 主状态机实现，避免 UI 层越权拼业务流程。
+ */
+static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *command)
+{
+    ActivityMeterData_s activity_data;
+    uint8_t activity_state;
+
+    if (command == NULL)
+    {
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_STOP_PROCESS)
+    {
+        MachineCMD_PauseRemoteMode();
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_RESET_ERROR)
+    {
+        MachineCMD_StopRemoteOutputs();
+        machine_cmd.remote_paused = 0U;
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_QUERY_STATUS)
+    {
+        MachineCMD_SendRemoteStatus(command->seq);
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_QUERY_VERSION)
+    {
+        (void)Communication_SendVersion(1U, 0U, 1U, 0U, 1U, 0U, command->seq);
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_READ_ACTIVITY)
+    {
+        if ((ActivityMeter_GetData(&activity_data) != 0U) &&
+            (activity_data.state == ACTIVITY_METER_STATE_OK))
+        {
+            (void)Communication_SendActivity(activity_data.activity,
+                                             (uint8_t)activity_data.activity_unit,
+                                             command->seq);
+            (void)Communication_SendActivityInfo(activity_data.nuclide_id,
+                                                 activity_data.background_subtracted,
+                                                 activity_data.channel,
+                                                 (uint8_t)activity_data.state,
+                                                 command->seq);
+        }
+        else
+        {
+            activity_state = (uint8_t)ActivityMeter_GetState();
+            (void)Communication_SendActivityInfo(0U, 0U, 0U, activity_state, command->seq);
+            (void)ActivityMeter_RequestRead();
+        }
+        return;
+    }
+
+    if (command->cmd == COMMUNICATION_CMD_STOP_OBJECT)
+    {
+        (void)MachineCMD_HandleRemoteStopObject(command);
+        return;
+    }
+
+    /*
+     * 远控暂停后只接受停止、复位和查询类命令。
+     * 如果继续执行运动/阀/泵命令，本机暂停键就失去了安全意义。
+     */
+    if (machine_cmd.remote_paused != 0U)
+    {
+        return;
+    }
+
+    switch (command->cmd)
+    {
+    case COMMUNICATION_CMD_MOVE_STEPPER:
+        (void)MachineCMD_HandleRemoteStepper(command);
+        break;
+
+    case COMMUNICATION_CMD_VALVE_CONTROL:
+        (void)MachineCMD_HandleRemoteValve(command);
+        break;
+
+    case COMMUNICATION_CMD_PUMP_CONTROL:
+        (void)MachineCMD_HandleRemotePump(command);
+        break;
+
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief 执行上位机单轴步进电机命令。
+ *
+ * @param command 上位机命令缓存。
+ * @return 1 表示已成功启动或停止；0 表示参数不支持或底层拒绝启动。
+ *
+ * @note 当前远控执行层约定：
+ *       Byte1=对象，MOTOR_A/MOTOR_B；
+ *       Byte2=方向，0 表示拉/PULL，非 0 表示推/PUSH；
+ *       Byte3~4=speed_pps，小端；
+ *       Byte5~6=steps，小端，0 表示连续运行，必须由 STOP_OBJECT 停止。
+ */
+static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *command)
+{
+    StepMotorId_e motor;
+    StepMotorDirection_e direction;
+    uint16_t speed_pps;
+    uint16_t steps;
+
+    if (command == NULL)
+    {
+        return 0U;
+    }
+
+    if (command->obj == COMMUNICATION_OBJ_MOTOR_A)
+    {
+        motor = STEP_MOTOR_ID_A;
+    }
+    else if (command->obj == COMMUNICATION_OBJ_MOTOR_B)
+    {
+        motor = STEP_MOTOR_ID_B;
+    }
+    else
+    {
+        return 0U;
+    }
+
+    direction = (command->data[2] == MACHINE_CMD_REMOTE_DIR_PULL) ?
+                STEP_MOTOR_DIR_PULL :
+                STEP_MOTOR_DIR_PUSH;
+    speed_pps = Communication_ReadU16LE(&command->data[3]);
+    steps = Communication_ReadU16LE(&command->data[5]);
+
+    if (speed_pps == 0U)
+    {
+        return 0U;
+    }
+
+    if (steps == 0U)
+    {
+        return StepMotor_RunContinuous(motor, direction, speed_pps);
+    }
+
+    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
+}
+
+/**
+ * @brief 执行上位机电磁阀控制命令。
+ *
+ * @param command 上位机命令缓存。
+ * @return 1 表示写入成功；0 表示对象不支持或阀模块暂时拒绝切换。
+ *
+ * @note 当前远控执行层约定 Byte2=0 关闭阀，Byte2 非 0 打开阀。
+ */
+static uint8_t MachineCMD_HandleRemoteValve(const CommunicationHostCommand_s *command)
+{
+    SolenoidValveId_e valve;
+    SolenoidValveState_e state;
+
+    if (command == NULL)
+    {
+        return 0U;
+    }
+
+    if (command->obj == COMMUNICATION_OBJ_VALVE_1)
+    {
+        valve = SOLENOID_VALVE_ID_WATER;
+    }
+    else if (command->obj == COMMUNICATION_OBJ_VALVE_2)
+    {
+        valve = SOLENOID_VALVE_ID_MED;
+    }
+    else
+    {
+        return 0U;
+    }
+
+    state = (command->data[2] != 0U) ?
+            SOLENOID_VALVE_STATE_ON_NC_OPEN :
+            SOLENOID_VALVE_STATE_OFF_NO_OPEN;
+
+    return SolenoidValve_SetState(valve, state);
+}
+
+/**
+ * @brief 执行上位机泵控制命令。
+ *
+ * @param command 上位机命令缓存。
+ * @return 1 表示命令已下发；0 表示对象/动作不支持或底层发送失败。
+ *
+ * @note WATER_PUMP 使用 Byte2=0/1 控制关/开。
+ *       PUMP_1/PUMP_2 使用 Byte2=0/1/2 表示停止/吸入/排出，Byte3~4 为体积 ul。
+ */
+static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *command)
+{
+    PumpDrive_s *pump;
+    uint8_t action;
+    uint16_t volume_ul;
+
+    if (command == NULL)
+    {
+        return 0U;
+    }
+
+    action = command->data[2];
+
+    if (command->obj == COMMUNICATION_OBJ_WATER_PUMP)
+    {
+        return WaterPump_SetState(WATER_PUMP_ID_MAIN,
+                                  (action == MACHINE_CMD_REMOTE_PUMP_STOP) ?
+                                  WATER_PUMP_STATE_OFF :
+                                  WATER_PUMP_STATE_ON);
+    }
+
+    if (command->obj == COMMUNICATION_OBJ_PUMP_1)
+    {
+        pump = PumpDrive_Get300ulPump();
+    }
+    else if (command->obj == COMMUNICATION_OBJ_PUMP_2)
+    {
+        pump = PumpDrive_Get100ulPump();
+    }
+    else
+    {
+        return 0U;
+    }
+
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    volume_ul = Communication_ReadU16LE(&command->data[3]);
+    switch (action)
+    {
+    case MACHINE_CMD_REMOTE_PUMP_STOP:
+        return PumpDrive_Stop(pump, 1U);
+
+    case MACHINE_CMD_REMOTE_PUMP_IN:
+        return PumpDrive_MoveInVolumeUl(pump, volume_ul);
+
+    case MACHINE_CMD_REMOTE_PUMP_OUT:
+        return PumpDrive_MoveOutVolumeUl(pump, volume_ul);
+
+    default:
+        return 0U;
+    }
+}
+
+/**
+ * @brief 停止上位机指定对象。
+ *
+ * @param command 上位机命令缓存。
+ * @return 1 表示对象已处理；0 表示对象不支持。
+ */
+static uint8_t MachineCMD_HandleRemoteStopObject(const CommunicationHostCommand_s *command)
+{
+    PumpDrive_s *pump;
+
+    if (command == NULL)
+    {
+        return 0U;
+    }
+
+    switch (command->obj)
+    {
+    case COMMUNICATION_OBJ_SYSTEM:
+        MachineCMD_StopRemoteOutputs();
+        return 1U;
+
+    case COMMUNICATION_OBJ_MOTOR_A:
+        StepMotor_Stop(STEP_MOTOR_ID_A);
+        return 1U;
+
+    case COMMUNICATION_OBJ_MOTOR_B:
+        StepMotor_Stop(STEP_MOTOR_ID_B);
+        return 1U;
+
+    case COMMUNICATION_OBJ_VALVE_1:
+        SolenoidValve_Off(SOLENOID_VALVE_ID_WATER);
+        return 1U;
+
+    case COMMUNICATION_OBJ_VALVE_2:
+        SolenoidValve_Off(SOLENOID_VALVE_ID_MED);
+        return 1U;
+
+    case COMMUNICATION_OBJ_WATER_PUMP:
+        WaterPump_Stop(WATER_PUMP_ID_MAIN);
+        return 1U;
+
+    case COMMUNICATION_OBJ_PUMP_1:
+        pump = PumpDrive_Get300ulPump();
+        return (pump != NULL) ? PumpDrive_Stop(pump, 1U) : 0U;
+
+    case COMMUNICATION_OBJ_PUMP_2:
+        pump = PumpDrive_Get100ulPump();
+        return (pump != NULL) ? PumpDrive_Stop(pump, 1U) : 0U;
+
+    default:
+        return 0U;
+    }
+}
+
+/**
+ * @brief 向上位机返回远控状态帧。
+ *
+ * @param seq 当前查询命令序号，0x181 状态帧没有独立 seq 字段，保留该参数方便后续扩展。
+ */
+static void MachineCMD_SendRemoteStatus(uint8_t seq)
+{
+    CommunicationStatus_s status;
+    PumpDrive_s *pump;
+    uint8_t activity_state;
+
+    (void)seq;
+    memset(&status, 0, sizeof(status));
+
+    if (machine_cmd.remote_enabled == 0U)
+    {
+        status.sys_state = COMMUNICATION_SYS_IDLE;
+    }
+    else
+    {
+        status.sys_state = (machine_cmd.remote_paused != 0U) ?
+                           COMMUNICATION_SYS_PAUSED :
+                           COMMUNICATION_SYS_RUNNING;
+    }
+
+    if (StepMotor_IsBusy(STEP_MOTOR_ID_A) != 0U)
+    {
+        status.motor_state |= MACHINE_CMD_REMOTE_MOTOR_A_BUSY;
+    }
+    if (StepMotor_IsBusy(STEP_MOTOR_ID_B) != 0U)
+    {
+        status.motor_state |= MACHINE_CMD_REMOTE_MOTOR_B_BUSY;
+    }
+
+    pump = PumpDrive_Get300ulPump();
+    if ((pump != NULL) && (pump->status.busy != 0U))
+    {
+        status.motor_state |= MACHINE_CMD_REMOTE_PUMP_300_BUSY;
+    }
+    pump = PumpDrive_Get100ulPump();
+    if ((pump != NULL) && (pump->status.busy != 0U))
+    {
+        status.motor_state |= MACHINE_CMD_REMOTE_PUMP_100_BUSY;
+    }
+
+    if (SolenoidValve_GetState(SOLENOID_VALVE_ID_WATER) == SOLENOID_VALVE_STATE_ON_NC_OPEN)
+    {
+        status.output_state |= MACHINE_CMD_REMOTE_WATER_VALVE_ON;
+    }
+    if (SolenoidValve_GetState(SOLENOID_VALVE_ID_MED) == SOLENOID_VALVE_STATE_ON_NC_OPEN)
+    {
+        status.output_state |= MACHINE_CMD_REMOTE_MED_VALVE_ON;
+    }
+    if (WaterPump_IsOn(WATER_PUMP_ID_MAIN) != 0U)
+    {
+        status.output_state |= MACHINE_CMD_REMOTE_WATER_PUMP_ON;
+    }
+
+    activity_state = (uint8_t)ActivityMeter_GetState();
+    status.activity_state = (activity_state <= (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE) ?
+                            activity_state :
+                            COMMUNICATION_ACTIVITY_NOT_READ;
+
+    (void)Communication_SendStatus(&status);
 }
 
 /**
@@ -1531,6 +2084,30 @@ static void MachineCMD_ShowDispRunningPage(void)
     MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_pump2);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_progress);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
+}
+
+/**
+ * @brief 显示上位机远控接管页。
+ *
+ * @note 本页全部使用 MachineCMD_Text.c 中的 GB2312 字节表。
+ *       每行均不超过 ST7920 文本模式 16 字节上限，避免中文错位或乱码。
+ */
+static void MachineCMD_ShowRemotePage(void)
+{
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_remote_title);
+
+    if (machine_cmd.remote_paused != 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_remote_paused);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_host);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_remote_takeover);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_remote_pause);
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_remote_reset);
 }
 
 /**

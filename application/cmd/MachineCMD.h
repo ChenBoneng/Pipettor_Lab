@@ -23,6 +23,7 @@ typedef enum
     MACHINE_CMD_PAGE_PREP_MEASURE,   // 配药活度测量页
     MACHINE_CMD_PAGE_DISP_SETTING,   // 发药参数输入页
     MACHINE_CMD_PAGE_DISP_RUNNING,   // 发药运行提示页
+    MACHINE_CMD_PAGE_REMOTE,         // 上位机远控接管页
     MACHINE_CMD_PAGE_MANUAL,         // 手动调试页
     MACHINE_CMD_PAGE_CLEAN,          // 自动清洗页
     MACHINE_CMD_PAGE_PAUSED,         // 流程暂停页
@@ -57,6 +58,9 @@ MachineCmdPage_e MachineCMD_GetPage(void);
 
 // 读取当前手动调试开关位。
 uint8_t MachineCMD_GetManualSwitches(void);
+
+// 判断当前是否处于上位机远控接管模式。
+uint8_t MachineCMD_IsRemoteMode(void);
 
 // 读取并清除“配药参数已经确认”事件，volume_ml_x100 当前返回原药体积，单位为 0.01ml。
 uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100);

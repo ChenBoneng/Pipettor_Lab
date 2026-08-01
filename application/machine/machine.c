@@ -210,7 +210,8 @@ static void Machine_UpdateCombo(void)
         return;
     }
 
-    if (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED)
+    if ((MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED) ||
+        (MachineCMD_IsRemoteMode() != 0U))
     {
         Machine_AbortCombo();
         return;
