@@ -45,6 +45,8 @@ typedef struct
     MachineCmdPage_e paused_page;                        // 暂停前所在运行页
     uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 配药体积，单位 0.01ml
     uint16_t dispense_ml_x100;                          // 发药体积，单位 0.01ml
+    uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
+    uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
     MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
 } MachineCmdContext_s;
@@ -165,6 +167,8 @@ void MachineCMD_Process(void)
     {
         MachineCMD_ClearInput();
         MachineCMD_ClearManualSwitches();
+        machine_cmd.prep_confirmed = 0U;
+        machine_cmd.dispense_confirmed = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
         return;
     }
@@ -294,6 +298,50 @@ uint8_t MachineCMD_GetManualSwitches(void)
 }
 
 /**
+ * @brief 读取并清除配药量确认事件。
+ *
+ * @param volume_ml_x100 输出配药量，单位 0.01ml，可为 NULL。
+ * @return 1 表示本次读到了新的确认事件；0 表示没有新事件。
+ */
+uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100)
+{
+    if (machine_cmd.prep_confirmed == 0U)
+    {
+        return 0U;
+    }
+
+    if (volume_ml_x100 != NULL)
+    {
+        *volume_ml_x100 = machine_cmd.prep_bottle_ml_x100[0];
+    }
+
+    machine_cmd.prep_confirmed = 0U;
+    return 1U;
+}
+
+/**
+ * @brief 读取并清除发药量确认事件。
+ *
+ * @param volume_ml_x100 输出发药量，单位 0.01ml，可为 NULL。
+ * @return 1 表示本次读到了新的确认事件；0 表示没有新事件。
+ */
+uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100)
+{
+    if (machine_cmd.dispense_confirmed == 0U)
+    {
+        return 0U;
+    }
+
+    if (volume_ml_x100 != NULL)
+    {
+        *volume_ml_x100 = machine_cmd.dispense_ml_x100;
+    }
+
+    machine_cmd.dispense_confirmed = 0U;
+    return 1U;
+}
+
+/**
  * @brief 获取 DWT 毫秒时间轴。
  *
  * @return 从 DWT_Init() 后累计的毫秒数。
@@ -323,6 +371,12 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
     if (page == MACHINE_CMD_PAGE_PREP_SETTING)
     {
         memset(machine_cmd.prep_bottle_ml_x100, 0, sizeof(machine_cmd.prep_bottle_ml_x100));
+        machine_cmd.prep_confirmed = 0U;
+    }
+
+    if (page == MACHINE_CMD_PAGE_DISP_SETTING)
+    {
+        machine_cmd.dispense_confirmed = 0U;
     }
 
     if (page == MACHINE_CMD_PAGE_PREP_MEASURE)
@@ -599,6 +653,7 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
     if (key == KEYPAD_STATE_START)
     {
         machine_cmd.prep_bottle_ml_x100[0] = MachineCMD_InputToMlX100();
+        machine_cmd.prep_confirmed = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
     }
@@ -614,6 +669,12 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
  */
 static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
 {
+    if (key == KEYPAD_STATE_SEND_MEDICINE)
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        return;
+    }
+
     if (key == KEYPAD_STATE_START)
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_MEASURE);
@@ -633,6 +694,12 @@ static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
  */
 static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key)
 {
+    if (key == KEYPAD_STATE_SEND_MEDICINE)
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        return;
+    }
+
     if (key == KEYPAD_STATE_PAUSE)
     {
         MachineCMD_PauseCurrentFlow();
@@ -671,6 +738,7 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key)
     if (key == KEYPAD_STATE_START)
     {
         machine_cmd.dispense_ml_x100 = MachineCMD_InputToMlX100();
+        machine_cmd.dispense_confirmed = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_RUNNING);
     }

@@ -58,4 +58,10 @@ MachineCmdPage_e MachineCMD_GetPage(void);
 // 读取当前手动调试开关位。
 uint8_t MachineCMD_GetManualSwitches(void);
 
+// 读取并清除“配药量已经确认”事件，volume_ml_x100 单位为 0.01ml。
+uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100);
+
+// 读取并清除“发药量已经确认”事件，volume_ml_x100 单位为 0.01ml。
+uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100);
+
 #endif //MACHINECMD_H
