@@ -19,6 +19,13 @@
 #define MACHINE_CMD_PREP_BOTTLE_COUNT     1U
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
+#define MACHINE_CMD_DEFAULT_LEFT_ML_X100  12050U
+
+typedef enum
+{
+    MACHINE_CMD_PREP_FOCUS_RAW_VOLUME = 0, // 配药设置页：当前输入原药体积
+    MACHINE_CMD_PREP_FOCUS_TARGET_CONC,    // 配药设置页：当前输入目标浓度
+} MachineCmdPrepFocus_e;
 
 typedef enum
 {
@@ -43,10 +50,14 @@ typedef struct
     uint8_t manual_switches;                            // 手动调试开关位
     uint32_t measure_start_ms;                           // 活度计测量页进入时间
     MachineCmdPage_e paused_page;                        // 暂停前所在运行页
-    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 配药体积，单位 0.01ml
+    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 原药体积，单位 0.01ml
+    uint16_t prep_target_conc_x1000;                      // 目标浓度，单位 0.001mCi/ml
     uint16_t dispense_ml_x100;                          // 发药体积，单位 0.01ml
+    uint16_t left_ml_x100;                               // 当前可发药余量，单位 0.01ml
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
     uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
+    uint8_t dispense_input_error;                         // 发药输入超余量提示标志
+    MachineCmdPrepFocus_e prep_focus;                     // 配药设置页当前输入焦点
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
     MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
 } MachineCmdContext_s;
@@ -60,7 +71,12 @@ static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit);
 static uint8_t MachineCMD_IsNumberKey(KeypadState_e key);
 static void MachineCMD_AppendDigit(uint8_t digit);
 static void MachineCMD_AppendDot(void);
+static uint16_t MachineCMD_InputToScaledValue(uint16_t scale);
 static uint16_t MachineCMD_InputToMlX100(void);
+static uint16_t MachineCMD_InputToConcX1000(void);
+static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10);
+static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100);
+static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000);
 static void MachineCMD_HandleStandbyKey(KeypadState_e key);
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key);
 static void MachineCMD_HandlePrepRunningKey(KeypadState_e key);
@@ -110,6 +126,8 @@ void MachineCMD_Init(void)
 
     machine_cmd.page = MACHINE_CMD_PAGE_BOOT;
     machine_cmd.boot_start_ms = MachineCMD_GetMs();
+    machine_cmd.left_ml_x100 = MACHINE_CMD_DEFAULT_LEFT_ML_X100;
+    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
     MachineCMD_ClearManualSwitches();
 }
@@ -169,6 +187,8 @@ void MachineCMD_Process(void)
         MachineCMD_ClearManualSwitches();
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.dispense_input_error = 0U;
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
         return;
     }
@@ -298,9 +318,9 @@ uint8_t MachineCMD_GetManualSwitches(void)
 }
 
 /**
- * @brief 读取并清除配药量确认事件。
+ * @brief 读取并清除配药参数确认事件。
  *
- * @param volume_ml_x100 输出配药量，单位 0.01ml，可为 NULL。
+ * @param volume_ml_x100 输出原药体积，单位 0.01ml，可为 NULL。
  * @return 1 表示本次读到了新的确认事件；0 表示没有新事件。
  */
 uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100)
@@ -371,12 +391,15 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
     if (page == MACHINE_CMD_PAGE_PREP_SETTING)
     {
         memset(machine_cmd.prep_bottle_ml_x100, 0, sizeof(machine_cmd.prep_bottle_ml_x100));
+        machine_cmd.prep_target_conc_x1000 = 0U;
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
         machine_cmd.prep_confirmed = 0U;
     }
 
     if (page == MACHINE_CMD_PAGE_DISP_SETTING)
     {
         machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.dispense_input_error = 0U;
     }
 
     if (page == MACHINE_CMD_PAGE_PREP_MEASURE)
@@ -510,20 +533,27 @@ static void MachineCMD_AppendDot(void)
 }
 
 /**
- * @brief 将当前输入字符串转换成 0.01ml 单位的整数值。
+ * @brief 将当前输入字符串转换成指定倍率的整数值。
  *
- * @return 输入值放大 100 倍后的整数。例如 "2.50" 返回 250。
+ * @param scale 放大倍率。例如 ml 使用 100，浓度使用 1000。
+ * @return 输入值乘以 scale 后的整数，超过 uint16 上限时截断。
  *
  * @note 这里不用 atof()，避免在 STM32F103 上引入不必要的浮点格式化依赖。
- *       最多保留两位小数，多余的小数位直接忽略。
+ *       scale 只按 10 的倍数使用，当前用于 0.01ml 和 0.001mCi/ml。
  */
-static uint16_t MachineCMD_InputToMlX100(void)
+static uint16_t MachineCMD_InputToScaledValue(uint16_t scale)
 {
     uint32_t integer_part = 0U;
     uint32_t decimal_part = 0U;
-    uint8_t decimal_count = 0U;
+    uint32_t decimal_scale;
     uint8_t dot_seen = 0U;
 
+    if (scale == 0U)
+    {
+        return 0U;
+    }
+
+    decimal_scale = scale;
     for (uint8_t i = 0U; machine_cmd.input[i] != '\0'; i++)
     {
         char ch = machine_cmd.input[i];
@@ -543,25 +573,71 @@ static uint16_t MachineCMD_InputToMlX100(void)
         {
             integer_part = integer_part * 10U + (uint32_t)(ch - '0');
         }
-        else if (decimal_count < 2U)
+        else if (decimal_scale > 1U)
         {
-            decimal_part = decimal_part * 10U + (uint32_t)(ch - '0');
-            decimal_count++;
+            decimal_scale /= 10U;
+            decimal_part += (uint32_t)(ch - '0') * decimal_scale;
         }
     }
 
-    if (decimal_count == 1U)
-    {
-        decimal_part *= 10U;
-    }
-
-    integer_part = integer_part * 100U + decimal_part;
+    integer_part = integer_part * (uint32_t)scale + decimal_part;
     if (integer_part > 65535U)
     {
         integer_part = 65535U;
     }
 
     return (uint16_t)integer_part;
+}
+
+/**
+ * @brief 将当前输入字符串转换成 0.01ml 单位的整数值。
+ */
+static uint16_t MachineCMD_InputToMlX100(void)
+{
+    return MachineCMD_InputToScaledValue(100U);
+}
+
+/**
+ * @brief 将当前输入字符串转换成 0.001mCi/ml 单位的整数值。
+ */
+static uint16_t MachineCMD_InputToConcX1000(void)
+{
+    return MachineCMD_InputToScaledValue(1000U);
+}
+
+/**
+ * @brief 格式化 1 位小数的 ASCII 数字。
+ *
+ * @param value_x10 已放大 10 倍的值，例如 1205 表示 120.5。
+ */
+static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10)
+{
+    if ((buffer == NULL) || (size == 0U))
+    {
+        return;
+    }
+
+    (void)snprintf(buffer,
+                   size,
+                   "%lu.%01lu",
+                   (unsigned long)(value_x10 / 10U),
+                   (unsigned long)(value_x10 % 10U));
+}
+
+/**
+ * @brief 把 0.01ml 单位的值格式化成 1 位小数 ASCII。
+ */
+static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100)
+{
+    MachineCMD_FormatFixed1Ascii(buffer, size, ((uint32_t)value_x100 + 5U) / 10U);
+}
+
+/**
+ * @brief 把 0.001mCi/ml 单位的值格式化成 1 位小数 ASCII。
+ */
+static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000)
+{
+    MachineCMD_FormatFixed1Ascii(buffer, size, ((uint32_t)value_x1000 + 50U) / 100U);
 }
 
 /**
@@ -625,8 +701,12 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
  *
  * @param key 当前一次性按下事件。
  *
- * @note 数字和小数点写入 input；启动键保存当前配药量输入值。
- *       当前流程每次只配一瓶，确认后直接进入配药运行提示页。
+ * @note 配药设置页有两个输入焦点：
+ *       1. 原药体积，单位 0.01ml；
+ *       2. 目标浓度，单位 0.001mCi/ml。
+ *
+ *       启动键第一次按下用于保存原药体积并切到浓度输入，
+ *       第二次按下才确认全部参数并进入配药运行提示页。
  */
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 {
@@ -652,7 +732,15 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 
     if (key == KEYPAD_STATE_START)
     {
-        machine_cmd.prep_bottle_ml_x100[0] = MachineCMD_InputToMlX100();
+        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_RAW_VOLUME)
+        {
+            machine_cmd.prep_bottle_ml_x100[0] = MachineCMD_InputToMlX100();
+            machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_TARGET_CONC;
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        machine_cmd.prep_target_conc_x1000 = MachineCMD_InputToConcX1000();
         machine_cmd.prep_confirmed = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
@@ -719,18 +807,21 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key)
 
     if (MachineCMD_KeyToDigit(key, &digit) != 0U)
     {
+        machine_cmd.dispense_input_error = 0U;
         MachineCMD_AppendDigit(digit);
         return;
     }
 
     if (key == KEYPAD_STATE_DOT)
     {
+        machine_cmd.dispense_input_error = 0U;
         MachineCMD_AppendDot();
         return;
     }
 
     if (key == KEYPAD_STATE_CLEAR_INPUT)
     {
+        machine_cmd.dispense_input_error = 0U;
         MachineCMD_ClearInput();
         return;
     }
@@ -738,6 +829,19 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key)
     if (key == KEYPAD_STATE_START)
     {
         machine_cmd.dispense_ml_x100 = MachineCMD_InputToMlX100();
+        if (machine_cmd.dispense_ml_x100 > machine_cmd.left_ml_x100)
+        {
+            /*
+             * 发药目标体积不能超过当前余量。
+             * 目前蜂鸣器没有开放模块接口，这里先做 UI 层拦截：清空输入并留在本页。
+             */
+            machine_cmd.dispense_input_error = 1U;
+            machine_cmd.dispense_confirmed = 0U;
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        machine_cmd.dispense_input_error = 0U;
         machine_cmd.dispense_confirmed = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_RUNNING);
@@ -1252,18 +1356,57 @@ static void MachineCMD_ShowPrepSettingPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
+    char ascii[8];
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_title);
 
+    /*
+     * 第 2 行：原药:____ml
+     * “原药:”占 5 字节，输入框最多 5 字节，ml 占 2 字节，整行最大 12 字节。
+     * 当前焦点在原药时显示正在输入的内容；焦点离开后显示已保存值。
+     */
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_prep_volume);
-    offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_raw_med);
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_RAW_VOLUME)
+    {
+        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
+    }
+    else if (machine_cmd.prep_bottle_ml_x100[0] != 0U)
+    {
+        MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.prep_bottle_ml_x100[0]);
+        offset = MachineCMD_LineAppendString(line, offset, ascii);
+    }
+    else
+    {
+        offset = MachineCMD_LineAppendString(line, offset, "____");
+    }
     (void)MachineCMD_LineAppendString(line, offset, "ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_number_input);
+    /*
+     * 第 3 行：浓度:____mCi/ml
+     * “浓度:”占 5 字节，输入框最多 5 字节，mCi/ml 占 6 字节，正好 16 字节封顶。
+     * 这里不能再追加光标或提示字符，否则会触碰 ST7920 单行 16 字节上限。
+     */
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_concentration);
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
+    {
+        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
+    }
+    else if (machine_cmd.prep_target_conc_x1000 != 0U)
+    {
+        MachineCMD_FormatConcX1000Ascii(ascii, sizeof(ascii), machine_cmd.prep_target_conc_x1000);
+        offset = MachineCMD_LineAppendString(line, offset, ascii);
+    }
+    else
+    {
+        offset = MachineCMD_LineAppendString(line, offset, "____");
+    }
+    (void)MachineCMD_LineAppendString(line, offset, "mCi/ml");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start_next_confirm);
 }
 
 /**
@@ -1274,9 +1417,9 @@ static void MachineCMD_ShowPrepSettingPage(void)
 static void MachineCMD_ShowPrepRunningPage(void)
 {
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_in_tank);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_put_tank);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start_ok);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_current_measure);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_activity);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
 }
 
 /**
@@ -1301,7 +1444,7 @@ static void MachineCMD_ShowPrepMeasurePage(void)
         left_sec = (MACHINE_CMD_MEASURE_HOLD_MS - elapsed_ms + 999U) / 1000U;
     }
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_measure);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
 
     if ((ActivityMeter_GetData(&activity_data) != 0U) &&
         (activity_data.state == ACTIVITY_METER_STATE_OK))
@@ -1341,17 +1484,40 @@ static void MachineCMD_ShowDispSettingPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
+    char ascii[8];
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_disp_title);
 
+    /*
+     * 第 2 行：目标:____ml
+     * 目标输入只使用 ASCII 数字和小数点，避免和中文 GB2312 字节混写后出现错位。
+     */
     memset(line, ' ', sizeof(line));
     offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_target);
     offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
     (void)MachineCMD_LineAppendString(line, offset, "ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, NULL);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start);
+    /*
+     * 第 3 行： （余量：120.5ml)
+     * 默认余量先用 UI 层占位值，后续 machine 层接入真实余量时只需要更新 left_ml_x100。
+     */
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_remaining_prefix);
+    MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.left_ml_x100);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    offset = MachineCMD_LineAppendString(line, offset, "ml");
+    (void)MachineCMD_LineAppendString(line, offset, ")");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    if (machine_cmd.dispense_input_error != 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_input_over_left);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_disp_start);
+    }
 }
 
 /**

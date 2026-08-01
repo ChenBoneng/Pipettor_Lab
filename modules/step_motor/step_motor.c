@@ -28,8 +28,8 @@
  * - 每次调整 STEP_MOTOR_ACC_STEP_PPS；
  * - 接近目标步数时按同样斜率减速。
  */
-#define STEP_MOTOR_START_PPS           50UL
-#define STEP_MOTOR_ACC_STEP_PPS        20UL
+#define STEP_MOTOR_START_PPS           200UL
+#define STEP_MOTOR_ACC_STEP_PPS        50UL
 #define STEP_MOTOR_ACC_UPDATE_MS       10UL
 
 /*

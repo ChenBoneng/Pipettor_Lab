@@ -98,6 +98,7 @@ void ModuleTask(void *argument)
          * - StepMotor_Process() 负责步进电机加减速状态维护；
          * - ActivityMeter_Process() 负责活度计轮询和超时维护；
          * - PumpDrive_Process() 负责 ISC1000 总线等待超时维护；
+         * - Communication_Process() 负责上位机授权心跳超时维护；
          * - DWT_SysTimeUpdate() 周期更新时间轴，防止 CYCCNT 长时间无人读取。
          *
          * 这里不处理业务流程，也不处理按键/CAN 控制命令。
@@ -105,6 +106,7 @@ void ModuleTask(void *argument)
         StepMotor_Process();
         ActivityMeter_Process();
         PumpDrive_Process();
+        Communication_Process();
         DWT_SysTimeUpdate();
 
         osDelay(2);
