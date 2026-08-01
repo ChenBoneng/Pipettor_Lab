@@ -22,7 +22,8 @@
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
 #define MACHINE_CMD_DEFAULT_LEFT_ML_X100  12050U
-#define MACHINE_CMD_REMOTE_DIR_PULL       0U
+#define MACHINE_CMD_REMOTE_DIR_REVERSE    0U
+#define MACHINE_CMD_REMOTE_DIR_FORWARD    1U
 #define MACHINE_CMD_REMOTE_PUMP_STOP      0U
 #define MACHINE_CMD_REMOTE_PUMP_IN        1U
 #define MACHINE_CMD_REMOTE_PUMP_OUT       2U
@@ -155,8 +156,8 @@ void MachineCMD_Init(void)
     machine_cmd.boot_start_ms = MachineCMD_GetMs();
     machine_cmd.left_ml_x100 = MACHINE_CMD_DEFAULT_LEFT_ML_X100;
     machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
-    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
-    machine_cmd.remote_enabled = 0U;
+    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
+    machine_cmd.remote_enabled = 1U;
     machine_cmd.remote_paused = 0U;
     MachineCMD_ClearManualSwitches();
 }
@@ -174,12 +175,12 @@ void MachineCMD_Process(void)
 
     /*
      * 开机页停留 2 秒，用于让用户看到系统已经进入初始化。
-     * 后续如果接入 EEPROM 断电恢复，可以在这里改成等待人工确认。
+     * 当前设备默认交给上位机控制，所以启动结束后直接进入远控页。
      */
     if ((machine_cmd.page == MACHINE_CMD_PAGE_BOOT) &&
         ((MachineCMD_GetMs() - machine_cmd.boot_start_ms) >= MACHINE_CMD_BOOT_HOLD_MS))
     {
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_READY);
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
     }
 
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) &&
@@ -196,8 +197,8 @@ void MachineCMD_Process(void)
     }
 
     /*
-     * 启动就绪页只等待一次用户确认。
-     * 任意按键都只进入待机页，不继续执行按键本身的功能。
+     * 启动就绪页是旧本机优先流程的保留页，当前默认不会主动进入。
+     * 如果后续从其它逻辑切到本页，仍按一次任意键回到本机待机页。
      */
     if (machine_cmd.page == MACHINE_CMD_PAGE_READY)
     {
@@ -1138,7 +1139,9 @@ static void MachineCMD_PauseCurrentFlow(void)
  *
  * @note 远控页只保留本机安全相关按键：
  *       - 暂停键：立即停止当前输出，但仍保持远控模式；
+ *       - 启动键：仅在本地暂停后恢复接收上位机动作命令；
  *       - 复位键：在 MachineCMD_Process() 的统一复位分支中退出远控模式。
+ *       启动键不会自动恢复被暂停前的动作，上位机需要重新下发动作命令。
  *       其它按键不再触发本机流程，避免本机和上位机同时抢控制权。
  */
 static void MachineCMD_HandleRemoteKey(KeypadState_e key)
@@ -1146,6 +1149,12 @@ static void MachineCMD_HandleRemoteKey(KeypadState_e key)
     if (key == KEYPAD_STATE_PAUSE)
     {
         MachineCMD_PauseRemoteMode();
+    }
+    else if ((key == KEYPAD_STATE_START) && (machine_cmd.remote_paused != 0U))
+    {
+        machine_cmd.remote_enabled = 1U;
+        machine_cmd.remote_paused = 0U;
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
     }
 }
 
@@ -1359,16 +1368,17 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
  *
  * @note 当前远控执行层约定：
  *       Byte1=对象，MOTOR_A/MOTOR_B；
- *       Byte2=方向，0 表示拉/PULL，非 0 表示推/PUSH；
- *       Byte3~4=speed_pps，小端；
- *       Byte5~6=steps，小端，0 表示连续运行，必须由 STOP_OBJECT 停止。
+ *       Byte2=方向，0 表示反向，1 表示正向；
+ *       Byte3~4=steps，小端；
+ *       Byte5~6=frequencyHz，小端，也就是每秒输出多少个 PUL 脉冲；
+ *       Byte7=SEQ，已经在 Communication 层特殊处理。
  */
 static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *command)
 {
     StepMotorId_e motor;
     StepMotorDirection_e direction;
-    uint16_t speed_pps;
     uint16_t steps;
+    uint16_t frequency_hz;
 
     if (command == NULL)
     {
@@ -1388,23 +1398,27 @@ static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *
         return 0U;
     }
 
-    direction = (command->data[2] == MACHINE_CMD_REMOTE_DIR_PULL) ?
-                STEP_MOTOR_DIR_PULL :
-                STEP_MOTOR_DIR_PUSH;
-    speed_pps = Communication_ReadU16LE(&command->data[3]);
-    steps = Communication_ReadU16LE(&command->data[5]);
+    /*
+     * CAN 协议使用“正/反向”，底层模块使用具体的 DIR 电平枚举。
+     * 这里集中做一次翻译，上层协议就不需要关心电机接线和机械语义。
+     */
+    direction = (command->data[2] == MACHINE_CMD_REMOTE_DIR_REVERSE) ?
+                STEP_MOTOR_DIR_REVERSE :
+                STEP_MOTOR_DIR_FORWARD;
+    steps = Communication_ReadU16LE(&command->data[3]);
+    frequency_hz = Communication_ReadU16LE(&command->data[5]);
 
-    if (speed_pps == 0U)
+    if (frequency_hz == 0U)
     {
         return 0U;
     }
 
     if (steps == 0U)
     {
-        return StepMotor_RunContinuous(motor, direction, speed_pps);
+        return StepMotor_RunContinuous(motor, direction, frequency_hz);
     }
 
-    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
+    return StepMotor_RunSteps(motor, direction, frequency_hz, steps);
 }
 
 /**
@@ -2098,8 +2112,9 @@ static void MachineCMD_ShowRemotePage(void)
 
     if (machine_cmd.remote_paused != 0U)
     {
-        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_remote_paused);
-        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_host);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_remote_paused);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_host);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_remote_start_continue);
     }
     else
     {

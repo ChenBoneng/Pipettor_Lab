@@ -85,6 +85,7 @@ extern const MachineCmdText_s machine_cmd_text_remote_takeover;
 extern const MachineCmdText_s machine_cmd_text_remote_pause;
 extern const MachineCmdText_s machine_cmd_text_remote_reset;
 extern const MachineCmdText_s machine_cmd_text_remote_paused;
+extern const MachineCmdText_s machine_cmd_text_remote_start_continue;
 extern const MachineCmdText_s machine_cmd_text_wait_host;
 extern const MachineCmdText_s machine_cmd_text_water_in;
 extern const MachineCmdText_s machine_cmd_text_med_in;
