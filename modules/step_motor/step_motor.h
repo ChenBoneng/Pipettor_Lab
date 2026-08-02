@@ -67,15 +67,17 @@ typedef enum
  * @brief 单个步进电机的运行信息。
  *
  * 业务层可通过 StepMotor_GetStatus() 获取该结构体，查看电机是否忙碌、
- * 当前方向、当前速度和已经完成的脉冲数量。
+ * 当前方向、当前速度、已经完成的脉冲数量和当前软件位置。
  */
 typedef struct
 {
     StepMotorState_e state;         /**< 当前状态：空闲或运行中。 */
     StepMotorDirection_e direction; /**< 当前方向。 */
     uint32_t speed_pps;             /**< 当前脉冲频率，单位 PPS，即每秒输出多少个上升沿。 */
-    uint32_t target_steps;          /**< 目标步数；0 表示连续运行，不自动停。 */
+    uint32_t target_steps;          /**< 目标步数；正常位置保护运行时为非 0。 */
     uint32_t finished_steps;        /**< 已完成步数，在 PWM 高电平结束中断里累加。 */
+    uint32_t current_position_um;   /**< 当前软件位置，单位 um；上电默认 0，推为正，拉为负。 */
+    uint32_t target_position_um;    /**< 本次运动目标软件位置，单位 um。 */
 } StepMotorStatus_s;
 
 /**
@@ -107,8 +109,9 @@ void StepMotor_Process(void);
  * @param speed_pps 脉冲频率，单位 PPS。2000 表示每秒 2000 个脉冲。
  * @return 1 表示启动成功；0 表示参数错误、模块未初始化或已有电机正在运行。
  *
- * @note 连续运行不会自动停止，业务层必须调用 StepMotor_Stop() 或
- *       StepMotor_StopAll() 停止输出脉冲。
+ * @note 位置保护启用后，连续运行会被限制为“朝当前方向运行到有效行程边界”。
+ *       如果业务层提前调用 StepMotor_Stop() 或 StepMotor_StopAll()，模块会按
+ *       已完成脉冲数折算当前位置。
  */
 uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
                                 StepMotorDirection_e direction,
@@ -121,11 +124,11 @@ uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
  * @param direction 运行方向，取值见 StepMotorDirection_e。
  * @param speed_pps 脉冲频率，单位 PPS。
  * @param steps 目标步数，也就是要输出的 PUL 上升沿数量。
- * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、模块未初始化或已有电机正在运行。
+ * @return 1 表示启动成功；0 表示参数错误、目标位置越界、模块未初始化或已有电机正在运行。
  *
  * @note 本函数非阻塞。启动成功后立即返回，步数统计在 TIM2 PWM 中断中完成，
- *       达到 steps 后自动停止 PWM。当前按 A 轴 150mm、B 轴 300mm 的滑台有效行程
- *       限制单次输出步数，但不记录滑台绝对位置。
+ *       达到 steps 后自动停止 PWM。当前位置按“推为正、拉为负”记录，
+ *       A 轴有效范围为 0~150mm，B 轴有效范围为 0~300mm。
  */
 uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            StepMotorDirection_e direction,
@@ -161,11 +164,11 @@ uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
  * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
  * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。
  * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 1500 表示 15.00mm/s。
- * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
+ * @return 1 表示启动成功；0 表示参数错误、目标位置越界、换算结果为 0 或电机启动失败。
  *
  * @note 本函数非阻塞。内部会把距离换算成 steps，把速度换算成 pps，
- *       再调用 StepMotor_RunSteps() 输出实际脉冲。当前 A 轴单次最大 150mm，
- *       B 轴单次最大 300mm。
+ *       再按当前位置和方向计算目标位置。当前位置采用“推为正、拉为负”，
+ *       A 轴有效范围为 0~150mm，B 轴有效范围为 0~300mm。
  */
 uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
@@ -179,15 +182,59 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
  * @param direction 运行方向，建议使用 STEP_MOTOR_DIR_PULL 或 STEP_MOTOR_DIR_PUSH。
  * @param distance_cm_x100 目标距离，单位 0.01cm。比如 300 表示 3.00cm。
  * @param speed_cm_s_x100 目标速度，单位 0.01cm/s。比如 150 表示 1.50cm/s。
- * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
+ * @return 1 表示启动成功；0 表示参数错误、目标位置越界、换算结果为 0 或电机启动失败。
  *
- * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。当前 A 轴单次最大 15cm，
- *       B 轴单次最大 30cm。
+ * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。内部仍然按当前位置
+ *       做累计位置保护，A 轴有效范围为 0~15cm，B 轴有效范围为 0~30cm。
  */
 uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
                                     uint32_t distance_cm_x100,
                                     uint32_t speed_cm_s_x100);
+
+/**
+ * @brief 让指定电机运行到绝对位置。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @param target_mm_x100 目标位置，单位 0.01mm。比如 3000 表示 30.00mm。
+ * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。
+ * @return 1 表示启动成功或已经在目标位置；0 表示目标越界、速度非法或电机启动失败。
+ *
+ * @note 坐标范围采用方案 A：上电默认当前位置为 0，推方向为正。
+ *       因此 A 轴目标范围为 0~15000，B 轴目标范围为 0~30000。
+ */
+uint8_t StepMotor_RunToPositionMmX100(StepMotorId_e motor,
+                                      uint32_t target_mm_x100,
+                                      uint32_t speed_mm_s_x100);
+
+/**
+ * @brief 设置指定滑块的当前软件位置。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @param position_mm_x100 当前位置，单位 0.01mm。比如 5000 表示 50.00mm。
+ * @return 1 表示设置成功；0 表示电机编号非法或位置超过有效行程。
+ *
+ * @note 该接口给后续光电门校准使用。运行中调用时，模块会以新位置为基准
+ *       重新计算剩余距离，避免校准后继续按旧起点累计位置。
+ */
+uint8_t StepMotor_SetCurrentPositionMmX100(StepMotorId_e motor, uint32_t position_mm_x100);
+
+/**
+ * @brief 读取指定滑块当前软件位置。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @param position_mm_x100 输出参数，单位 0.01mm，不能为 NULL。
+ * @return 1 表示读取成功；0 表示参数错误。
+ */
+uint8_t StepMotor_GetCurrentPositionMmX100(StepMotorId_e motor, uint32_t *position_mm_x100);
+
+/**
+ * @brief 把指定滑块当前位置校准为 0。
+ *
+ * @param motor 电机编号，取值见 StepMotorId_e。
+ * @return 1 表示校准成功；0 表示电机编号非法。
+ */
+uint8_t StepMotor_SetCurrentPositionZero(StepMotorId_e motor);
 
 /**
  * @brief 停止指定电机。

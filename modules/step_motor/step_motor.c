@@ -81,6 +81,8 @@ static const uint32_t step_motor_max_travel_um[STEP_MOTOR_ID_MAX] = {
 };
 
 static volatile StepMotorStatus_s step_motor_status[STEP_MOTOR_ID_MAX];
+static volatile uint32_t step_motor_move_start_position_um[STEP_MOTOR_ID_MAX];
+static volatile uint32_t step_motor_move_target_position_um[STEP_MOTOR_ID_MAX];
 static volatile StepMotorId_e step_motor_active_id = STEP_MOTOR_ID_MAX;
 static StepMotorRamp_s step_motor_ramp = {0};
 static uint8_t step_motor_inited = 0U;
@@ -92,15 +94,27 @@ static uint8_t StepMotor_ConfigTimer(uint32_t speed_pps, uint32_t channel);
 static uint32_t StepMotor_LimitStartSpeed(uint32_t target_speed_pps);
 static uint32_t StepMotor_CalcDecelSteps(uint32_t current_speed_pps);
 static uint32_t StepMotor_GetMaxTravelUm(StepMotorId_e motor);
-static uint8_t StepMotor_IsDistanceAllowed(StepMotorId_e motor, uint32_t distance_um);
+static uint8_t StepMotor_IsPositionAllowed(StepMotorId_e motor, uint32_t position_um);
+static uint8_t StepMotor_CalcTargetPosition(StepMotorId_e motor,
+                                            StepMotorDirection_e direction,
+                                            uint32_t distance_um,
+                                            uint32_t *target_position_um);
 static uint32_t StepMotor_UmToSteps(uint32_t distance_um);
+static uint32_t StepMotor_StepsToUm(uint32_t steps);
 static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s);
 static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e direction);
+static void StepMotor_UpdatePositionOnStop(StepMotorId_e motor);
+static void StepMotor_RebaseRunningMove(StepMotorId_e motor);
 static void StepMotor_StopOutput(StepMotorId_e motor);
 static uint8_t StepMotor_Start(StepMotorId_e motor,
                                StepMotorDirection_e direction,
                                uint32_t speed_pps,
-                               uint32_t steps);
+                               uint32_t steps,
+                               uint32_t target_position_um);
+static uint8_t StepMotor_RunDistanceUm(StepMotorId_e motor,
+                                       StepMotorDirection_e direction,
+                                       uint32_t distance_um,
+                                       uint32_t speed_pps);
 
 /**
  * @brief 判断电机编号是否合法。
@@ -277,26 +291,76 @@ static uint32_t StepMotor_GetMaxTravelUm(StepMotorId_e motor)
 }
 
 /**
- * @brief 判断单次目标位移是否超过对应滑台的有效行程。
+ * @brief 判断软件位置是否在指定电机有效行程内。
  *
  * @param motor 电机编号。
- * @param distance_um 本次目标位移，单位 um。
- * @return 1 表示允许执行；0 表示参数非法、距离为 0 或超过单次有效行程。
+ * @param position_um 目标软件位置，单位 um。
+ * @return 1 表示位置合法；0 表示电机编号非法或位置超过有效行程。
  *
- * @note 当前没有原点、限位或绝对位置反馈，所以这里仅限制“单次命令距离”
- *       不超过滑台总有效行程。若要防止累计移动撞端点，还需要增加回零、
- *       当前位置记录或限位开关检测。
+ * @note 当前采用方案 A：上电位置为 0，推为正，拉为负。
+ *       因此有效范围固定为 0~对应滑台最大行程。
  */
-static uint8_t StepMotor_IsDistanceAllowed(StepMotorId_e motor, uint32_t distance_um)
+static uint8_t StepMotor_IsPositionAllowed(StepMotorId_e motor, uint32_t position_um)
 {
     uint32_t max_travel_um;
 
     max_travel_um = StepMotor_GetMaxTravelUm(motor);
-    if ((max_travel_um == 0U) ||
-        (distance_um == 0U) ||
-        (distance_um > max_travel_um))
+    if ((max_travel_um == 0U) || (position_um > max_travel_um))
     {
         return 0U;
+    }
+
+    return 1U;
+}
+
+/**
+ * @brief 按当前位置、方向和位移计算目标位置。
+ *
+ * @param motor 电机编号。
+ * @param direction 运行方向，推为正，拉为负。
+ * @param distance_um 本次相对位移，单位 um。
+ * @param target_position_um 输出目标位置，单位 um。
+ * @return 1 表示目标位置合法；0 表示会越界或参数非法。
+ */
+static uint8_t StepMotor_CalcTargetPosition(StepMotorId_e motor,
+                                            StepMotorDirection_e direction,
+                                            uint32_t distance_um,
+                                            uint32_t *target_position_um)
+{
+    uint32_t current_position_um;
+    uint32_t max_travel_um;
+
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (distance_um == 0U) ||
+        (target_position_um == NULL))
+    {
+        return 0U;
+    }
+
+    current_position_um = step_motor_status[motor].current_position_um;
+    max_travel_um = StepMotor_GetMaxTravelUm(motor);
+    if (max_travel_um == 0U)
+    {
+        return 0U;
+    }
+
+    if (direction == STEP_MOTOR_DIR_PUSH)
+    {
+        if (distance_um > (max_travel_um - current_position_um))
+        {
+            return 0U;
+        }
+
+        *target_position_um = current_position_um + distance_um;
+    }
+    else
+    {
+        if (distance_um > current_position_um)
+        {
+            return 0U;
+        }
+
+        *target_position_um = current_position_um - distance_um;
     }
 
     return 1U;
@@ -319,6 +383,24 @@ static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
     numerator += STEP_MOTOR_SCREW_LEAD_UM / 2U;
 
     return (uint32_t)(numerator / STEP_MOTOR_SCREW_LEAD_UM);
+}
+
+/**
+ * @brief 把脉冲数换算成微米距离。
+ *
+ * @param steps 脉冲数。
+ * @return 四舍五入后的距离，单位 um。
+ *
+ * @note 公式：distance_um = steps * 4000 / 1600。
+ */
+static uint32_t StepMotor_StepsToUm(uint32_t steps)
+{
+    uint64_t numerator;
+
+    numerator = (uint64_t)steps * STEP_MOTOR_SCREW_LEAD_UM;
+    numerator += STEP_MOTOR_DRIVER_MICROSTEP_PPR / 2U;
+
+    return (uint32_t)(numerator / STEP_MOTOR_DRIVER_MICROSTEP_PPR);
 }
 
 /**
@@ -367,6 +449,129 @@ static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e dir
 }
 
 /**
+ * @brief 根据已输出脉冲数结算当前软件位置。
+ *
+ * @param motor 电机编号。
+ *
+ * @note 正常到位时直接写入计划目标位置；提前停止时按 finished_steps 折算。
+ *       这样暂停、急停和后续光电门校准都不会继续沿用旧的起点。
+ */
+static void StepMotor_UpdatePositionOnStop(StepMotorId_e motor)
+{
+    uint32_t start_position_um;
+    uint32_t moved_um;
+    uint32_t max_travel_um;
+    uint32_t current_position_um;
+
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (step_motor_status[motor].state != STEP_MOTOR_STATE_RUNNING))
+    {
+        return;
+    }
+
+    start_position_um = step_motor_move_start_position_um[motor];
+    max_travel_um = StepMotor_GetMaxTravelUm(motor);
+
+    if ((step_motor_status[motor].target_steps != 0U) &&
+        (step_motor_status[motor].finished_steps >= step_motor_status[motor].target_steps))
+    {
+        current_position_um = step_motor_move_target_position_um[motor];
+    }
+    else
+    {
+        moved_um = StepMotor_StepsToUm(step_motor_status[motor].finished_steps);
+        if (step_motor_status[motor].direction == STEP_MOTOR_DIR_PUSH)
+        {
+            current_position_um = start_position_um + moved_um;
+            if (current_position_um > max_travel_um)
+            {
+                current_position_um = max_travel_um;
+            }
+        }
+        else
+        {
+            current_position_um = (moved_um >= start_position_um) ? 0U : (start_position_um - moved_um);
+        }
+    }
+
+    step_motor_status[motor].current_position_um = current_position_um;
+    step_motor_status[motor].target_position_um = current_position_um;
+    step_motor_move_start_position_um[motor] = current_position_um;
+    step_motor_move_target_position_um[motor] = current_position_um;
+}
+
+/**
+ * @brief 运行中被光电门校准后，重新计算剩余目标步数。
+ *
+ * @param motor 电机编号。
+ *
+ * @note 如果校准后已经到达或越过计划目标点，则立即停止输出。
+ */
+static void StepMotor_RebaseRunningMove(StepMotorId_e motor)
+{
+    uint32_t current_position_um;
+    uint32_t target_position_um;
+    uint32_t remaining_um;
+    uint32_t remaining_steps;
+
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (step_motor_status[motor].state != STEP_MOTOR_STATE_RUNNING))
+    {
+        return;
+    }
+
+    current_position_um = step_motor_status[motor].current_position_um;
+    target_position_um = step_motor_move_target_position_um[motor];
+
+    if (step_motor_status[motor].direction == STEP_MOTOR_DIR_PUSH)
+    {
+        if (current_position_um >= target_position_um)
+        {
+            step_motor_move_start_position_um[motor] = current_position_um;
+            step_motor_move_target_position_um[motor] = current_position_um;
+            step_motor_status[motor].finished_steps = 0U;
+            step_motor_status[motor].target_steps = 0U;
+            step_motor_status[motor].target_position_um = current_position_um;
+            StepMotor_StopOutput(motor);
+            return;
+        }
+
+        remaining_um = target_position_um - current_position_um;
+    }
+    else
+    {
+        if (current_position_um <= target_position_um)
+        {
+            step_motor_move_start_position_um[motor] = current_position_um;
+            step_motor_move_target_position_um[motor] = current_position_um;
+            step_motor_status[motor].finished_steps = 0U;
+            step_motor_status[motor].target_steps = 0U;
+            step_motor_status[motor].target_position_um = current_position_um;
+            StepMotor_StopOutput(motor);
+            return;
+        }
+
+        remaining_um = current_position_um - target_position_um;
+    }
+
+    remaining_steps = StepMotor_UmToSteps(remaining_um);
+    if (remaining_steps == 0U)
+    {
+        step_motor_move_start_position_um[motor] = current_position_um;
+        step_motor_move_target_position_um[motor] = current_position_um;
+        step_motor_status[motor].finished_steps = 0U;
+        step_motor_status[motor].target_steps = 0U;
+        step_motor_status[motor].target_position_um = current_position_um;
+        StepMotor_StopOutput(motor);
+        return;
+    }
+
+    step_motor_move_start_position_um[motor] = current_position_um;
+    step_motor_status[motor].finished_steps = 0U;
+    step_motor_status[motor].target_steps = remaining_steps;
+}
+
+/**
  * @brief 关闭某一路 PWM 输出并清理运行状态。
  *
  * @param motor 电机编号。
@@ -380,6 +585,8 @@ static void StepMotor_StopOutput(StepMotorId_e motor)
 
     (void)HAL_TIM_PWM_Stop_IT(&htim2, step_motor_hw[motor].tim_channel);
     __HAL_TIM_SET_COMPARE(&htim2, step_motor_hw[motor].tim_channel, 0U);
+
+    StepMotor_UpdatePositionOnStop(motor);
 
     step_motor_status[motor].state = STEP_MOTOR_STATE_IDLE;
     if (step_motor_active_id == motor)
@@ -399,19 +606,22 @@ static void StepMotor_StopOutput(StepMotorId_e motor)
  * @param motor 电机编号。
  * @param direction 运行方向。
  * @param speed_pps 脉冲频率，单位 PPS。
- * @param steps 目标步数，0 表示连续运行。
+ * @param steps 目标步数；当前公开接口都会传入非 0，0 仅保留给内部兼容连续输出。
+ * @param target_position_um 本次运动结束后的目标软件位置，单位 um。
  * @return 1 表示启动成功；0 表示启动失败。
  */
 static uint8_t StepMotor_Start(StepMotorId_e motor,
                                StepMotorDirection_e direction,
                                uint32_t speed_pps,
-                               uint32_t steps)
+                               uint32_t steps,
+                               uint32_t target_position_um)
 {
     uint32_t start_speed_pps;
 
     if ((step_motor_inited == 0U) ||
         (StepMotor_IsValidId(motor) == 0U) ||
-        (speed_pps == 0U))
+        (speed_pps == 0U) ||
+        (StepMotor_IsPositionAllowed(motor, target_position_um) == 0U))
     {
         return 0U;
     }
@@ -447,6 +657,9 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
     step_motor_status[motor].speed_pps = start_speed_pps;
     step_motor_status[motor].target_steps = steps;
     step_motor_status[motor].finished_steps = 0U;
+    step_motor_status[motor].target_position_um = target_position_um;
+    step_motor_move_start_position_um[motor] = step_motor_status[motor].current_position_um;
+    step_motor_move_target_position_um[motor] = target_position_um;
     step_motor_active_id = motor;
 
     step_motor_ramp.enabled = 1U;
@@ -457,8 +670,9 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
     if (steps == 0U)
     {
         /*
-         * 连续运行不需要统计目标步数，因此不开比较中断，减少 CPU 开销。
-         * 停止动作由业务层调用 StepMotor_Stop() 或 StepMotor_StopAll() 完成。
+         * 该分支只作为底层兼容保留。
+         * 公开的 StepMotor_RunContinuous() 已经被位置保护转换成“跑到边界”的有限步数，
+         * 正常不会再走真正无限输出。
          */
         if (HAL_TIM_PWM_Start(&htim2, step_motor_hw[motor].tim_channel) != HAL_OK)
         {
@@ -478,6 +692,8 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
 void StepMotor_Init(void)
 {
     memset((void *)step_motor_status, 0, sizeof(step_motor_status));
+    memset((void *)step_motor_move_start_position_um, 0, sizeof(step_motor_move_start_position_um));
+    memset((void *)step_motor_move_target_position_um, 0, sizeof(step_motor_move_target_position_um));
     memset(&step_motor_ramp, 0, sizeof(step_motor_ramp));
 
     StepMotor_StopAll();
@@ -562,8 +778,8 @@ void StepMotor_Process(void)
              (current_speed_pps < step_motor_ramp.target_speed_pps))
     {
         /*
-         * 连续运行没有目标步数，只做缓启动加速。
-         * 停止时由业务层调用 Stop 接口。
+         * 兼容底层无限输出模式，只做缓启动加速。
+         * 当前公开接口已经启用位置保护，正常业务不会进入该分支。
          */
         next_speed_pps = current_speed_pps + STEP_MOTOR_ACC_STEP_PPS;
         if (next_speed_pps > step_motor_ramp.target_speed_pps)
@@ -588,7 +804,36 @@ uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
                                 StepMotorDirection_e direction,
                                 uint32_t speed_pps)
 {
-    return StepMotor_Start(motor, direction, speed_pps, 0U);
+    uint32_t current_position_um;
+    uint32_t target_position_um;
+    uint32_t distance_um;
+    uint32_t steps;
+
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    current_position_um = step_motor_status[motor].current_position_um;
+
+    if (direction == STEP_MOTOR_DIR_PUSH)
+    {
+        target_position_um = StepMotor_GetMaxTravelUm(motor);
+        distance_um = target_position_um - current_position_um;
+    }
+    else
+    {
+        target_position_um = 0U;
+        distance_um = current_position_um;
+    }
+
+    steps = StepMotor_UmToSteps(distance_um);
+    if (steps == 0U)
+    {
+        return 0U;
+    }
+
+    return StepMotor_Start(motor, direction, speed_pps, steps, target_position_um);
 }
 
 uint8_t StepMotor_RunSteps(StepMotorId_e motor,
@@ -596,14 +841,22 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            uint32_t speed_pps,
                            uint32_t steps)
 {
+    uint32_t distance_um;
+    uint32_t target_position_um;
+
     if ((StepMotor_IsValidId(motor) == 0U) ||
-        (steps == 0U) ||
-        (steps > StepMotor_UmToSteps(StepMotor_GetMaxTravelUm(motor))))
+        (steps == 0U))
     {
         return 0U;
     }
 
-    return StepMotor_Start(motor, direction, speed_pps, steps);
+    distance_um = StepMotor_StepsToUm(steps);
+    if (StepMotor_CalcTargetPosition(motor, direction, distance_um, &target_position_um) == 0U)
+    {
+        return 0U;
+    }
+
+    return StepMotor_Start(motor, direction, speed_pps, steps, target_position_um);
 }
 
 uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100)
@@ -622,24 +875,12 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     uint32_t speed_mm_s_x100)
 {
     uint32_t distance_um;
-    uint32_t steps;
     uint32_t speed_pps;
 
     distance_um = distance_mm_x100 * STEP_MOTOR_MM_X100_TO_UM;
-    if (StepMotor_IsDistanceAllowed(motor, distance_um) == 0U)
-    {
-        return 0U;
-    }
-
-    steps = StepMotor_UmToSteps(distance_um);
     speed_pps = StepMotor_MmPerSecX100ToPps(speed_mm_s_x100);
 
-    if ((steps == 0U) || (speed_pps == 0U))
-    {
-        return 0U;
-    }
-
-    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
+    return StepMotor_RunDistanceUm(motor, direction, distance_um, speed_pps);
 }
 
 uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
@@ -649,25 +890,139 @@ uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
 {
     uint32_t distance_um;
     uint32_t speed_um_s;
-    uint32_t steps;
     uint32_t speed_pps;
 
     distance_um = distance_cm_x100 * STEP_MOTOR_CM_X100_TO_UM;
     speed_um_s = speed_cm_s_x100 * STEP_MOTOR_CM_X100_TO_UM;
-    if (StepMotor_IsDistanceAllowed(motor, distance_um) == 0U)
+    speed_pps = StepMotor_UmPerSecToPps(speed_um_s);
+
+    return StepMotor_RunDistanceUm(motor, direction, distance_um, speed_pps);
+}
+
+/**
+ * @brief 按微米距离和 PPS 速度运行指定电机。
+ *
+ * @param motor 电机编号。
+ * @param direction 运行方向，推为正，拉为负。
+ * @param distance_um 本次相对位移，单位 um。
+ * @param speed_pps 脉冲频率，单位 PPS。
+ * @return 1 表示启动成功；0 表示参数错误、目标位置越界或电机启动失败。
+ */
+static uint8_t StepMotor_RunDistanceUm(StepMotorId_e motor,
+                                       StepMotorDirection_e direction,
+                                       uint32_t distance_um,
+                                       uint32_t speed_pps)
+{
+    uint32_t steps;
+    uint32_t target_position_um;
+
+    if ((StepMotor_CalcTargetPosition(motor, direction, distance_um, &target_position_um) == 0U) ||
+        (speed_pps == 0U))
     {
         return 0U;
     }
 
     steps = StepMotor_UmToSteps(distance_um);
-    speed_pps = StepMotor_UmPerSecToPps(speed_um_s);
-
-    if ((steps == 0U) || (speed_pps == 0U))
+    if (steps == 0U)
     {
         return 0U;
     }
 
-    return StepMotor_RunSteps(motor, direction, speed_pps, steps);
+    return StepMotor_Start(motor, direction, speed_pps, steps, target_position_um);
+}
+
+uint8_t StepMotor_RunToPositionMmX100(StepMotorId_e motor,
+                                      uint32_t target_mm_x100,
+                                      uint32_t speed_mm_s_x100)
+{
+    uint32_t target_position_um;
+    uint32_t current_position_um;
+    uint32_t distance_um;
+    uint32_t speed_pps;
+    StepMotorDirection_e direction;
+
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    target_position_um = target_mm_x100 * STEP_MOTOR_MM_X100_TO_UM;
+    if (StepMotor_IsPositionAllowed(motor, target_position_um) == 0U)
+    {
+        return 0U;
+    }
+
+    current_position_um = step_motor_status[motor].current_position_um;
+    if (target_position_um == current_position_um)
+    {
+        return 1U;
+    }
+
+    if (target_position_um > current_position_um)
+    {
+        direction = STEP_MOTOR_DIR_PUSH;
+        distance_um = target_position_um - current_position_um;
+    }
+    else
+    {
+        direction = STEP_MOTOR_DIR_PULL;
+        distance_um = current_position_um - target_position_um;
+    }
+
+    speed_pps = StepMotor_MmPerSecX100ToPps(speed_mm_s_x100);
+    return StepMotor_RunDistanceUm(motor, direction, distance_um, speed_pps);
+}
+
+uint8_t StepMotor_SetCurrentPositionMmX100(StepMotorId_e motor, uint32_t position_mm_x100)
+{
+    uint32_t position_um;
+
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    position_um = position_mm_x100 * STEP_MOTOR_MM_X100_TO_UM;
+    if (StepMotor_IsPositionAllowed(motor, position_um) == 0U)
+    {
+        return 0U;
+    }
+
+    step_motor_status[motor].current_position_um = position_um;
+
+    /*
+     * 光电门运行中校准时，只改“当前位置”，不改原本的目标位置。
+     * 这样电机可以基于校准后的真实位置继续跑剩余距离；如果校准位置
+     * 已经达到目标点，StepMotor_RebaseRunningMove() 会立即停止输出。
+     */
+    if (step_motor_status[motor].state == STEP_MOTOR_STATE_RUNNING)
+    {
+        StepMotor_RebaseRunningMove(motor);
+    }
+    else
+    {
+        step_motor_status[motor].target_position_um = position_um;
+        step_motor_move_start_position_um[motor] = position_um;
+        step_motor_move_target_position_um[motor] = position_um;
+    }
+
+    return 1U;
+}
+
+uint8_t StepMotor_GetCurrentPositionMmX100(StepMotorId_e motor, uint32_t *position_mm_x100)
+{
+    if ((StepMotor_IsValidId(motor) == 0U) || (position_mm_x100 == NULL))
+    {
+        return 0U;
+    }
+
+    *position_mm_x100 = step_motor_status[motor].current_position_um / STEP_MOTOR_MM_X100_TO_UM;
+    return 1U;
+}
+
+uint8_t StepMotor_SetCurrentPositionZero(StepMotorId_e motor)
+{
+    return StepMotor_SetCurrentPositionMmX100(motor, 0U);
 }
 
 void StepMotor_Stop(StepMotorId_e motor)
@@ -684,6 +1039,7 @@ void StepMotor_StopAll(void)
 
     for (uint8_t i = 0U; i < (uint8_t)STEP_MOTOR_ID_MAX; i++)
     {
+        StepMotor_UpdatePositionOnStop((StepMotorId_e)i);
         step_motor_status[i].state = STEP_MOTOR_STATE_IDLE;
     }
 
@@ -713,6 +1069,8 @@ uint8_t StepMotor_GetStatus(StepMotorId_e motor, StepMotorStatus_s *status)
     status->speed_pps = step_motor_status[motor].speed_pps;
     status->target_steps = step_motor_status[motor].target_steps;
     status->finished_steps = step_motor_status[motor].finished_steps;
+    status->current_position_um = step_motor_status[motor].current_position_um;
+    status->target_position_um = step_motor_status[motor].target_position_um;
 
     return 1U;
 }
@@ -757,7 +1115,7 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
     step_motor_status[motor].finished_steps++;
 
     /*
-     * target_steps 为 0 表示连续运行，不在中断里自动停止。
+     * target_steps 为 0 时不在中断里自动停止，只作为底层兼容模式保留。
      * 非 0 时，达到目标步数立即关断 PWM，避免下一个周期再次产生上升沿。
      */
     if ((step_motor_status[motor].target_steps != 0U) &&
