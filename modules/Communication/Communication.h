@@ -128,12 +128,12 @@ typedef enum
     COMMUNICATION_OBJ_SYSTEM = 0x00U,              /**< 系统整体对象。 */
     COMMUNICATION_OBJ_MOTOR_A = 0x01U,             /**< A 轴步进电机。 */
     COMMUNICATION_OBJ_MOTOR_B = 0x02U,             /**< B 轴步进电机。 */
-    COMMUNICATION_OBJ_PUMP_1 = 0x03U,              /**< 定量泵 1。 */
+    COMMUNICATION_OBJ_PUMP_1 = 0x03U,              /**< 泵1：300ul 定量泵。 */
     COMMUNICATION_OBJ_VALVE_1 = 0x04U,             /**< 阀门 1。 */
     COMMUNICATION_OBJ_VALVE_2 = 0x05U,             /**< 阀门 2。 */
     COMMUNICATION_OBJ_WATER_PUMP = 0x06U,          /**< 抽水泵。 */
     COMMUNICATION_OBJ_ACTIVITY_METER = 0x07U,      /**< 活度计。 */
-    COMMUNICATION_OBJ_PUMP_2 = 0x08U,              /**< 定量泵 2。 */
+    COMMUNICATION_OBJ_PUMP_2 = 0x08U,              /**< 泵2：100ul 定量泵。 */
     COMMUNICATION_OBJ_PREPARE_PARAM = 0x10U,       /**< 配药目标参数。 */
     COMMUNICATION_OBJ_DISPENSE_PARAM = 0x11U,      /**< 发药参数。 */
     COMMUNICATION_OBJ_PREPARE_RESULT = 0x12U,      /**< 配药结果返回对象。 */

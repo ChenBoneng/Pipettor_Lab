@@ -22,20 +22,20 @@
 /** 保存握手、参数配置、离线时序脚本等文本反馈的最大长度。 */
 #define PUMP_DRIVE_TEXT_MAX            220U
 
-/** 当前设备最多挂接两台 ISC1000，分别对应 300ul 和 100ul 定量泵。 */
+/** 当前设备最多挂接两台 ISC1000：泵1为 300ul，泵2为 100ul。 */
 #define PUMP_DRIVE_MAX_INSTANCE        2U
 
-/** ID=1 对应 300ul 定量泵。 */
-#define PUMP_DRIVE_300UL_DEVICE_ID     1U
+/** 泵1：RS485 ID=1，对应 300ul 定量泵。 */
+#define PUMP_DRIVE_PUMP1_DEVICE_ID     1U
 
-/** ID=2 对应 100ul 定量泵。 */
-#define PUMP_DRIVE_100UL_DEVICE_ID     2U
+/** 泵2：RS485 ID=2，对应 100ul 定量泵。 */
+#define PUMP_DRIVE_PUMP2_DEVICE_ID     2U
 
-/** ID=1 定量泵量程，单位 ul。 */
-#define PUMP_DRIVE_ID1_FULL_STROKE_UL  300U
+/** 泵1满行程体积，单位 ul。 */
+#define PUMP_DRIVE_PUMP1_FULL_STROKE_UL 300U
 
-/** ID=2 定量泵量程，单位 ul。 */
-#define PUMP_DRIVE_ID2_FULL_STROKE_UL  100U
+/** 泵2满行程体积，单位 ul。 */
+#define PUMP_DRIVE_PUMP2_FULL_STROKE_UL 100U
 
 /** 两台定量泵满行程命令步数。 */
 #define PUMP_DRIVE_FULL_STROKE_STEPS   1600U
@@ -172,23 +172,27 @@ uint8_t PumpDrive_Init(PumpDrive_s *pump, PumpDriveBusMode_e mode, uint8_t devic
  *
  * @return 1 表示两台泵都已经注册完成；0 表示 USART3 注册失败或 ID 冲突。
  *
- * @note 当前硬件约定：ID1=300ul，ID2=100ul，两台泵共用 USART3 RS485 总线。
+ * @note 当前硬件约定：泵1=ID1=300ul，泵2=ID2=100ul，两台泵共用 USART3 RS485 总线。
  */
 uint8_t PumpDrive_BoardInit(void);
 
 /**
- * @brief 获取 300ul 定量泵实例。
+ * @brief 获取泵1实例。
  *
- * @return 初始化完成后返回 ID1 泵实例；未初始化时返回 NULL。
+ * @return 初始化完成后返回泵1实例；未初始化时返回 NULL。
+ *
+ * @note 泵1对应上位机 OBJ=PUMP_1，硬件为 RS485 ID=1 的 300ul 定量泵。
  */
-PumpDrive_s *PumpDrive_Get300ulPump(void);
+PumpDrive_s *PumpDrive_GetPump1(void);
 
 /**
- * @brief 获取 100ul 定量泵实例。
+ * @brief 获取泵2实例。
  *
- * @return 初始化完成后返回 ID2 泵实例；未初始化时返回 NULL。
+ * @return 初始化完成后返回泵2实例；未初始化时返回 NULL。
+ *
+ * @note 泵2对应上位机 OBJ=PUMP_2，硬件为 RS485 ID=2 的 100ul 定量泵。
  */
-PumpDrive_s *PumpDrive_Get100ulPump(void);
+PumpDrive_s *PumpDrive_GetPump2(void);
 
 /**
  * @brief 按 RS485 设备 ID 获取定量泵实例。
@@ -300,7 +304,7 @@ uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps);
  * @param full_stroke_ul 满行程体积，单位 ul。
  * @param full_stroke_steps 满行程命令步数。
  *
- * @note 当前默认：ID1=300ul/1600步，ID2=100ul/1600步。
+ * @note 当前默认：泵1=300ul/1600步，泵2=100ul/1600步。
  */
 void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32_t full_stroke_steps);
 

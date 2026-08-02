@@ -17,8 +17,8 @@
 
 static USARTInstance *s_pump_usart = NULL;
 static PumpDrive_s *s_pump_list[PUMP_DRIVE_MAX_INSTANCE] = {0};
-static PumpDrive_s s_pump_300ul = {0};
-static PumpDrive_s s_pump_100ul = {0};
+static PumpDrive_s s_pump1 = {0};
+static PumpDrive_s s_pump2 = {0};
 static uint8_t s_pump_count = 0U;
 static uint8_t s_board_inited = 0U;
 static uint8_t s_bus_waiting = 0U;
@@ -180,13 +180,13 @@ static void PumpDrive_SetDefaultCalibration(PumpDrive_s *pump)
 
     pump->full_stroke_steps = PUMP_DRIVE_FULL_STROKE_STEPS;
 
-    if (pump->device_id == PUMP_DRIVE_100UL_DEVICE_ID)
+    if (pump->device_id == PUMP_DRIVE_PUMP2_DEVICE_ID)
     {
-        pump->full_stroke_ul = PUMP_DRIVE_ID2_FULL_STROKE_UL;
+        pump->full_stroke_ul = PUMP_DRIVE_PUMP2_FULL_STROKE_UL;
     }
     else
     {
-        pump->full_stroke_ul = PUMP_DRIVE_ID1_FULL_STROKE_UL;
+        pump->full_stroke_ul = PUMP_DRIVE_PUMP1_FULL_STROKE_UL;
     }
 }
 
@@ -343,18 +343,19 @@ uint8_t PumpDrive_BoardInit(void)
 
     /*
      * 当前硬件两台 ISC1000 共享 USART3 RS485 总线。
+     * 泵1固定为 ID1/300ul，泵2固定为 ID2/100ul。
      * 这里只绑定项目固定 ID 和泵体量程，不在业务层重复写这些常量。
      */
-    if (PumpDrive_Init(&s_pump_300ul,
+    if (PumpDrive_Init(&s_pump1,
                        PUMP_DRIVE_BUS_RS485,
-                       PUMP_DRIVE_300UL_DEVICE_ID) == 0U)
+                       PUMP_DRIVE_PUMP1_DEVICE_ID) == 0U)
     {
         return 0U;
     }
 
-    if (PumpDrive_Init(&s_pump_100ul,
+    if (PumpDrive_Init(&s_pump2,
                        PUMP_DRIVE_BUS_RS485,
-                       PUMP_DRIVE_100UL_DEVICE_ID) == 0U)
+                       PUMP_DRIVE_PUMP2_DEVICE_ID) == 0U)
     {
         return 0U;
     }
@@ -364,19 +365,19 @@ uint8_t PumpDrive_BoardInit(void)
 }
 
 /**
- * @brief 获取 300ul 定量泵实例。
+ * @brief 获取泵1实例。
  */
-PumpDrive_s *PumpDrive_Get300ulPump(void)
+PumpDrive_s *PumpDrive_GetPump1(void)
 {
-    return PumpDrive_FindById(PUMP_DRIVE_300UL_DEVICE_ID);
+    return PumpDrive_FindById(PUMP_DRIVE_PUMP1_DEVICE_ID);
 }
 
 /**
- * @brief 获取 100ul 定量泵实例。
+ * @brief 获取泵2实例。
  */
-PumpDrive_s *PumpDrive_Get100ulPump(void)
+PumpDrive_s *PumpDrive_GetPump2(void)
 {
-    return PumpDrive_FindById(PUMP_DRIVE_100UL_DEVICE_ID);
+    return PumpDrive_FindById(PUMP_DRIVE_PUMP2_DEVICE_ID);
 }
 
 /**

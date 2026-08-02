@@ -12,10 +12,10 @@
  * 2. 导杆 A 拉 3cm；
  * 3. 导杆 B 推 5cm；
  * 4. 两个电磁阀打通；
- * 5. 300ul 定量泵吸 100ul；
+ * 5. 泵1（300ul 定量泵）吸 100ul；
  * 6. 抽水泵打开 2s 后关闭；
  * 7. 等待用户按发药键并确认发药量；
- * 8. 100ul 定量泵吸 20ul，流程结束。
+ * 8. 泵2（100ul 定量泵）吸 20ul，流程结束。
  *
  * 每一步之间保留 500ms 间隔，不在 MachineTask 里阻塞等待。
  */
@@ -25,8 +25,8 @@
 #define MACHINE_COMBO_STEP_SPEED_CM_S_X100    200U
 #define MACHINE_COMBO_STEP_A_DISTANCE_CM_X100 300U
 #define MACHINE_COMBO_STEP_B_DISTANCE_CM_X100 500U
-#define MACHINE_COMBO_PUMP_300_VOLUME_UL      100U
-#define MACHINE_COMBO_PUMP_100_VOLUME_UL      20U
+#define MACHINE_COMBO_PUMP1_VOLUME_UL         100U
+#define MACHINE_COMBO_PUMP2_VOLUME_UL         20U
 
 typedef enum
 {
@@ -37,12 +37,12 @@ typedef enum
     MACHINE_COMBO_STATE_GAP_AFTER_B,    // B 动作完成后的间隔
     MACHINE_COMBO_STATE_VALVES_ON,      // 打通两个电磁阀
     MACHINE_COMBO_STATE_GAP_AFTER_VALVE,// 阀门动作后的间隔
-    MACHINE_COMBO_STATE_PUMP_300_IN,    // 300ul 定量泵吸 100ul
-    MACHINE_COMBO_STATE_GAP_AFTER_300,  // 300ul 泵动作后的间隔
+    MACHINE_COMBO_STATE_PUMP1_IN,       // 泵1吸 100ul
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP1,// 泵1动作后的间隔
     MACHINE_COMBO_STATE_WATER_PUMP_ON,  // 抽水泵打开 2s
     MACHINE_COMBO_STATE_WATER_PUMP_OFF, // 关闭抽水泵后间隔
     MACHINE_COMBO_STATE_WAIT_DISPENSE,  // 等待发药量确认
-    MACHINE_COMBO_STATE_PUMP_100_IN,    // 100ul 定量泵吸 20ul
+    MACHINE_COMBO_STATE_PUMP2_IN,       // 泵2吸 20ul
     MACHINE_COMBO_STATE_FINISHED,       // 流程结束，关闭输出
     MACHINE_COMBO_STATE_ERROR           // 动作启动失败，关闭输出
 } MachineComboState_e;
@@ -139,9 +139,9 @@ static void Machine_ExecuteComboState(void)
                                      SOLENOID_VALVE_STATE_ON_NC_OPEN);
         break;
 
-    case MACHINE_COMBO_STATE_PUMP_300_IN:
-        pump = PumpDrive_Get300ulPump();
-        if (PumpDrive_MoveInVolumeUl(pump, MACHINE_COMBO_PUMP_300_VOLUME_UL) == 0U)
+    case MACHINE_COMBO_STATE_PUMP1_IN:
+        pump = PumpDrive_GetPump1();
+        if (PumpDrive_MoveInVolumeUl(pump, MACHINE_COMBO_PUMP1_VOLUME_UL) == 0U)
         {
             Machine_AbortCombo();
         }
@@ -158,9 +158,9 @@ static void Machine_ExecuteComboState(void)
         WaterPump_Stop(WATER_PUMP_ID_MAIN);
         break;
 
-    case MACHINE_COMBO_STATE_PUMP_100_IN:
-        pump = PumpDrive_Get100ulPump();
-        if (PumpDrive_MoveInVolumeUl(pump, MACHINE_COMBO_PUMP_100_VOLUME_UL) == 0U)
+    case MACHINE_COMBO_STATE_PUMP2_IN:
+        pump = PumpDrive_GetPump2();
+        if (PumpDrive_MoveInVolumeUl(pump, MACHINE_COMBO_PUMP2_VOLUME_UL) == 0U)
         {
             Machine_AbortCombo();
         }
@@ -176,7 +176,7 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_A:
     case MACHINE_COMBO_STATE_GAP_AFTER_B:
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
-    case MACHINE_COMBO_STATE_GAP_AFTER_300:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
     default:
         break;
@@ -256,18 +256,18 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP_300_IN);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_IN);
         }
         break;
 
-    case MACHINE_COMBO_STATE_PUMP_300_IN:
+    case MACHINE_COMBO_STATE_PUMP1_IN:
         if (elapsed_ms >= MACHINE_COMBO_PUMP_ACTION_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_300);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1);
         }
         break;
 
-    case MACHINE_COMBO_STATE_GAP_AFTER_300:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_WATER_PUMP_ON);
@@ -291,11 +291,11 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
         if (MachineCMD_ConsumeDispenseConfirmed(&machine_combo_dispense_ml_x100) != 0U)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP_100_IN);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_IN);
         }
         break;
 
-    case MACHINE_COMBO_STATE_PUMP_100_IN:
+    case MACHINE_COMBO_STATE_PUMP2_IN:
         if (elapsed_ms >= MACHINE_COMBO_PUMP_ACTION_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);

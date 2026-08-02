@@ -124,7 +124,7 @@ uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
  * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、模块未初始化或已有电机正在运行。
  *
  * @note 本函数非阻塞。启动成功后立即返回，步数统计在 TIM2 PWM 中断中完成，
- *       达到 steps 后自动停止 PWM。当前按 A 轴 100mm、B 轴 150mm 的滑台有效行程
+ *       达到 steps 后自动停止 PWM。当前按 A 轴 150mm、B 轴 300mm 的滑台有效行程
  *       限制单次输出步数，但不记录滑台绝对位置。
  */
 uint8_t StepMotor_RunSteps(StepMotorId_e motor,
@@ -164,8 +164,8 @@ uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
  * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
  *
  * @note 本函数非阻塞。内部会把距离换算成 steps，把速度换算成 pps，
- *       再调用 StepMotor_RunSteps() 输出实际脉冲。当前 A 轴单次最大 100mm，
- *       B 轴单次最大 150mm。
+ *       再调用 StepMotor_RunSteps() 输出实际脉冲。当前 A 轴单次最大 150mm，
+ *       B 轴单次最大 300mm。
  */
 uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
@@ -181,8 +181,8 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
  * @param speed_cm_s_x100 目标速度，单位 0.01cm/s。比如 150 表示 1.50cm/s。
  * @return 1 表示启动成功；0 表示参数错误、超过单次有效行程、换算结果为 0 或电机启动失败。
  *
- * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。当前 A 轴单次最大 10cm，
- *       B 轴单次最大 15cm。
+ * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。当前 A 轴单次最大 15cm，
+ *       B 轴单次最大 30cm。
  */
 uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,

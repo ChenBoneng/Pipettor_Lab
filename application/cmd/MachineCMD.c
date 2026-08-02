@@ -29,8 +29,8 @@
 #define MACHINE_CMD_REMOTE_PUMP_OUT       2U
 #define MACHINE_CMD_REMOTE_MOTOR_A_BUSY   (1U << 0)
 #define MACHINE_CMD_REMOTE_MOTOR_B_BUSY   (1U << 1)
-#define MACHINE_CMD_REMOTE_PUMP_300_BUSY  (1U << 2)
-#define MACHINE_CMD_REMOTE_PUMP_100_BUSY  (1U << 3)
+#define MACHINE_CMD_REMOTE_PUMP1_BUSY     (1U << 2)
+#define MACHINE_CMD_REMOTE_PUMP2_BUSY     (1U << 3)
 #define MACHINE_CMD_REMOTE_WATER_VALVE_ON (1U << 0)
 #define MACHINE_CMD_REMOTE_MED_VALVE_ON   (1U << 1)
 #define MACHINE_CMD_REMOTE_WATER_PUMP_ON  (1U << 2)
@@ -1195,13 +1195,13 @@ static void MachineCMD_StopRemoteOutputs(void)
     SolenoidValve_AllOff();
     WaterPump_StopAll();
 
-    pump = PumpDrive_Get300ulPump();
+    pump = PumpDrive_GetPump1();
     if (pump != NULL)
     {
         (void)PumpDrive_Stop(pump, 1U);
     }
 
-    pump = PumpDrive_Get100ulPump();
+    pump = PumpDrive_GetPump2();
     if (pump != NULL)
     {
         (void)PumpDrive_Stop(pump, 1U);
@@ -1491,11 +1491,11 @@ static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *com
 
     if (command->obj == COMMUNICATION_OBJ_PUMP_1)
     {
-        pump = PumpDrive_Get300ulPump();
+        pump = PumpDrive_GetPump1();
     }
     else if (command->obj == COMMUNICATION_OBJ_PUMP_2)
     {
-        pump = PumpDrive_Get100ulPump();
+        pump = PumpDrive_GetPump2();
     }
     else
     {
@@ -1566,11 +1566,11 @@ static uint8_t MachineCMD_HandleRemoteStopObject(const CommunicationHostCommand_
         return 1U;
 
     case COMMUNICATION_OBJ_PUMP_1:
-        pump = PumpDrive_Get300ulPump();
+        pump = PumpDrive_GetPump1();
         return (pump != NULL) ? PumpDrive_Stop(pump, 1U) : 0U;
 
     case COMMUNICATION_OBJ_PUMP_2:
-        pump = PumpDrive_Get100ulPump();
+        pump = PumpDrive_GetPump2();
         return (pump != NULL) ? PumpDrive_Stop(pump, 1U) : 0U;
 
     default:
@@ -1612,15 +1612,15 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
         status.motor_state |= MACHINE_CMD_REMOTE_MOTOR_B_BUSY;
     }
 
-    pump = PumpDrive_Get300ulPump();
+    pump = PumpDrive_GetPump1();
     if ((pump != NULL) && (pump->status.busy != 0U))
     {
-        status.motor_state |= MACHINE_CMD_REMOTE_PUMP_300_BUSY;
+        status.motor_state |= MACHINE_CMD_REMOTE_PUMP1_BUSY;
     }
-    pump = PumpDrive_Get100ulPump();
+    pump = PumpDrive_GetPump2();
     if ((pump != NULL) && (pump->status.busy != 0U))
     {
-        status.motor_state |= MACHINE_CMD_REMOTE_PUMP_100_BUSY;
+        status.motor_state |= MACHINE_CMD_REMOTE_PUMP2_BUSY;
     }
 
     if (SolenoidValve_GetState(SOLENOID_VALVE_ID_WATER) == SOLENOID_VALVE_STATE_ON_NC_OPEN)
