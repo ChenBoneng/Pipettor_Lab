@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#include "main.h"
 #include "usart.h"
 
 /*
@@ -24,6 +25,7 @@ static uint8_t s_board_inited = 0U;
 static uint8_t s_bus_waiting = 0U;
 static uint8_t s_bus_waiting_id = 0U;
 static uint32_t s_bus_wait_start_ms = 0U;
+static uint8_t s_sensor_config_index = 0U;
 
 /**
  * @brief USART3 接收完成回调入口。
@@ -49,7 +51,29 @@ static void PumpDrive_StartBusWait(PumpDrive_s *pump);
 
 static void PumpDrive_ClearBusWait(uint8_t device_id);
 
+static void PumpDrive_SaveRawRx(PumpDrive_s *pump, const uint8_t *data, uint16_t len);
+
+static void PumpDrive_SaveRawRxToAll(const uint8_t *data, uint16_t len);
+
 static uint8_t PumpDrive_ParseBusStream(const uint8_t *data, uint16_t len);
+
+static void PumpDrive_UpdateBusTimeout(void);
+
+static uint8_t PumpDrive_HasActiveMove(void);
+
+static void PumpDrive_ProcessSensorConfig(void);
+
+static void PumpDrive_ProcessMoveMonitor(void);
+
+static void PumpDrive_StartMoveMonitor(PumpDrive_s *pump,
+                                       PumpDriveMoveDir_e dir,
+                                       uint32_t steps);
+
+static void PumpDrive_ClearMoveMonitor(PumpDrive_s *pump);
+
+static void PumpDrive_UpdateMoveByStatus(PumpDrive_s *pump);
+
+static uint32_t PumpDrive_CalcMoveTimeoutMs(uint32_t steps);
 
 /**
  * @brief 使用 printf 风格格式化命令，然后发送到 ISC1000。
@@ -83,6 +107,35 @@ static uint32_t PumpDrive_GetMs(void)
     return HAL_GetTick();
 }
 
+/**
+ * @brief 根据目标步数估算本次运动最大等待时间。
+ *
+ * @param steps 本次 in/out 命令步数。
+ * @return 最大等待时间，单位 ms。
+ *
+ * 正常情况下运动完成由 `sta` 的 Busy=0 确认；这个时间只作为兜底保护。
+ * 估算速度故意取偏慢值，避免泵实际还在运动时过早放行。
+ */
+static uint32_t PumpDrive_CalcMoveTimeoutMs(uint32_t steps)
+{
+    uint32_t timeout_ms;
+
+    if (steps == 0U)
+    {
+        return 0U;
+    }
+
+    timeout_ms = ((steps * 1000U) + (PUMP_DRIVE_MOVE_TIMEOUT_ESTIMATE_PPS - 1U)) /
+                 PUMP_DRIVE_MOVE_TIMEOUT_ESTIMATE_PPS;
+    timeout_ms += PUMP_DRIVE_MOVE_TIMEOUT_MARGIN_MS;
+
+    if (timeout_ms < PUMP_DRIVE_MOVE_TIMEOUT_MIN_MS)
+    {
+        timeout_ms = PUMP_DRIVE_MOVE_TIMEOUT_MIN_MS;
+    }
+
+    return timeout_ms;
+}
 /**
  * @brief 注册 USART3 总线。
  *
@@ -192,8 +245,11 @@ static void PumpDrive_SetDefaultCalibration(PumpDrive_s *pump)
 
 /**
  * @brief 释放超时等待中的 RS485 总线。
+ *
+ * 这里被拆成独立函数，是为了避免 PumpDrive_Process() 内部发送
+ * `sta` / `set stl=0` 时再次递归进入 PumpDrive_Process()。
  */
-void PumpDrive_Process(void)
+static void PumpDrive_UpdateBusTimeout(void)
 {
     if ((s_bus_waiting != 0U) &&
         ((PumpDrive_GetMs() - s_bus_wait_start_ms) >= PUMP_DRIVE_BUS_TIMEOUT_MS))
@@ -201,6 +257,21 @@ void PumpDrive_Process(void)
         s_bus_waiting = 0U;
         s_bus_waiting_id = 0U;
     }
+}
+
+/**
+ * @brief 定量泵周期维护。
+ *
+ * 当前维护三类事情：
+ * - 释放 RS485 一问一答超时；
+ * - 上电后给两台泵发送 `set stl=0`，匹配白线低电平触发；
+ * - 对正在运动的泵周期查询 `sta`，等待 Busy=0 后再做机械稳定延时。
+ */
+void PumpDrive_Process(void)
+{
+    PumpDrive_UpdateBusTimeout();
+    PumpDrive_ProcessSensorConfig();
+    PumpDrive_ProcessMoveMonitor();
 }
 
 /**
@@ -216,7 +287,7 @@ static uint8_t PumpDrive_IsBusReady(PumpDrive_s *pump)
         return 0U;
     }
 
-    PumpDrive_Process();
+    PumpDrive_UpdateBusTimeout();
 
     if (s_bus_waiting != 0U)
     {
@@ -260,6 +331,250 @@ static void PumpDrive_ClearBusWait(uint8_t device_id)
 }
 
 /**
+ * @brief 保存最近一次 USART3 原始接收字节，方便现场调试反馈帧格式。
+ *
+ * @param pump 定量泵实例。
+ * @param data DMA + IDLE 得到的原始接收数据。
+ * @param len 原始接收长度。
+ *
+ * 这里只保存前 PUMP_DRIVE_RAW_RX_DEBUG_SIZE 字节，不参与任何业务判断。
+ * 如果再次出现 BAD_TAIL，就可以直接看 last_raw_rx 判断是没回包、乱码还是帧尾位置不一致。
+ */
+static void PumpDrive_SaveRawRx(PumpDrive_s *pump, const uint8_t *data, uint16_t len)
+{
+    uint16_t copy_len;
+
+    if ((pump == NULL) || (data == NULL) || (len == 0U))
+    {
+        return;
+    }
+
+    copy_len = len;
+    if (copy_len > PUMP_DRIVE_RAW_RX_DEBUG_SIZE)
+    {
+        copy_len = PUMP_DRIVE_RAW_RX_DEBUG_SIZE;
+    }
+
+    pump->raw_rx_count++;
+    pump->last_raw_rx_total_len = len;
+    pump->last_raw_rx_len = copy_len;
+    memset(pump->last_raw_rx, 0, sizeof(pump->last_raw_rx));
+    memcpy(pump->last_raw_rx, data, copy_len);
+}
+
+/**
+ * @brief 把一条 USART3 原始回包同步保存到所有泵实例。
+ *
+ * RS485 总线只有一个 USART3 接收入口；当前问题的关键是确认底层到底收到了什么字节。
+ * 所以先把同一份原始数据保存到泵1/泵2，避免因为 ID 解析失败而丢失现场信息。
+ */
+static void PumpDrive_SaveRawRxToAll(const uint8_t *data, uint16_t len)
+{
+    for (uint8_t i = 0U; i < s_pump_count; i++)
+    {
+        PumpDrive_SaveRawRx(s_pump_list[i], data, len);
+    }
+}
+
+/**
+ * @brief 判断是否有定量泵正在执行运动跟踪。
+ *
+ * @return 1 表示至少一台泵还在 RUNNING/STABILIZING；0 表示没有。
+ *
+ * 上电 `set stl=0` 是参数配置命令，不应该夹在运动过程中发送。
+ * 因此只要有泵还没确认完成，就先暂停自动配置。
+ */
+static uint8_t PumpDrive_HasActiveMove(void)
+{
+    for (uint8_t i = 0U; i < s_pump_count; i++)
+    {
+        if ((s_pump_list[i] != NULL) &&
+            ((s_pump_list[i]->move_state == PUMP_DRIVE_MOVE_RUNNING) ||
+             (s_pump_list[i]->move_state == PUMP_DRIVE_MOVE_STABILIZING)))
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
+}
+
+/**
+ * @brief 上电后按当前接线配置传感器触发电平。
+ *
+ * 当前两台泵的 Input1 都接白线，白线遮光时为低电平，
+ * 所以上电后给每台泵发送一次 `set stl=0`。
+ *
+ * @note 这里不发送 `sav`。`set` 只写 RAM，掉电后是否保持取决于驱动器原配置；
+ *       主控每次上电重发一次即可，避免频繁写 Flash。
+ */
+static void PumpDrive_ProcessSensorConfig(void)
+{
+    PumpDrive_s *pump;
+
+    if ((s_board_inited == 0U) ||
+        (s_sensor_config_index >= s_pump_count) ||
+        (PumpDrive_HasActiveMove() != 0U))
+    {
+        return;
+    }
+
+    pump = s_pump_list[s_sensor_config_index];
+    if (pump == NULL)
+    {
+        s_sensor_config_index++;
+        return;
+    }
+
+    if (pump->sensor_level_configured != 0U)
+    {
+        s_sensor_config_index++;
+        return;
+    }
+
+    if (PumpDrive_SetSensorTriggerLevel(pump, 0U) != 0U)
+    {
+        pump->sensor_level_configured = 1U;
+        s_sensor_config_index++;
+    }
+}
+
+/**
+ * @brief 定时查询正在运动的泵状态。
+ *
+ * ISC1000 没有主动上报“运动完成”的事件，因此运动命令发出后，
+ * 驱动层周期发送 `sta`，用 Busy 位决定什么时候可以进入下一步。
+ */
+static void PumpDrive_ProcessMoveMonitor(void)
+{
+    uint32_t now_ms = PumpDrive_GetMs();
+
+    for (uint8_t i = 0U; i < s_pump_count; i++)
+    {
+        PumpDrive_s *pump = s_pump_list[i];
+
+        if (pump == NULL)
+        {
+            continue;
+        }
+
+        if (pump->move_state == PUMP_DRIVE_MOVE_STABILIZING)
+        {
+            if ((now_ms - pump->move_stable_start_ms) >= PUMP_DRIVE_MOVE_STABLE_DELAY_MS)
+            {
+                pump->move_photo_count = pump->photo_count - pump->move_start_photo_count;
+                pump->move_state = PUMP_DRIVE_MOVE_DONE;
+            }
+            continue;
+        }
+
+        if (pump->move_state != PUMP_DRIVE_MOVE_RUNNING)
+        {
+            continue;
+        }
+
+        if ((pump->move_timeout_ms != 0U) &&
+            ((now_ms - pump->move_start_ms) >= pump->move_timeout_ms))
+        {
+            /*
+             * 兜底完成只在 Busy 状态帧没有成功驱动状态机时触发。
+             * 到这里说明按保守速度估算已经超过最大运动时间，先进入稳定延时，
+             * 避免整机流程永久卡在“等待泵完成”。
+             */
+            pump->move_timeout_fallback = 1U;
+            pump->move_photo_count = pump->photo_count - pump->move_start_photo_count;
+            pump->move_stable_start_ms = now_ms;
+            pump->move_state = PUMP_DRIVE_MOVE_STABILIZING;
+            continue;
+        }
+
+        if ((now_ms - pump->move_last_query_ms) >= PUMP_DRIVE_STATUS_QUERY_INTERVAL_MS)
+        {
+            if (PumpDrive_QueryStatus(pump) != 0U)
+            {
+                pump->move_last_query_ms = now_ms;
+            }
+        }
+    }
+}
+
+/**
+ * @brief 记录一次 in/out 运动的起始状态。
+ *
+ * @param pump 驱动实例指针。
+ * @param dir 本次运动方向。
+ * @param steps 本次下发的命令步数。
+ */
+static void PumpDrive_StartMoveMonitor(PumpDrive_s *pump,
+                                       PumpDriveMoveDir_e dir,
+                                       uint32_t steps)
+{
+    uint32_t now_ms = PumpDrive_GetMs();
+
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    pump->move_dir = dir;
+    pump->move_target_steps = steps;
+    pump->move_start_photo_count = pump->photo_count;
+    pump->move_photo_count = 0U;
+    pump->move_start_ms = now_ms;
+    pump->move_timeout_ms = PumpDrive_CalcMoveTimeoutMs(steps);
+    pump->move_last_query_ms = now_ms;
+    pump->move_stable_start_ms = 0U;
+    pump->move_timeout_fallback = 0U;
+    pump->move_state = (steps == 0U) ? PUMP_DRIVE_MOVE_DONE : PUMP_DRIVE_MOVE_RUNNING;
+}
+
+/**
+ * @brief 清除运动跟踪状态。
+ *
+ * 急停、减速停止或流程复位时调用。这里会保留截至清除时的光电门计数差，
+ * 便于调试时观察停止前大概已经转过多少。
+ */
+static void PumpDrive_ClearMoveMonitor(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    pump->move_photo_count = pump->photo_count - pump->move_start_photo_count;
+    pump->move_dir = PUMP_DRIVE_MOVE_DIR_NONE;
+    pump->move_target_steps = 0U;
+    pump->move_start_ms = 0U;
+    pump->move_timeout_ms = 0U;
+    pump->move_last_query_ms = 0U;
+    pump->move_stable_start_ms = 0U;
+    pump->move_timeout_fallback = 0U;
+    pump->move_state = PUMP_DRIVE_MOVE_IDLE;
+}
+
+/**
+ * @brief 根据最新 `sta` 结果推进运动状态。
+ *
+ * 只有 Busy 从运行态变成 0 后，才进入机械稳定延时。
+ * 这样上层流程不会在泵还没实际停下时提前启动抽水泵或导轨复位。
+ */
+static void PumpDrive_UpdateMoveByStatus(PumpDrive_s *pump)
+{
+    if ((pump == NULL) || (pump->move_state != PUMP_DRIVE_MOVE_RUNNING))
+    {
+        return;
+    }
+
+    if (pump->status.busy == 0U)
+    {
+        pump->move_timeout_fallback = 0U;
+        pump->move_photo_count = pump->photo_count - pump->move_start_photo_count;
+        pump->move_stable_start_ms = PumpDrive_GetMs();
+        pump->move_state = PUMP_DRIVE_MOVE_STABILIZING;
+    }
+}
+
+/**
  * @brief 判断离线时序步骤序号是否合法。
  * @param step_index 步骤序号，手册允许范围为 1~60。
  * @return 1 表示合法；0 表示超出手册范围。
@@ -290,6 +605,8 @@ static void PumpDrive_UpdateStatus(PumpDrive_s *pump, uint32_t raw_value)
     pump->status.enabled = ((flags & PUMP_DRIVE_STATUS_ENABLE) != 0U) ? 1U : 0U;
     pump->status.valve1 = ((flags & PUMP_DRIVE_STATUS_VALVE1) != 0U) ? 1U : 0U;
     pump->status.valve2 = ((flags & PUMP_DRIVE_STATUS_VALVE2) != 0U) ? 1U : 0U;
+
+    PumpDrive_UpdateMoveByStatus(pump);
 }
 
 /**
@@ -360,6 +677,9 @@ uint8_t PumpDrive_BoardInit(void)
         return 0U;
     }
 
+    s_pump1.sensor_level_configured = 0U;
+    s_pump2.sensor_level_configured = 0U;
+    s_sensor_config_index = 0U;
     s_board_inited = 1U;
     return 1U;
 }
@@ -497,10 +817,27 @@ uint8_t PumpDrive_QueryConfig(PumpDrive_s *pump)
  * @brief 发送参数保存命令，将当前设置写入 ISC1000 Flash。
  * @param pump 驱动实例指针。
  * @return 1 表示发送成功；0 表示发送失败。
+ *
+ * @note `sav` 会写入驱动器 Flash，正常业务流程不要自动调用。
+ *       当前工程只保留这个手动接口，上电设置 `stl` 时不会发送 `sav`。
  */
 uint8_t PumpDrive_SaveConfig(PumpDrive_s *pump)
 {
     return PumpDrive_SendCommand(pump, "sav");
+}
+
+/**
+ * @brief 设置传感器 1 触发电平。
+ * @param pump 驱动实例指针。
+ * @param trigger_high_level 0 表示低电平触发；1 表示高电平触发。
+ * @return 1 表示发送成功；0 表示发送失败。
+ *
+ * 当前泵1/PB15、泵2/PB14 都接白线，白线遮光时为低电平，
+ * 因此本机默认发送 `set stl=0`。这里只写 RAM，不写 Flash。
+ */
+uint8_t PumpDrive_SetSensorTriggerLevel(PumpDrive_s *pump, uint8_t trigger_high_level)
+{
+    return PumpDrive_SendFormatted(pump, "set stl=%u", trigger_high_level ? 1U : 0U);
 }
 
 /**
@@ -531,6 +868,8 @@ uint8_t PumpDrive_Disable(PumpDrive_s *pump)
  */
 uint8_t PumpDrive_Stop(PumpDrive_s *pump, uint8_t emergency)
 {
+    uint8_t result;
+
     if (emergency != 0U)
     {
         /*
@@ -541,7 +880,13 @@ uint8_t PumpDrive_Stop(PumpDrive_s *pump, uint8_t emergency)
         s_bus_waiting_id = 0U;
     }
 
-    return PumpDrive_SendFormatted(pump, "stp %u", emergency ? 1U : 0U);
+    result = PumpDrive_SendFormatted(pump, "stp %u", emergency ? 1U : 0U);
+    if (result != 0U)
+    {
+        PumpDrive_ClearMoveMonitor(pump);
+    }
+
+    return result;
 }
 
 /**
@@ -567,7 +912,13 @@ uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps)
         return 0U;
     }
 
-    return PumpDrive_SendFormatted(pump, "in %lu", (unsigned long)steps);
+    if (PumpDrive_SendFormatted(pump, "in %lu", (unsigned long)steps) == 0U)
+    {
+        return 0U;
+    }
+
+    PumpDrive_StartMoveMonitor(pump, PUMP_DRIVE_MOVE_DIR_IN, steps);
+    return 1U;
 }
 
 /**
@@ -583,7 +934,100 @@ uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps)
         return 0U;
     }
 
-    return PumpDrive_SendFormatted(pump, "out %lu", (unsigned long)steps);
+    if (PumpDrive_SendFormatted(pump, "out %lu", (unsigned long)steps) == 0U)
+    {
+        return 0U;
+    }
+
+    PumpDrive_StartMoveMonitor(pump, PUMP_DRIVE_MOVE_DIR_OUT, steps);
+    return 1U;
+}
+
+/**
+ * @brief 判断最近一次 in/out 运动是否已经完成。
+ */
+uint8_t PumpDrive_IsMoveDone(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    return ((pump->move_state == PUMP_DRIVE_MOVE_IDLE) ||
+            (pump->move_state == PUMP_DRIVE_MOVE_DONE)) ? 1U : 0U;
+}
+
+/**
+ * @brief 读取光电门下降沿累计计数。
+ */
+uint32_t PumpDrive_GetPhotoCount(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    return pump->photo_count;
+}
+
+/**
+ * @brief 清零光电门累计计数。
+ */
+void PumpDrive_ResetPhotoCount(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    pump->photo_count = 0U;
+    pump->move_start_photo_count = 0U;
+    pump->move_photo_count = 0U;
+}
+
+/**
+ * @brief 读取本次运动产生的光电门计数差值。
+ */
+uint32_t PumpDrive_GetMovePhotoCount(PumpDrive_s *pump)
+{
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    return pump->move_photo_count;
+}
+
+/**
+ * @brief 读取本次运动圈数，结果放大 1000 倍。
+ */
+uint32_t PumpDrive_GetMoveTurnsX1000(PumpDrive_s *pump)
+{
+    if ((pump == NULL) || (PUMP_DRIVE_SENSOR_PULSES_PER_TURN == 0U))
+    {
+        return 0U;
+    }
+
+    return (pump->move_photo_count * 1000U) / PUMP_DRIVE_SENSOR_PULSES_PER_TURN;
+}
+
+/**
+ * @brief 光电门 EXTI 中断分发入口。
+ * @param GPIO_Pin HAL 传入的触发引脚。
+ *
+ * PB15 接泵1白线，PB14 接泵2白线。
+ * GPIO 已配置为下降沿中断，因此每次进入这里代表一次遮光触发。
+ */
+void PumpDrive_PhotoSensorIrqHandler(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_15)
+    {
+        s_pump1.photo_count++;
+    }
+    else if (GPIO_Pin == GPIO_PIN_14)
+    {
+        s_pump2.photo_count++;
+    }
 }
 
 /**
@@ -1114,28 +1558,49 @@ static uint8_t PumpDrive_ParseOneFrame(PumpDrive_s *pump,
     if ((type == PUMP_DRIVE_FB_STATUS) || (type == PUMP_DRIVE_FB_SEQUENCE_COUNT))
     {
         uint32_t decoded_value;
+        const uint8_t *value_bytes;
 
-        if (len < 11U)
+        /*
+         * 0x02/0x05 是数值反馈帧，理论数据区为 5 字节 7-bit 编码值。
+         * 实测 ISC1000 的 sta 帧会在数值前多带 1 个 0x00 保留字节：
+         * FF 01 02 00 xx xx xx xx xx BCC_H BCC_L FE。
+         * 因此这里不再写死帧尾在 data[10]，而是先找 0xFE，再由 BCC 反推出数据区长度。
+         */
+        for (tail_index = data_start; tail_index < len; tail_index++)
         {
-            pump->last_error = PUMP_DRIVE_ERR_SHORT_FRAME;
-            return 0U;
+            if (data[tail_index] == PUMP_DRIVE_FRAME_TAIL)
+            {
+                break;
+            }
         }
 
-        if (data[10] != PUMP_DRIVE_FRAME_TAIL)
+        if (tail_index >= len)
         {
             pump->last_error = PUMP_DRIVE_ERR_BAD_TAIL;
             return 0U;
         }
 
-        bcc_high = data[8];
-        bcc_low = data[9];
-        if (PumpDrive_CheckBcc(&data[1], 7U, bcc_high, bcc_low) == 0U)
+        if (tail_index < (data_start + 7U))
+        {
+            pump->last_error = PUMP_DRIVE_ERR_SHORT_FRAME;
+            return 0U;
+        }
+
+        data_len = (uint16_t)(tail_index - data_start - 2U);
+        bcc_high = data[tail_index - 2U];
+        bcc_low = data[tail_index - 1U];
+        if (PumpDrive_CheckBcc(&data[1], (uint16_t)(2U + data_len), bcc_high, bcc_low) == 0U)
         {
             pump->last_error = PUMP_DRIVE_ERR_BAD_BCC;
             return 0U;
         }
 
-        decoded_value = PumpDrive_Decode5ByteToUint32(&data[3]);
+        /*
+         * 数据区如果多于 5 字节，前面的字节按驱动器保留字段处理。
+         * 状态值始终取数据区末尾 5 字节，这和本次实测回包完全匹配。
+         */
+        value_bytes = &data[(uint16_t)(data_start + data_len - 5U)];
+        decoded_value = PumpDrive_Decode5ByteToUint32(value_bytes);
         pump->last_value = decoded_value;
 
         if (type == PUMP_DRIVE_FB_STATUS)
@@ -1154,7 +1619,7 @@ static uint8_t PumpDrive_ParseOneFrame(PumpDrive_s *pump,
 
         if (used_len != NULL)
         {
-            *used_len = 11U;
+            *used_len = (uint16_t)(tail_index + 1U);
         }
 
         return 1U;
@@ -1295,6 +1760,8 @@ static void PumpDrive_UsartRxCallback(void)
     {
         return;
     }
+
+    PumpDrive_SaveRawRxToAll(s_pump_usart->rx_buffer_finished, s_pump_usart->rx_len);
 
     (void)PumpDrive_ParseBusStream(s_pump_usart->rx_buffer_finished,
                                    s_pump_usart->rx_len);

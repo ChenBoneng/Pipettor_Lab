@@ -19,14 +19,12 @@
  * 9. 等待用户按发药键并确认发药量；
  * 10. 泵2吸入本次发药体积，流程结束。
  *
- * 每一步之间保留 500ms 间隔，定量泵按“体积换算步数 + 保守速度”等待完成，
+ * 每一步之间保留 500ms 间隔，定量泵由 pump_drive 周期轮询 Busy 位确认完成，
  * 所有等待都由状态机推进，不在 MachineTask 里阻塞。
  */
 #define MACHINE_COMBO_STEP_GAP_MS                500U
 #define MACHINE_COMBO_WATER_PUMP_MS              5000U
 #define MACHINE_COMBO_ACTIVITY_STABLE_MS         1000U
-#define MACHINE_COMBO_PUMP_SPEED_PPS             1000U
-#define MACHINE_COMBO_PUMP_WAIT_MARGIN_MS        1000U
 #define MACHINE_COMBO_STEP_SPEED_MM_S_X100       2000U
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
@@ -69,13 +67,11 @@ static uint16_t machine_combo_dispense_ml_x100 = 0U;
 static uint32_t machine_combo_water_ul = 0U;
 static uint32_t machine_combo_dispense_ul = 0U;
 static uint32_t machine_combo_raw_activity_mci_x1000 = 0U;
-static uint32_t machine_combo_pump_wait_ms = 0U;
 
 static uint32_t Machine_GetMs(void);
 static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
                                               uint16_t target_conc_x1000,
                                               uint32_t raw_activity_mci_x1000);
-static uint32_t Machine_CalcPumpWaitMs(PumpDrive_s *pump, uint32_t volume_ul);
 static void Machine_EnterComboState(MachineComboState_e next_state);
 static void Machine_ExecuteComboState(void);
 static void Machine_StopComboOutputs(void);
@@ -131,31 +127,6 @@ static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
     return water_ml_x100 * 10U;
 }
 
-/**
- * @brief 根据本次定量泵体积估算动作完成等待时间。
- *
- * @param pump 定量泵实例。
- * @param volume_ul 本次吸入体积，单位 ul。
- * @return 建议等待时间，单位 ms。
- *
- * @note 当前 ISC1000 只下发一条 in/out 命令，没有“动作完成事件”主动上报。
- *       为了保证流程动作串行，machine 层按命令步数和保守 PPS 估算等待时间。
- *       后续如果要做到更准，可以改成周期发送 sta 并等 busy 位清零。
- */
-static uint32_t Machine_CalcPumpWaitMs(PumpDrive_s *pump, uint32_t volume_ul)
-{
-    uint32_t steps;
-
-    steps = PumpDrive_VolumeUlToSteps(pump, volume_ul);
-    if (steps == 0U)
-    {
-        return 0U;
-    }
-
-    return ((steps * 1000U) + (MACHINE_COMBO_PUMP_SPEED_PPS - 1U)) /
-           MACHINE_COMBO_PUMP_SPEED_PPS +
-           MACHINE_COMBO_PUMP_WAIT_MARGIN_MS;
-}
 
 /**
  * @brief 关闭组合测试相关输出。
@@ -267,13 +238,11 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
         if (machine_combo_water_ul == 0U)
         {
-            machine_combo_pump_wait_ms = 0U;
             break;
         }
 
         pump = PumpDrive_GetPump1();
-        machine_combo_pump_wait_ms = Machine_CalcPumpWaitMs(pump, machine_combo_water_ul);
-        if (PumpDrive_MoveInVolumeUl(pump, machine_combo_water_ul) == 0U)
+        if ((pump == NULL) || (PumpDrive_MoveInVolumeUl(pump, machine_combo_water_ul) == 0U))
         {
             Machine_AbortCombo();
         }
@@ -299,9 +268,13 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN:
         machine_combo_dispense_ul = (uint32_t)machine_combo_dispense_ml_x100 * 10U;
+        if (machine_combo_dispense_ul == 0U)
+        {
+            break;
+        }
+
         pump = PumpDrive_GetPump2();
-        machine_combo_pump_wait_ms = Machine_CalcPumpWaitMs(pump, machine_combo_dispense_ul);
-        if (PumpDrive_MoveInVolumeUl(pump, machine_combo_dispense_ul) == 0U)
+        if ((pump == NULL) || (PumpDrive_MoveInVolumeUl(pump, machine_combo_dispense_ul) == 0U))
         {
             Machine_AbortCombo();
         }
@@ -342,7 +315,6 @@ static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000)
     machine_combo_water_ul = 0U;
     machine_combo_dispense_ul = 0U;
     machine_combo_raw_activity_mci_x1000 = 0U;
-    machine_combo_pump_wait_ms = 0U;
     machine_combo_running = 1U;
 
     Machine_StopComboOutputs();
@@ -437,7 +409,8 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
-        if (elapsed_ms >= machine_combo_pump_wait_ms)
+        if ((machine_combo_water_ul == 0U) ||
+            (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1);
         }
@@ -507,7 +480,8 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN:
-        if (elapsed_ms >= machine_combo_pump_wait_ms)
+        if ((machine_combo_dispense_ul == 0U) ||
+            (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U))
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
         }
@@ -531,7 +505,6 @@ void MachineInit(void)
     machine_combo_water_ul = 0U;
     machine_combo_dispense_ul = 0U;
     machine_combo_raw_activity_mci_x1000 = 0U;
-    machine_combo_pump_wait_ms = 0U;
     Machine_StopComboOutputs();
 }
 

@@ -22,6 +22,9 @@
 /** 保存握手、参数配置、离线时序脚本等文本反馈的最大长度。 */
 #define PUMP_DRIVE_TEXT_MAX            220U
 
+/** 调试用：保存最近一次 USART3 原始接收数据的最大字节数。 */
+#define PUMP_DRIVE_RAW_RX_DEBUG_SIZE   32U
+
 /** 当前设备最多挂接两台 ISC1000：泵1为 300ul，泵2为 100ul。 */
 #define PUMP_DRIVE_MAX_INSTANCE        2U
 
@@ -42,6 +45,34 @@
 
 /** ISC1000 单条 in/out 命令最大步数，超过该值需要业务层分段执行。 */
 #define PUMP_DRIVE_COMMAND_MAX_STEPS    60000U
+
+/** 定量泵运动中查询 `sta` 的间隔，单位 ms。 */
+#define PUMP_DRIVE_STATUS_QUERY_INTERVAL_MS 100U
+
+/** Busy 变为 0 后额外等待机械和流体稳定的时间，单位 ms。 */
+#define PUMP_DRIVE_MOVE_STABLE_DELAY_MS  100U
+
+/**
+ * 定量泵运动完成兜底估算速度，单位 PPS。
+ *
+ * 正常流程优先等待 `sta` 返回 Busy=0；这个值只在 `sta` 没有被成功解析时使用，
+ * 用一个偏慢的速度估算最大等待时间，避免整机流程永久卡住。
+ */
+#define PUMP_DRIVE_MOVE_TIMEOUT_ESTIMATE_PPS 200U
+
+/** 定量泵运动完成兜底等待的额外余量，单位 ms。 */
+#define PUMP_DRIVE_MOVE_TIMEOUT_MARGIN_MS 2000U
+
+/** 定量泵运动完成兜底等待的最小时间，单位 ms。 */
+#define PUMP_DRIVE_MOVE_TIMEOUT_MIN_MS 3000U
+
+/**
+ * 光电门每转一圈产生的下降沿数量。
+ *
+ * 当前先按“一圈一个遮光下降沿”处理；如果实测一圈有多个缺口，
+ * 只需要改这个常量，圈数换算接口不用跟着改。
+ */
+#define PUMP_DRIVE_SENSOR_PULSES_PER_TURN 1U
 
 /** RS485 一问一答保护超时时间，单位 ms。 */
 #define PUMP_DRIVE_BUS_TIMEOUT_MS      100U
@@ -102,6 +133,36 @@ typedef enum
 } PumpDriveFeedbackType_e;
 
 /**
+ * @brief ISC1000 本次运动方向。
+ *
+ * 方向只用于调试和状态记录，不参与协议解析：
+ * - IN：吸入方向；
+ * - OUT：排出方向。
+ */
+typedef enum
+{
+    PUMP_DRIVE_MOVE_DIR_NONE = 0, /**< 当前没有正在跟踪的运动。 */
+    PUMP_DRIVE_MOVE_DIR_IN,       /**< 本次运动为吸入方向。 */
+    PUMP_DRIVE_MOVE_DIR_OUT,      /**< 本次运动为排出方向。 */
+} PumpDriveMoveDir_e;
+
+/**
+ * @brief ISC1000 本次运动完成状态。
+ *
+ * 运动完成不再只靠软件估算时间，而是由 `sta` 的 Busy 位确认：
+ * - RUNNING：已下发 in/out，正在周期查询 Busy；
+ * - STABILIZING：Busy 已经为 0，正在等待机械稳定延时；
+ * - DONE：本次运动已确认结束，上层可以进入下一步。
+ */
+typedef enum
+{
+    PUMP_DRIVE_MOVE_IDLE = 0,  /**< 空闲，没有正在跟踪的运动。 */
+    PUMP_DRIVE_MOVE_RUNNING,   /**< 运动中，等待 `sta` 返回 Busy=0。 */
+    PUMP_DRIVE_MOVE_STABILIZING, /**< 电气停止，等待机械和管路压力稳定。 */
+    PUMP_DRIVE_MOVE_DONE,      /**< 本次运动完成。 */
+} PumpDriveMoveState_e;
+
+/**
  * @brief ISC1000 反馈帧解析错误码。
  *
  * last_error 用于记录最近一次解析失败原因，便于调试线缆、校验、帧格式问题。
@@ -152,8 +213,24 @@ typedef struct
     uint32_t sequence_count;                  /**< `act 0 rdcnt` 返回的离线时序运行次数。 */
     uint8_t frame_ready;                      /**< 成功解析到一帧后置 1，上层处理完可手动清 0。 */
     uint8_t last_rx_id;                       /**< 最近一次反馈帧中的设备 ID。 */
+    uint32_t raw_rx_count;                    /**< USART3 原始接收次数计数，用于判断驱动器是否真的有回包。 */
+    uint16_t last_raw_rx_total_len;           /**< 最近一次 USART3 实际收到的总长度，可能大于调试缓存。 */
+    uint16_t last_raw_rx_len;                 /**< last_raw_rx 中实际保存的字节数。 */
+    uint8_t last_raw_rx[PUMP_DRIVE_RAW_RX_DEBUG_SIZE]; /**< 最近一次 USART3 原始接收字节，调试帧头/帧尾/ID 用。 */
     uint32_t full_stroke_ul;                  /**< 该泵满行程体积，单位 ul。 */
     uint32_t full_stroke_steps;               /**< 该泵满行程命令步数。 */
+    volatile uint32_t photo_count;            /**< 光电门下降沿累计计数，在 EXTI 中断里递增。 */
+    uint32_t move_start_photo_count;          /**< 本次运动开始时的光电门计数，用于计算本次转过多少圈。 */
+    uint32_t move_photo_count;                /**< 本次运动完成时的光电门计数差值。 */
+    uint32_t move_target_steps;               /**< 本次 in/out 下发的目标步数。 */
+    uint32_t move_start_ms;                   /**< 本次运动命令成功发送的起始时间。 */
+    uint32_t move_timeout_ms;                 /**< 按目标步数估算出的最大等待时间。 */
+    uint32_t move_last_query_ms;              /**< 最近一次查询 `sta` 的时间。 */
+    uint32_t move_stable_start_ms;            /**< Busy 变为 0 后进入机械稳定延时的起始时间。 */
+    PumpDriveMoveDir_e move_dir;              /**< 本次运动方向，仅用于调试显示和后续扩展。 */
+    PumpDriveMoveState_e move_state;          /**< 本次运动完成状态，由 Busy 轮询和稳定延时维护。 */
+    uint8_t move_timeout_fallback;            /**< 本次运动是否因为超过最大等待时间而兜底完成。 */
+    uint8_t sensor_level_configured;          /**< 上电后是否已发送 `set stl=0`。 */
     uint16_t text_len;                        /**< text_feedback 中的有效字符数量，不含结尾 `\0`。 */
     char text_feedback[PUMP_DRIVE_TEXT_MAX];  /**< 握手、配置、离线时序脚本等 ASCII 文本反馈。 */
 } PumpDrive_s;
@@ -208,9 +285,21 @@ PumpDrive_s *PumpDrive_GetByDeviceId(uint8_t device_id);
 /**
  * @brief ISC1000 总线周期维护。
  *
- * @note 当前只做 RS485 一问一答超时释放。即使不周期调用，下一次发送前也会自动检查超时。
+ * @note 需要在 ModuleTask 中周期调用，用于释放 RS485 等待、配置 stl、轮询 Busy 并完成机械稳定延时。
  */
 void PumpDrive_Process(void);
+
+/**
+ * @brief 光电门 EXTI 中断分发入口。
+ *
+ * @param GPIO_Pin HAL 传入的触发引脚。
+ *
+ * @note 当前硬件约定：
+ *       - PB15 接泵1白线；
+ *       - PB14 接泵2白线；
+ *       - 白线遮光时为低电平，因此 GPIO 配置为下降沿计数。
+ */
+void PumpDrive_PhotoSensorIrqHandler(uint16_t GPIO_Pin);
 
 /**
  * @brief 发送一条 ISC1000 原始 ASCII 命令。
@@ -252,6 +341,18 @@ uint8_t PumpDrive_QueryConfig(PumpDrive_s *pump);
  * @note 手册说明保存耗时约 10ms；id、bdr 等参数保存后通常需要重启生效。
  */
 uint8_t PumpDrive_SaveConfig(PumpDrive_s *pump);
+
+/**
+ * @brief 设置传感器 1 触发电平 `stl`。
+ *
+ * @param pump 驱动实例指针。
+ * @param trigger_high_level 0 表示遮光/触发为低电平；1 表示遮光/触发为高电平。
+ * @return 1 表示发送成功；0 表示发送失败。
+ *
+ * @note 当前接的是白线，遮光时 ON=低电平，所以应发送 `set stl=0`。
+ *       本函数只写驱动器 RAM，不会发送 `sav` 写 Flash。
+ */
+uint8_t PumpDrive_SetSensorTriggerLevel(PumpDrive_s *pump, uint8_t trigger_high_level);
 
 /**
  * @brief 发送电机使能命令 `on`。
@@ -299,6 +400,45 @@ uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps);
  * @return 1 表示发送成功；0 表示发送失败。
  */
 uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps);
+
+/**
+ * @brief 判断最近一次 in/out 运动是否已经完成。
+ *
+ * @param pump 驱动实例指针。
+ * @return 1 表示空闲或本次运动已完成；0 表示仍在运动或机械稳定延时中。
+ */
+uint8_t PumpDrive_IsMoveDone(PumpDrive_s *pump);
+
+/**
+ * @brief 读取光电门下降沿累计计数。
+ *
+ * @param pump 驱动实例指针。
+ * @return 从上电或最近一次清零以来累计到的下降沿数量。
+ */
+uint32_t PumpDrive_GetPhotoCount(PumpDrive_s *pump);
+
+/**
+ * @brief 清零光电门累计计数。
+ *
+ * @param pump 驱动实例指针。
+ */
+void PumpDrive_ResetPhotoCount(PumpDrive_s *pump);
+
+/**
+ * @brief 读取本次运动产生的光电门计数差值。
+ *
+ * @param pump 驱动实例指针。
+ * @return 最近一次完成的 in/out 动作期间累计到的下降沿数量。
+ */
+uint32_t PumpDrive_GetMovePhotoCount(PumpDrive_s *pump);
+
+/**
+ * @brief 读取本次运动圈数，结果放大 1000 倍。
+ *
+ * @param pump 驱动实例指针。
+ * @return 圈数 * 1000，例如返回 2500 表示 2.500 圈。
+ */
+uint32_t PumpDrive_GetMoveTurnsX1000(PumpDrive_s *pump);
 
 /**
  * @brief 设置泵体标定参数。
