@@ -531,6 +531,16 @@ uint8_t PumpDrive_Disable(PumpDrive_s *pump)
  */
 uint8_t PumpDrive_Stop(PumpDrive_s *pump, uint8_t emergency)
 {
+    if (emergency != 0U)
+    {
+        /*
+         * 急停命令的优先级高于普通一问一答保护。
+         * 如果上一条运动命令还没返回反馈，继续等待总线会导致急停发不出去。
+         */
+        s_bus_waiting = 0U;
+        s_bus_waiting_id = 0U;
+    }
+
     return PumpDrive_SendFormatted(pump, "stp %u", emergency ? 1U : 0U);
 }
 
@@ -552,6 +562,11 @@ uint8_t PumpDrive_ResetHome(PumpDrive_s *pump)
  */
 uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps)
 {
+    if (steps > PUMP_DRIVE_COMMAND_MAX_STEPS)
+    {
+        return 0U;
+    }
+
     return PumpDrive_SendFormatted(pump, "in %lu", (unsigned long)steps);
 }
 
@@ -563,6 +578,11 @@ uint8_t PumpDrive_MoveIn(PumpDrive_s *pump, uint32_t steps)
  */
 uint8_t PumpDrive_MoveOut(PumpDrive_s *pump, uint32_t steps)
 {
+    if (steps > PUMP_DRIVE_COMMAND_MAX_STEPS)
+    {
+        return 0U;
+    }
+
     return PumpDrive_SendFormatted(pump, "out %lu", (unsigned long)steps);
 }
 

@@ -373,9 +373,10 @@ uint8_t MachineCMD_IsRemoteMode(void)
  * @brief 读取并清除配药参数确认事件。
  *
  * @param volume_ml_x100 输出原药体积，单位 0.01ml，可为 NULL。
+ * @param target_conc_x1000 输出目标浓度，单位 0.001mCi/ml，可为 NULL。
  * @return 1 表示本次读到了新的确认事件；0 表示没有新事件。
  */
-uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100)
+uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100, uint16_t *target_conc_x1000)
 {
     if (machine_cmd.prep_confirmed == 0U)
     {
@@ -385,6 +386,11 @@ uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100)
     if (volume_ml_x100 != NULL)
     {
         *volume_ml_x100 = machine_cmd.prep_bottle_ml_x100[0];
+    }
+
+    if (target_conc_x1000 != NULL)
+    {
+        *target_conc_x1000 = machine_cmd.prep_target_conc_x1000;
     }
 
     machine_cmd.prep_confirmed = 0U;

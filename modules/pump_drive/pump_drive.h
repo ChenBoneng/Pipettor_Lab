@@ -40,6 +40,9 @@
 /** 两台定量泵满行程命令步数。 */
 #define PUMP_DRIVE_FULL_STROKE_STEPS   1600U
 
+/** ISC1000 单条 in/out 命令最大步数，超过该值需要业务层分段执行。 */
+#define PUMP_DRIVE_COMMAND_MAX_STEPS    60000U
+
 /** RS485 一问一答保护超时时间，单位 ms。 */
 #define PUMP_DRIVE_BUS_TIMEOUT_MS      100U
 
