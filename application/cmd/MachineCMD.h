@@ -62,6 +62,9 @@ uint8_t MachineCMD_GetManualSwitches(void);
 // 判断当前是否处于上位机远控接管模式。
 uint8_t MachineCMD_IsRemoteMode(void);
 
+// 读取并清除“复位键已经按下”事件，machine 层用它终止当前自动流程。
+uint8_t MachineCMD_ConsumeResetRequested(void);
+
 // 读取并清除“配药参数已经确认”事件，原药体积单位 0.01ml，目标浓度单位 0.001mCi/ml。
 uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100, uint16_t *target_conc_x1000);
 

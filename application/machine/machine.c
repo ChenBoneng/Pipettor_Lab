@@ -29,6 +29,7 @@
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
 #define MACHINE_COMBO_FAKE_RAW_ACTIVITY_MCI_X1000 20000U
+#define MACHINE_COMBO_PUMP2_SEGMENT_UL           PUMP_DRIVE_PUMP2_FULL_STROKE_UL
 
 typedef enum
 {
@@ -53,10 +54,24 @@ typedef enum
     MACHINE_COMBO_STATE_STEP_B_HOME,           // 导杆 B 回原点
     MACHINE_COMBO_STATE_GAP_AFTER_B_HOME,      // B 回原点后的间隔
     MACHINE_COMBO_STATE_WAIT_DISPENSE,         // 等待发药量确认
+    MACHINE_COMBO_STATE_PUMP2_ENABLE,          // 发送泵2使能命令
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE, // 泵2使能后等待总线和驱动响应
     MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN,     // 泵2吸入发药体积
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP2,        // 泵2分段吸液后的间隔
     MACHINE_COMBO_STATE_FINISHED,              // 流程结束，关闭输出
     MACHINE_COMBO_STATE_ERROR                  // 动作启动失败，关闭输出
 } MachineComboState_e;
+
+typedef enum
+{
+    MACHINE_DIRECT_DISPENSE_STATE_IDLE = 0,    // 空闲，等待待机页发药量确认
+    MACHINE_DIRECT_DISPENSE_STATE_ENABLE,      // 发送泵2使能命令
+    MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE, // 使能后等待总线和驱动响应
+    MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN,    // 泵2吸入本次发药体积
+    MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2, // 泵2分段吸液后的间隔
+    MACHINE_DIRECT_DISPENSE_STATE_FINISHED,    // 独立发药结束
+    MACHINE_DIRECT_DISPENSE_STATE_ERROR        // 泵2动作启动失败
+} MachineDirectDispenseState_e;
 
 static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
@@ -66,7 +81,21 @@ static uint16_t machine_combo_target_conc_x1000 = 0U;
 static uint16_t machine_combo_dispense_ml_x100 = 0U;
 static uint32_t machine_combo_water_ul = 0U;
 static uint32_t machine_combo_dispense_ul = 0U;
+static uint32_t machine_combo_dispense_remaining_ul = 0U;
+static uint32_t machine_combo_dispense_segment_ul = 0U;
 static uint32_t machine_combo_raw_activity_mci_x1000 = 0U;
+static uint8_t machine_combo_paused = 0U;
+static uint32_t machine_combo_pause_start_ms = 0U;
+
+static MachineDirectDispenseState_e machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
+static uint32_t machine_direct_dispense_state_start_ms = 0U;
+static uint8_t machine_direct_dispense_running = 0U;
+static uint16_t machine_direct_dispense_ml_x100 = 0U;
+static uint32_t machine_direct_dispense_ul = 0U;
+static uint32_t machine_direct_dispense_remaining_ul = 0U;
+static uint32_t machine_direct_dispense_segment_ul = 0U;
+static uint8_t machine_direct_dispense_paused = 0U;
+static uint32_t machine_direct_dispense_pause_start_ms = 0U;
 
 static uint32_t Machine_GetMs(void);
 static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
@@ -76,8 +105,20 @@ static void Machine_EnterComboState(MachineComboState_e next_state);
 static void Machine_ExecuteComboState(void);
 static void Machine_StopComboOutputs(void);
 static void Machine_AbortCombo(void);
+static void Machine_PauseCombo(void);
+static void Machine_ResumeCombo(void);
+static void Machine_StopPump2Output(void);
+static uint8_t Machine_StartPump2DispenseSegment(void);
 static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000);
 static void Machine_UpdateCombo(void);
+static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_state);
+static void Machine_ExecuteDirectDispenseState(void);
+static void Machine_AbortDirectDispense(void);
+static void Machine_PauseDirectDispense(void);
+static void Machine_ResumeDirectDispense(void);
+static uint8_t Machine_StartDirectDispenseSegment(void);
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100);
+static void Machine_UpdateDirectDispense(void);
 
 /**
  * @brief 获取当前毫秒时间轴。
@@ -157,6 +198,21 @@ static void Machine_StopComboOutputs(void)
 }
 
 /**
+ * @brief 只停止泵2输出。
+ *
+ * @note 待机直接发药流程只涉及泵2，不应该顺手改动导杆、阀门、抽水泵或泵1。
+ */
+static void Machine_StopPump2Output(void)
+{
+    PumpDrive_s *pump = PumpDrive_GetPump2();
+
+    if (pump != NULL)
+    {
+        (void)PumpDrive_Stop(pump, 1U);
+    }
+}
+
+/**
  * @brief 异常退出组合测试。
  */
 static void Machine_AbortCombo(void)
@@ -164,6 +220,85 @@ static void Machine_AbortCombo(void)
     Machine_StopComboOutputs();
     machine_combo_running = 0U;
     machine_combo_state = MACHINE_COMBO_STATE_ERROR;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
+    machine_combo_dispense_segment_ul = 0U;
+}
+
+/**
+ * @brief 暂停当前组合流程。
+ *
+ * 暂停只停止当前物理输出，不清空状态机状态。
+ * 启动键恢复时会从当前 machine_combo_state 继续推进。
+ */
+static void Machine_PauseCombo(void)
+{
+    if (machine_combo_paused != 0U)
+    {
+        return;
+    }
+
+    Machine_StopComboOutputs();
+    machine_combo_paused = 1U;
+    machine_combo_pause_start_ms = Machine_GetMs();
+}
+
+/**
+ * @brief 从暂停页恢复当前组合流程。
+ *
+ * 对正在计时的状态，扣除暂停期间经过的时间；
+ * 对正在动作的状态，重新执行该状态的一次性启动动作。
+ */
+static void Machine_ResumeCombo(void)
+{
+    uint32_t now_ms;
+
+    if (machine_combo_paused == 0U)
+    {
+        return;
+    }
+
+    now_ms = Machine_GetMs();
+    machine_combo_state_start_ms += now_ms - machine_combo_pause_start_ms;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
+
+    Machine_ExecuteComboState();
+}
+
+/**
+ * @brief 启动泵2的一段发药吸液。
+ *
+ * 泵2满行程为 100ul。发 1ml 时不再一次下发 16000 步，
+ * 而是拆成 10 段，每段 100ul，便于暂停和后续光电门校准。
+ */
+static uint8_t Machine_StartPump2DispenseSegment(void)
+{
+    PumpDrive_s *pump = PumpDrive_GetPump2();
+    uint32_t segment_ul;
+
+    if ((pump == NULL) || (machine_combo_dispense_remaining_ul == 0U))
+    {
+        return 0U;
+    }
+
+    segment_ul = machine_combo_dispense_segment_ul;
+    if (segment_ul == 0U)
+    {
+        segment_ul = machine_combo_dispense_remaining_ul;
+        if (segment_ul > MACHINE_COMBO_PUMP2_SEGMENT_UL)
+        {
+            segment_ul = MACHINE_COMBO_PUMP2_SEGMENT_UL;
+        }
+    }
+
+    if (PumpDrive_MoveInVolumeUl(pump, segment_ul) == 0U)
+    {
+        return 0U;
+    }
+
+    machine_combo_dispense_segment_ul = segment_ul;
+    return 1U;
 }
 
 /**
@@ -266,15 +401,31 @@ static void Machine_ExecuteComboState(void)
         }
         break;
 
+    case MACHINE_COMBO_STATE_PUMP2_ENABLE:
+        /*
+         * 泵2发药前先显式使能，并等待一个状态间隔后再发 in 命令。
+         * 这样避免上一条 stop / set / sta 命令后的 RS485 一问一答保护挡住吸液命令。
+         */
+        if (PumpDrive_Enable(PumpDrive_GetPump2()) != 0U)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE);
+        }
+        break;
+
     case MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN:
-        machine_combo_dispense_ul = (uint32_t)machine_combo_dispense_ml_x100 * 10U;
         if (machine_combo_dispense_ul == 0U)
+        {
+            machine_combo_dispense_ul = (uint32_t)machine_combo_dispense_ml_x100 * 10U;
+            machine_combo_dispense_remaining_ul = machine_combo_dispense_ul;
+            machine_combo_dispense_segment_ul = 0U;
+        }
+
+        if (machine_combo_dispense_remaining_ul == 0U)
         {
             break;
         }
 
-        pump = PumpDrive_GetPump2();
-        if ((pump == NULL) || (PumpDrive_MoveInVolumeUl(pump, machine_combo_dispense_ul) == 0U))
+        if (Machine_StartPump2DispenseSegment() == 0U)
         {
             Machine_AbortCombo();
         }
@@ -296,6 +447,8 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
     case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2:
     default:
         break;
     }
@@ -314,7 +467,11 @@ static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000)
     machine_combo_dispense_ml_x100 = 0U;
     machine_combo_water_ul = 0U;
     machine_combo_dispense_ul = 0U;
+    machine_combo_dispense_remaining_ul = 0U;
+    machine_combo_dispense_segment_ul = 0U;
     machine_combo_raw_activity_mci_x1000 = 0U;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
     machine_combo_running = 1U;
 
     Machine_StopComboOutputs();
@@ -333,11 +490,21 @@ static void Machine_UpdateCombo(void)
         return;
     }
 
-    if ((MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED) ||
-        (MachineCMD_IsRemoteMode() != 0U))
+    if (MachineCMD_IsRemoteMode() != 0U)
     {
         Machine_AbortCombo();
         return;
+    }
+
+    if (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED)
+    {
+        Machine_PauseCombo();
+        return;
+    }
+
+    if (machine_combo_paused != 0U)
+    {
+        Machine_ResumeCombo();
     }
 
     elapsed_ms = Machine_GetMs() - machine_combo_state_start_ms;
@@ -475,21 +642,311 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
         if (MachineCMD_ConsumeDispenseConfirmed(&machine_combo_dispense_ml_x100) != 0U)
         {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_ENABLE);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP2_ENABLE:
+        Machine_ExecuteComboState();
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
             Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN);
         }
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN:
-        if ((machine_combo_dispense_ul == 0U) ||
-            (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U))
+        if (machine_combo_dispense_ul == 0U)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+        }
+        else if (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U)
+        {
+            if (machine_combo_dispense_remaining_ul >= machine_combo_dispense_segment_ul)
+            {
+                machine_combo_dispense_remaining_ul -= machine_combo_dispense_segment_ul;
+            }
+            else
+            {
+                machine_combo_dispense_remaining_ul = 0U;
+            }
+
+            machine_combo_dispense_segment_ul = 0U;
+
+            if (machine_combo_dispense_remaining_ul == 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP2);
+            }
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN);
         }
         break;
 
     case MACHINE_COMBO_STATE_FINISHED:
     case MACHINE_COMBO_STATE_ERROR:
     case MACHINE_COMBO_STATE_IDLE:
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief 进入待机直接发药状态并执行一次性动作。
+ *
+ * @param next_state 下一个状态。
+ */
+static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_state)
+{
+    machine_direct_dispense_state = next_state;
+    machine_direct_dispense_state_start_ms = Machine_GetMs();
+    Machine_ExecuteDirectDispenseState();
+}
+
+/**
+ * @brief 启动待机直接发药的一段泵2吸液。
+ *
+ * @return 1 表示本段动作已经下发；0 表示泵2不可用或启动失败。
+ */
+static uint8_t Machine_StartDirectDispenseSegment(void)
+{
+    PumpDrive_s *pump = PumpDrive_GetPump2();
+    uint32_t segment_ul;
+
+    if ((pump == NULL) || (machine_direct_dispense_remaining_ul == 0U))
+    {
+        return 0U;
+    }
+
+    segment_ul = machine_direct_dispense_segment_ul;
+    if (segment_ul == 0U)
+    {
+        segment_ul = machine_direct_dispense_remaining_ul;
+        if (segment_ul > MACHINE_COMBO_PUMP2_SEGMENT_UL)
+        {
+            segment_ul = MACHINE_COMBO_PUMP2_SEGMENT_UL;
+        }
+    }
+
+    if (PumpDrive_MoveInVolumeUl(pump, segment_ul) == 0U)
+    {
+        return 0U;
+    }
+
+    machine_direct_dispense_segment_ul = segment_ul;
+    return 1U;
+}
+
+/**
+ * @brief 执行待机直接发药状态的一次性动作。
+ */
+static void Machine_ExecuteDirectDispenseState(void)
+{
+    switch (machine_direct_dispense_state)
+    {
+    case MACHINE_DIRECT_DISPENSE_STATE_ENABLE:
+        if (PumpDrive_Enable(PumpDrive_GetPump2()) != 0U)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN:
+        if (machine_direct_dispense_ul == 0U)
+        {
+            machine_direct_dispense_ul = (uint32_t)machine_direct_dispense_ml_x100 * 10U;
+            machine_direct_dispense_remaining_ul = machine_direct_dispense_ul;
+            machine_direct_dispense_segment_ul = 0U;
+        }
+
+        if (machine_direct_dispense_remaining_ul == 0U)
+        {
+            break;
+        }
+
+        if (Machine_StartDirectDispenseSegment() == 0U)
+        {
+            Machine_AbortDirectDispense();
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_FINISHED:
+    case MACHINE_DIRECT_DISPENSE_STATE_ERROR:
+        Machine_StopPump2Output();
+        machine_direct_dispense_running = 0U;
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_IDLE:
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE:
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2:
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief 异常退出待机直接发药流程。
+ */
+static void Machine_AbortDirectDispense(void)
+{
+    Machine_StopPump2Output();
+    machine_direct_dispense_running = 0U;
+    machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_ERROR;
+    machine_direct_dispense_paused = 0U;
+    machine_direct_dispense_pause_start_ms = 0U;
+    machine_direct_dispense_segment_ul = 0U;
+}
+
+/**
+ * @brief 暂停待机直接发药流程。
+ */
+static void Machine_PauseDirectDispense(void)
+{
+    if (machine_direct_dispense_paused != 0U)
+    {
+        return;
+    }
+
+    Machine_StopPump2Output();
+    machine_direct_dispense_paused = 1U;
+    machine_direct_dispense_pause_start_ms = Machine_GetMs();
+}
+
+/**
+ * @brief 从暂停页恢复待机直接发药流程。
+ */
+static void Machine_ResumeDirectDispense(void)
+{
+    uint32_t now_ms;
+
+    if (machine_direct_dispense_paused == 0U)
+    {
+        return;
+    }
+
+    now_ms = Machine_GetMs();
+    machine_direct_dispense_state_start_ms += now_ms - machine_direct_dispense_pause_start_ms;
+    machine_direct_dispense_paused = 0U;
+    machine_direct_dispense_pause_start_ms = 0U;
+
+    Machine_ExecuteDirectDispenseState();
+}
+
+/**
+ * @brief 启动待机页直接发药流程。
+ *
+ * @param dispense_ml_x100 发药体积，单位 0.01ml。
+ */
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100)
+{
+    machine_direct_dispense_ml_x100 = dispense_ml_x100;
+    machine_direct_dispense_ul = 0U;
+    machine_direct_dispense_remaining_ul = 0U;
+    machine_direct_dispense_segment_ul = 0U;
+    machine_direct_dispense_paused = 0U;
+    machine_direct_dispense_pause_start_ms = 0U;
+    machine_direct_dispense_running = 1U;
+
+    /*
+     * 待机直接发药刚启动时不先发急停。
+     * 急停命令会占用 RS485 一问一答保护窗口，马上发 in 命令会被总线忙挡掉。
+     */
+    Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_ENABLE);
+}
+
+/**
+ * @brief 推进待机直接发药流程。
+ */
+static void Machine_UpdateDirectDispense(void)
+{
+    uint32_t elapsed_ms;
+
+    if (machine_direct_dispense_running == 0U)
+    {
+        return;
+    }
+
+    if (MachineCMD_IsRemoteMode() != 0U)
+    {
+        Machine_AbortDirectDispense();
+        return;
+    }
+
+    if (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED)
+    {
+        Machine_PauseDirectDispense();
+        return;
+    }
+
+    if (machine_direct_dispense_paused != 0U)
+    {
+        Machine_ResumeDirectDispense();
+    }
+
+    elapsed_ms = Machine_GetMs() - machine_direct_dispense_state_start_ms;
+
+    switch (machine_direct_dispense_state)
+    {
+    case MACHINE_DIRECT_DISPENSE_STATE_ENABLE:
+        Machine_ExecuteDirectDispenseState();
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN:
+        if (machine_direct_dispense_ul == 0U)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FINISHED);
+        }
+        else if (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U)
+        {
+            if (machine_direct_dispense_remaining_ul >= machine_direct_dispense_segment_ul)
+            {
+                machine_direct_dispense_remaining_ul -= machine_direct_dispense_segment_ul;
+            }
+            else
+            {
+                machine_direct_dispense_remaining_ul = 0U;
+            }
+
+            machine_direct_dispense_segment_ul = 0U;
+
+            if (machine_direct_dispense_remaining_ul == 0U)
+            {
+                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FINISHED);
+            }
+            else
+            {
+                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2);
+            }
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_FINISHED:
+    case MACHINE_DIRECT_DISPENSE_STATE_ERROR:
+    case MACHINE_DIRECT_DISPENSE_STATE_IDLE:
     default:
         break;
     }
@@ -504,7 +961,22 @@ void MachineInit(void)
     machine_combo_dispense_ml_x100 = 0U;
     machine_combo_water_ul = 0U;
     machine_combo_dispense_ul = 0U;
+    machine_combo_dispense_remaining_ul = 0U;
+    machine_combo_dispense_segment_ul = 0U;
     machine_combo_raw_activity_mci_x1000 = 0U;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
+
+    machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
+    machine_direct_dispense_state_start_ms = 0U;
+    machine_direct_dispense_running = 0U;
+    machine_direct_dispense_ml_x100 = 0U;
+    machine_direct_dispense_ul = 0U;
+    machine_direct_dispense_remaining_ul = 0U;
+    machine_direct_dispense_segment_ul = 0U;
+    machine_direct_dispense_paused = 0U;
+    machine_direct_dispense_pause_start_ms = 0U;
+
     Machine_StopComboOutputs();
 }
 
@@ -512,11 +984,40 @@ void MachineControl(void)
 {
     uint16_t raw_ml_x100;
     uint16_t target_conc_x1000;
+    uint16_t dispense_ml_x100;
+
+    if (MachineCMD_ConsumeResetRequested() != 0U)
+    {
+        if (machine_combo_running != 0U)
+        {
+            Machine_AbortCombo();
+        }
+
+        if (machine_direct_dispense_running != 0U)
+        {
+            Machine_AbortDirectDispense();
+        }
+
+        return;
+    }
+
+    if (machine_direct_dispense_running != 0U)
+    {
+        Machine_UpdateDirectDispense();
+        return;
+    }
 
     if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumePrepConfirmed(&raw_ml_x100, &target_conc_x1000) != 0U))
     {
         Machine_StartCombo(raw_ml_x100, target_conc_x1000);
+        return;
+    }
+
+    if ((machine_combo_running == 0U) &&
+        (MachineCMD_ConsumeDispenseConfirmed(&dispense_ml_x100) != 0U))
+    {
+        Machine_StartDirectDispense(dispense_ml_x100);
         return;
     }
 
@@ -526,4 +1027,15 @@ void MachineControl(void)
 uint8_t MachineCombinationTestIsRunning(void)
 {
     return machine_combo_running;
+}
+
+uint8_t MachineCombinationTestCanDispense(void)
+{
+    if ((machine_combo_running != 0U) &&
+        (machine_combo_state == MACHINE_COMBO_STATE_WAIT_DISPENSE))
+    {
+        return 1U;
+    }
+
+    return 0U;
 }

@@ -34,7 +34,6 @@ void AllTaskInit(void)
     MachineInit();
 }
 
-
 void KeyboardTask(void *argument)
 {
     (void)argument;

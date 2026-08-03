@@ -25,6 +25,9 @@
 /** 调试用：保存最近一次 USART3 原始接收数据的最大字节数。 */
 #define PUMP_DRIVE_RAW_RX_DEBUG_SIZE   32U
 
+/** 调试用：保存最近一次 USART3 发送命令文本的最大字节数。 */
+#define PUMP_DRIVE_LAST_TX_DEBUG_SIZE  48U
+
 /** 当前设备最多挂接两台 ISC1000：泵1为 300ul，泵2为 100ul。 */
 #define PUMP_DRIVE_MAX_INSTANCE        2U
 
@@ -217,6 +220,11 @@ typedef struct
     uint16_t last_raw_rx_total_len;           /**< 最近一次 USART3 实际收到的总长度，可能大于调试缓存。 */
     uint16_t last_raw_rx_len;                 /**< last_raw_rx 中实际保存的字节数。 */
     uint8_t last_raw_rx[PUMP_DRIVE_RAW_RX_DEBUG_SIZE]; /**< 最近一次 USART3 原始接收字节，调试帧头/帧尾/ID 用。 */
+    uint16_t last_tx_len;                     /**< 最近一次尝试发送的命令长度，包含 RS485 ID 和换行。 */
+    uint8_t last_tx_result;                   /**< 最近一次命令是否真正发出：1 已发送，0 被参数/总线状态拦截。 */
+    uint32_t last_volume_ul;                  /**< 最近一次按体积运动的目标体积，单位 ul。 */
+    uint32_t last_volume_steps;               /**< 最近一次按体积运动换算出的目标步数。 */
+    char last_tx_command[PUMP_DRIVE_LAST_TX_DEBUG_SIZE]; /**< 最近一次命令文本，例如 `2 in 1600\n`。 */
     uint32_t full_stroke_ul;                  /**< 该泵满行程体积，单位 ul。 */
     uint32_t full_stroke_steps;               /**< 该泵满行程命令步数。 */
     volatile uint32_t photo_count;            /**< 光电门下降沿累计计数，在 EXTI 中断里递增。 */

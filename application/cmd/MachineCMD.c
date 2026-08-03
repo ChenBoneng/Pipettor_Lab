@@ -9,6 +9,7 @@
 #include "display_lcd.h"
 #include "Keyboard.h"
 #include "MachineCMD_Text.h"
+#include "machine.h"
 #include "Communication.h"
 #include "activity_meter.h"
 #include "pump_drive.h"
@@ -71,6 +72,7 @@ typedef struct
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
     uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
     uint8_t dispense_input_error;                         // 发药输入超余量提示标志
+    uint8_t reset_requested;                              // 复位键事件，machine 层读取后终止当前流程
     uint8_t remote_enabled;                               // 上位机远控接管标志
     uint8_t remote_paused;                                // 远控暂停标志，本地暂停键置位
     MachineCmdPrepFocus_e prep_focus;                     // 配药设置页当前输入焦点
@@ -82,6 +84,7 @@ static MachineCmdContext_s machine_cmd = {0};
 
 static uint32_t MachineCMD_GetMs(void);
 static void MachineCMD_EnterPage(MachineCmdPage_e page);
+static void MachineCMD_TryEnterDispSettingPage(uint8_t allow_direct_dispense);
 static void MachineCMD_ClearInput(void);
 static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit);
 static uint8_t MachineCMD_IsNumberKey(KeypadState_e key);
@@ -220,6 +223,7 @@ void MachineCMD_Process(void)
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
         machine_cmd.dispense_input_error = 0U;
+        machine_cmd.reset_requested = 1U;
         machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
         machine_cmd.remote_enabled = 0U;
         machine_cmd.remote_paused = 0U;
@@ -370,6 +374,25 @@ uint8_t MachineCMD_IsRemoteMode(void)
 }
 
 /**
+ * @brief 读取并清除复位键事件。
+ *
+ * @return 1 表示本次读到了复位事件；0 表示没有新事件。
+ *
+ * UI 层按下复位后会回到待机页；machine 层需要独立消费这个事件，
+ * 用来区分“用户复位终止流程”和“普通页面切换”。
+ */
+uint8_t MachineCMD_ConsumeResetRequested(void)
+{
+    if (machine_cmd.reset_requested == 0U)
+    {
+        return 0U;
+    }
+
+    machine_cmd.reset_requested = 0U;
+    return 1U;
+}
+
+/**
  * @brief 读取并清除配药参数确认事件。
  *
  * @param volume_ml_x100 输出原药体积，单位 0.01ml，可为 NULL。
@@ -464,6 +487,31 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
     {
         machine_cmd.measure_start_ms = MachineCMD_GetMs();
     }
+}
+
+/**
+ * @brief 在允许发药时进入发药参数页。
+ *
+ * @param allow_direct_dispense 是否允许待机页直接进入独立发药流程。
+ *
+ * @note 待机页允许直接发药，用于单独控制泵2。
+ *       配药运行中仍必须等 machine 组合流程走到 WAIT_DISPENSE，避免配药未完成时误发药。
+ */
+static void MachineCMD_TryEnterDispSettingPage(uint8_t allow_direct_dispense)
+{
+    if (MachineCombinationTestCanDispense() != 0U)
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        return;
+    }
+
+    if ((allow_direct_dispense == 0U) ||
+        (MachineCombinationTestIsRunning() != 0U))
+    {
+        return;
+    }
+
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
 }
 
 /**
@@ -717,7 +765,7 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
         break;
 
     case KEYPAD_STATE_SEND_MEDICINE:
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        MachineCMD_TryEnterDispSettingPage(1U);
         break;
 
     case KEYPAD_STATE_CLEAR_ALL:
@@ -820,7 +868,7 @@ static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
 {
     if (key == KEYPAD_STATE_SEND_MEDICINE)
     {
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        MachineCMD_TryEnterDispSettingPage(0U);
         return;
     }
 
@@ -845,7 +893,7 @@ static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key)
 {
     if (key == KEYPAD_STATE_SEND_MEDICINE)
     {
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_SETTING);
+        MachineCMD_TryEnterDispSettingPage(0U);
         return;
     }
 

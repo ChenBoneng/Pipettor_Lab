@@ -51,6 +51,8 @@ static void PumpDrive_StartBusWait(PumpDrive_s *pump);
 
 static void PumpDrive_ClearBusWait(uint8_t device_id);
 
+static void PumpDrive_SaveTxDebug(PumpDrive_s *pump, const char *tx_data, uint16_t tx_len, uint8_t result);
+
 static void PumpDrive_SaveRawRx(PumpDrive_s *pump, const uint8_t *data, uint16_t len);
 
 static void PumpDrive_SaveRawRxToAll(const uint8_t *data, uint16_t len);
@@ -328,6 +330,44 @@ static void PumpDrive_ClearBusWait(uint8_t device_id)
         s_bus_waiting = 0U;
         s_bus_waiting_id = 0U;
     }
+}
+
+/**
+ * @brief 保存最近一次尝试发送给 ISC1000 的命令。
+ *
+ * @param pump 定量泵实例。
+ * @param tx_data 已经拼好 RS485 ID 和换行的命令文本。
+ * @param tx_len 命令文本长度。
+ * @param result 1 表示已经调用 USARTSend，0 表示被格式/总线状态拦截。
+ *
+ * 该缓存只用于现场调试：比如发药 1ml 时，泵2里应能看到 `2 in 1600\n`
+ * 这样的分段命令；如果 last_tx_result 为 0，则说明命令还没真正发出去。
+ */
+static void PumpDrive_SaveTxDebug(PumpDrive_s *pump, const char *tx_data, uint16_t tx_len, uint8_t result)
+{
+    uint16_t copy_len;
+
+    if (pump == NULL)
+    {
+        return;
+    }
+
+    pump->last_tx_result = result ? 1U : 0U;
+    pump->last_tx_len = tx_len;
+    memset(pump->last_tx_command, 0, sizeof(pump->last_tx_command));
+
+    if ((tx_data == NULL) || (tx_len == 0U))
+    {
+        return;
+    }
+
+    copy_len = tx_len;
+    if (copy_len >= PUMP_DRIVE_LAST_TX_DEBUG_SIZE)
+    {
+        copy_len = PUMP_DRIVE_LAST_TX_DEBUG_SIZE - 1U;
+    }
+
+    memcpy(pump->last_tx_command, tx_data, copy_len);
 }
 
 /**
@@ -728,11 +768,6 @@ uint8_t PumpDrive_SendCommand(PumpDrive_s *pump, const char *command)
         return 0U;
     }
 
-    if (PumpDrive_IsBusReady(pump) == 0U)
-    {
-        return 0U;
-    }
-
     /*
      * 手册规定：
      * - RS232：命令直接以 '\n' 结尾；
@@ -749,10 +784,18 @@ uint8_t PumpDrive_SendCommand(PumpDrive_s *pump, const char *command)
 
     if ((tx_len <= 0) || ((uint32_t)tx_len >= sizeof(tx_buffer)))
     {
+        PumpDrive_SaveTxDebug(pump, NULL, 0U, 0U);
+        return 0U;
+    }
+
+    if (PumpDrive_IsBusReady(pump) == 0U)
+    {
+        PumpDrive_SaveTxDebug(pump, tx_buffer, (uint16_t)tx_len, 0U);
         return 0U;
     }
 
     USARTSend(pump->usart, (uint8_t *)tx_buffer, (uint16_t)tx_len, USART_TRANSFER_BLOCKING);
+    PumpDrive_SaveTxDebug(pump, tx_buffer, (uint16_t)tx_len, 1U);
     PumpDrive_StartBusWait(pump);
 
     return 1U;
@@ -1107,7 +1150,15 @@ uint8_t PumpDrive_SetSpeedRpmX10(PumpDrive_s *pump, uint32_t rpm_x10)
  */
 uint8_t PumpDrive_MoveInVolumeUl(PumpDrive_s *pump, uint32_t volume_ul)
 {
-    return PumpDrive_MoveIn(pump, PumpDrive_VolumeUlToSteps(pump, volume_ul));
+    uint32_t steps = PumpDrive_VolumeUlToSteps(pump, volume_ul);
+
+    if (pump != NULL)
+    {
+        pump->last_volume_ul = volume_ul;
+        pump->last_volume_steps = steps;
+    }
+
+    return PumpDrive_MoveIn(pump, steps);
 }
 
 /**
@@ -1115,7 +1166,15 @@ uint8_t PumpDrive_MoveInVolumeUl(PumpDrive_s *pump, uint32_t volume_ul)
  */
 uint8_t PumpDrive_MoveOutVolumeUl(PumpDrive_s *pump, uint32_t volume_ul)
 {
-    return PumpDrive_MoveOut(pump, PumpDrive_VolumeUlToSteps(pump, volume_ul));
+    uint32_t steps = PumpDrive_VolumeUlToSteps(pump, volume_ul);
+
+    if (pump != NULL)
+    {
+        pump->last_volume_ul = volume_ul;
+        pump->last_volume_steps = steps;
+    }
+
+    return PumpDrive_MoveOut(pump, steps);
 }
 
 /**
