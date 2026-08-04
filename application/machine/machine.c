@@ -10,11 +10,11 @@
 
 /*
  * 配药/发药整机测试流程：
- * 1. 配药页确认“原药体积”和“目标浓度”后启动；
+ * 1. 配药页确认“当前活度浓度、当前体积、目标活度浓度”后启动；
  * 2. 进罐导轨（电机A）推 3cm，插针导轨（电机B）推 5cm；
- * 3. 抽水泵打开 5s，把铅罐中原药抽入活度计；
- * 4. 等待活度计读数稳定，当前未接入实物，先使用固定假活度；
- * 5. 按目标浓度、原药体积和实际活度计算需要补入的纯净水体积；
+ * 3. 抽水泵打开 5s，把铅罐中当前溶液抽入活度计；
+ * 4. 等待活度计读数稳定；
+ * 5. 按当前浓度、当前体积和目标浓度计算需要补入的纯净水体积；
  * 6. 打开电磁阀 1，通过泵1抽取所需纯净水；
  * 7. 抽水泵再次打开 5s，把铅罐中的纯净水抽到活度计；
  * 8. 等待读数稳定后认为配药完成，先回退插针导轨（电机B），再回退进罐导轨（电机A）；
@@ -30,7 +30,6 @@
 #define MACHINE_COMBO_STEP_SPEED_MM_S_X100       2000U
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
-#define MACHINE_COMBO_FAKE_RAW_ACTIVITY_MCI_X1000 20000U
 #define MACHINE_COMBO_PUMP2_SEGMENT_UL           PUMP_DRIVE_PUMP2_FULL_STROKE_UL
 
 typedef enum
@@ -40,10 +39,10 @@ typedef enum
     MACHINE_COMBO_STATE_GAP_AFTER_A,           // 进罐导轨动作完成后的间隔
     MACHINE_COMBO_STATE_STEP_B_PUSH,           // 插针导轨（电机B）推 5cm
     MACHINE_COMBO_STATE_GAP_AFTER_B,           // 插针导轨动作完成后的间隔
-    MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵抽原药进入活度计
+    MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵抽当前溶液进入活度计
     MACHINE_COMBO_STATE_RAW_PUMP_OFF,          // 关闭抽水泵并等待流路稳定
-    MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY,     // 等待原药活度读数稳定
-    MACHINE_COMBO_STATE_CALC_WATER,            // 根据假活度计算补水量
+    MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY,     // 等待当前溶液活度读数稳定
+    MACHINE_COMBO_STATE_CALC_WATER,            // 根据当前浓度和目标浓度计算补水量
     MACHINE_COMBO_STATE_WATER_VALVE_ON,        // 打开电磁阀 1（水路阀）
     MACHINE_COMBO_STATE_GAP_AFTER_VALVE,       // 阀门动作后的间隔
     MACHINE_COMBO_STATE_PUMP1_WATER_IN,        // 泵1抽取纯净水
@@ -85,7 +84,8 @@ static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
 static uint8_t machine_combo_running = 0U;
 static MachineFlowOwner_e machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
-static uint16_t machine_combo_raw_ml_x100 = 0U;
+static uint16_t machine_combo_current_conc_x1000 = 0U;
+static uint16_t machine_combo_current_ml_x100 = 0U;
 static uint16_t machine_combo_target_conc_x1000 = 0U;
 static uint16_t machine_combo_dispense_ml_x100 = 0U;
 static uint32_t machine_combo_water_ul = 0U;
@@ -97,7 +97,7 @@ static uint8_t machine_combo_remote_seq = 0U;
 static uint32_t machine_combo_dispense_ul = 0U;
 static uint32_t machine_combo_dispense_remaining_ul = 0U;
 static uint32_t machine_combo_dispense_segment_ul = 0U;
-static uint32_t machine_combo_raw_activity_mci_x1000 = 0U;
+static uint32_t machine_combo_dispense_done_ul = 0U;
 static uint8_t machine_combo_paused = 0U;
 static uint32_t machine_combo_pause_start_ms = 0U;
 
@@ -109,13 +109,16 @@ static uint16_t machine_direct_dispense_ml_x100 = 0U;
 static uint32_t machine_direct_dispense_ul = 0U;
 static uint32_t machine_direct_dispense_remaining_ul = 0U;
 static uint32_t machine_direct_dispense_segment_ul = 0U;
+static uint32_t machine_direct_dispense_done_ul = 0U;
 static uint8_t machine_direct_dispense_paused = 0U;
 static uint32_t machine_direct_dispense_pause_start_ms = 0U;
+static uint8_t machine_dispense_progress_percent = 0U;
 
 static uint32_t Machine_GetMs(void);
-static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
-                                              uint16_t target_conc_x1000,
-                                              uint32_t raw_activity_mci_x1000);
+static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
+                                              uint16_t current_ml_x100,
+                                              uint16_t target_conc_x1000);
+static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul);
 static void Machine_EnterComboState(MachineComboState_e next_state);
 static void Machine_ExecuteComboState(void);
 static void Machine_StopComboOutputs(void);
@@ -124,7 +127,8 @@ static void Machine_PauseCombo(void);
 static void Machine_ResumeCombo(void);
 static void Machine_StopPump2Output(void);
 static uint8_t Machine_StartPump2DispenseSegment(void);
-static void Machine_StartCombo(uint16_t raw_ml_x100,
+static void Machine_StartCombo(uint16_t current_conc_x1000,
+                               uint16_t current_ml_x100,
                                uint16_t target_conc_x1000,
                                MachineFlowOwner_e owner);
 static void Machine_UpdateCombo(void);
@@ -152,41 +156,70 @@ static uint32_t Machine_GetMs(void)
 }
 
 /**
- * @brief 根据目标浓度计算需要补入的纯净水体积。
+ * @brief 根据当前浓度、当前体积和目标浓度计算需要补入的纯净水体积。
  *
- * @param raw_ml_x100 原药体积，单位 0.01ml。
- * @param target_conc_x1000 目标浓度，单位 0.001mCi/ml。
- * @param raw_activity_mci_x1000 活度计读到的原药总活度，单位 0.001mCi。
+ * @param current_conc_x1000 当前活度浓度，单位 0.001mCi/ml。
+ * @param current_ml_x100 当前溶液体积，单位 0.01ml。
+ * @param target_conc_x1000 目标活度浓度，单位 0.001mCi/ml。
  * @return 需要泵1抽取的纯净水体积，单位 ul。
  *
  * @note 稀释计算的本质是：
- *       最终总体积 = 原药总活度 / 目标浓度；
- *       补水体积 = 最终总体积 - 原药体积。
+ *       当前总活度 = 当前浓度 * 当前体积；
+ *       最终总体积 = 当前总活度 / 目标浓度；
+ *       补水体积 = 最终总体积 - 当前体积。
  *
- *       目前活度计还没有接入实物，raw_activity_mci_x1000 由固定假数据传入。
- *       如果目标浓度高于当前原药浓度，计算结果会小于原药体积，此时认为无需补水。
+ *       只加纯净水时，浓度只能下降，不能上升。
+ *       如果目标浓度大于等于当前浓度，则这里直接返回 0，不让泵1补水。
  */
-static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
-                                              uint16_t target_conc_x1000,
-                                              uint32_t raw_activity_mci_x1000)
+static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
+                                              uint16_t current_ml_x100,
+                                              uint16_t target_conc_x1000)
 {
     uint32_t final_ml_x100;
     uint32_t water_ml_x100;
 
-    if (target_conc_x1000 == 0U)
+    if ((current_conc_x1000 == 0U) ||
+        (current_ml_x100 == 0U) ||
+        (target_conc_x1000 == 0U) ||
+        (target_conc_x1000 >= current_conc_x1000))
     {
         return 0U;
     }
 
-    final_ml_x100 = ((raw_activity_mci_x1000 * 100U) + (target_conc_x1000 / 2U)) /
+    final_ml_x100 = (((uint32_t)current_conc_x1000 * (uint32_t)current_ml_x100) +
+                     (target_conc_x1000 / 2U)) /
                     target_conc_x1000;
-    if (final_ml_x100 <= raw_ml_x100)
+    if (final_ml_x100 <= current_ml_x100)
     {
         return 0U;
     }
 
-    water_ml_x100 = final_ml_x100 - raw_ml_x100;
+    water_ml_x100 = final_ml_x100 - current_ml_x100;
     return water_ml_x100 * 10U;
+}
+
+/**
+ * @brief 根据泵2已经完成的发药体积计算进度。
+ *
+ * @note 当前泵驱动没有可靠的“已执行步数”反馈，光电门圈数也还没有完成现场标定。
+ *       所以 LCD 进度只按已经确认完成的 100ul 分段推进，避免泵还在转时提前显示 100%。
+ */
+static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul)
+{
+    uint32_t percent;
+
+    if (target_ul == 0U)
+    {
+        return 0U;
+    }
+
+    percent = (uint32_t)((((uint64_t)done_ul * 100ULL) + (target_ul / 2U)) / target_ul);
+    if (percent > 100U)
+    {
+        percent = 100U;
+    }
+
+    return (uint8_t)percent;
 }
 
 /**
@@ -493,10 +526,9 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_CALC_WATER:
         /*
-         * 本地配药沿用当前假活度稀释计算；远程配药必须使用上位机随
+         * 本地配药使用 LCD 输入的当前浓度和当前体积计算补水量；远程配药必须使用上位机随
          * PREPARE_VOLUME_PARAM 下发的理论补水量，避免下位机缺参数硬算。
          */
-        machine_combo_raw_activity_mci_x1000 = MACHINE_COMBO_FAKE_RAW_ACTIVITY_MCI_X1000;
         if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
             (machine_combo_remote_volume_valid != 0U))
         {
@@ -504,9 +536,9 @@ static void Machine_ExecuteComboState(void)
         }
         else
         {
-            machine_combo_water_ul = Machine_CalcPureWaterVolumeUl(machine_combo_raw_ml_x100,
-                                                                   machine_combo_target_conc_x1000,
-                                                                   machine_combo_raw_activity_mci_x1000);
+            machine_combo_water_ul = Machine_CalcPureWaterVolumeUl(machine_combo_current_conc_x1000,
+                                                                   machine_combo_current_ml_x100,
+                                                                   machine_combo_target_conc_x1000);
         }
         break;
 
@@ -563,6 +595,8 @@ static void Machine_ExecuteComboState(void)
             machine_combo_dispense_ul = (uint32_t)machine_combo_dispense_ml_x100 * 10U;
             machine_combo_dispense_remaining_ul = machine_combo_dispense_ul;
             machine_combo_dispense_segment_ul = 0U;
+            machine_combo_dispense_done_ul = 0U;
+            machine_dispense_progress_percent = 0U;
         }
 
         if (machine_combo_dispense_remaining_ul == 0U)
@@ -578,6 +612,11 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_FINISHED:
     case MACHINE_COMBO_STATE_ERROR:
+        if ((machine_combo_state == MACHINE_COMBO_STATE_FINISHED) &&
+            (machine_combo_dispense_ul != 0U))
+        {
+            machine_dispense_progress_percent = 100U;
+        }
         Machine_StopComboOutputs();
         Machine_NotifyFlowStopped(machine_combo_owner,
                                   (machine_combo_state == MACHINE_COMBO_STATE_FINISHED) ?
@@ -608,22 +647,26 @@ static void Machine_ExecuteComboState(void)
 /**
  * @brief 启动组合测试。
  *
- * @param raw_ml_x100 配药页确认的原药体积，单位 0.01ml。
- * @param target_conc_x1000 配药页确认的目标浓度，单位 0.001mCi/ml。
+ * @param current_conc_x1000 配药页确认的当前活度浓度，单位 0.001mCi/ml。
+ * @param current_ml_x100 配药页确认的当前溶液体积，单位 0.01ml。
+ * @param target_conc_x1000 配药页确认的目标活度浓度，单位 0.001mCi/ml。
  */
-static void Machine_StartCombo(uint16_t raw_ml_x100,
+static void Machine_StartCombo(uint16_t current_conc_x1000,
+                               uint16_t current_ml_x100,
                                uint16_t target_conc_x1000,
                                MachineFlowOwner_e owner)
 {
     machine_combo_owner = owner;
-    machine_combo_raw_ml_x100 = raw_ml_x100;
+    machine_combo_current_conc_x1000 = current_conc_x1000;
+    machine_combo_current_ml_x100 = current_ml_x100;
     machine_combo_target_conc_x1000 = target_conc_x1000;
     machine_combo_dispense_ml_x100 = 0U;
     machine_combo_water_ul = 0U;
     machine_combo_dispense_ul = 0U;
     machine_combo_dispense_remaining_ul = 0U;
     machine_combo_dispense_segment_ul = 0U;
-    machine_combo_raw_activity_mci_x1000 = 0U;
+    machine_combo_dispense_done_ul = 0U;
+    machine_dispense_progress_percent = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_running = 1U;
@@ -840,6 +883,9 @@ static void Machine_UpdateCombo(void)
                 machine_combo_dispense_remaining_ul = 0U;
             }
 
+            machine_combo_dispense_done_ul = machine_combo_dispense_ul - machine_combo_dispense_remaining_ul;
+            machine_dispense_progress_percent =
+                Machine_CalcDispenseProgressPercent(machine_combo_dispense_done_ul, machine_combo_dispense_ul);
             machine_combo_dispense_segment_ul = 0U;
 
             if (machine_combo_dispense_remaining_ul == 0U)
@@ -934,6 +980,8 @@ static void Machine_ExecuteDirectDispenseState(void)
             machine_direct_dispense_ul = (uint32_t)machine_direct_dispense_ml_x100 * 10U;
             machine_direct_dispense_remaining_ul = machine_direct_dispense_ul;
             machine_direct_dispense_segment_ul = 0U;
+            machine_direct_dispense_done_ul = 0U;
+            machine_dispense_progress_percent = 0U;
         }
 
         if (machine_direct_dispense_remaining_ul == 0U)
@@ -949,6 +997,11 @@ static void Machine_ExecuteDirectDispenseState(void)
 
     case MACHINE_DIRECT_DISPENSE_STATE_FINISHED:
     case MACHINE_DIRECT_DISPENSE_STATE_ERROR:
+        if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FINISHED) &&
+            (machine_direct_dispense_ul != 0U))
+        {
+            machine_dispense_progress_percent = 100U;
+        }
         Machine_StopPump2Output();
         Machine_NotifyFlowStopped(machine_direct_dispense_owner,
                                   (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FINISHED) ?
@@ -1026,6 +1079,8 @@ static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOw
     machine_direct_dispense_ul = 0U;
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
+    machine_direct_dispense_done_ul = 0U;
+    machine_dispense_progress_percent = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
     machine_direct_dispense_running = 1U;
@@ -1099,6 +1154,9 @@ static void Machine_UpdateDirectDispense(void)
                 machine_direct_dispense_remaining_ul = 0U;
             }
 
+            machine_direct_dispense_done_ul = machine_direct_dispense_ul - machine_direct_dispense_remaining_ul;
+            machine_dispense_progress_percent =
+                Machine_CalcDispenseProgressPercent(machine_direct_dispense_done_ul, machine_direct_dispense_ul);
             machine_direct_dispense_segment_ul = 0U;
 
             if (machine_direct_dispense_remaining_ul == 0U)
@@ -1132,7 +1190,8 @@ void MachineInit(void)
     machine_combo_state = MACHINE_COMBO_STATE_IDLE;
     machine_combo_running = 0U;
     machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
-    machine_combo_raw_ml_x100 = 0U;
+    machine_combo_current_conc_x1000 = 0U;
+    machine_combo_current_ml_x100 = 0U;
     machine_combo_target_conc_x1000 = 0U;
     machine_combo_dispense_ml_x100 = 0U;
     machine_combo_water_ul = 0U;
@@ -1144,7 +1203,7 @@ void MachineInit(void)
     machine_combo_dispense_ul = 0U;
     machine_combo_dispense_remaining_ul = 0U;
     machine_combo_dispense_segment_ul = 0U;
-    machine_combo_raw_activity_mci_x1000 = 0U;
+    machine_combo_dispense_done_ul = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
 
@@ -1156,15 +1215,18 @@ void MachineInit(void)
     machine_direct_dispense_ul = 0U;
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
+    machine_direct_dispense_done_ul = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
+    machine_dispense_progress_percent = 0U;
 
     Machine_StopComboOutputs();
 }
 
 void MachineControl(void)
 {
-    uint16_t raw_ml_x100;
+    uint16_t current_conc_x1000;
+    uint16_t current_ml_x100;
     uint16_t target_conc_x1000;
     uint16_t dispense_ml_x100;
 
@@ -1190,10 +1252,15 @@ void MachineControl(void)
     }
 
     if ((machine_combo_running == 0U) &&
-        (MachineCMD_ConsumePrepConfirmed(&raw_ml_x100, &target_conc_x1000) != 0U))
+        (MachineCMD_ConsumePrepConfirmed(&current_conc_x1000,
+                                         &current_ml_x100,
+                                         &target_conc_x1000) != 0U))
     {
         machine_combo_remote_volume_valid = 0U;
-        Machine_StartCombo(raw_ml_x100, target_conc_x1000, MACHINE_FLOW_OWNER_LOCAL);
+        Machine_StartCombo(current_conc_x1000,
+                           current_ml_x100,
+                           target_conc_x1000,
+                           MACHINE_FLOW_OWNER_LOCAL);
         return;
     }
 
@@ -1229,7 +1296,7 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                                    uint16_t target_conc_x1000,
                                    uint8_t seq)
 {
-    uint16_t raw_ml_x100 = 0U;
+    uint16_t current_ml_x100 = 0U;
 
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
@@ -1242,7 +1309,7 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
 
     if (final_volume_x100 > water_volume_x100)
     {
-        raw_ml_x100 = final_volume_x100 - water_volume_x100;
+        current_ml_x100 = final_volume_x100 - water_volume_x100;
     }
 
     machine_combo_remote_water_ml_x100 = water_volume_x100;
@@ -1251,7 +1318,14 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
     machine_combo_remote_volume_valid = 1U;
     machine_combo_remote_seq = seq;
 
-    Machine_StartCombo(raw_ml_x100, target_conc_x1000, MACHINE_FLOW_OWNER_REMOTE);
+    /*
+     * 远程配药的补水量已经由上位机算好并随 PREPARE_VOLUME_PARAM 下发。
+     * 这里保留当前体积用于状态记录，当前浓度填 0，不参与本地补水计算。
+     */
+    Machine_StartCombo(0U,
+                       current_ml_x100,
+                       target_conc_x1000,
+                       MACHINE_FLOW_OWNER_REMOTE);
     return 1U;
 }
 
@@ -1345,6 +1419,25 @@ uint8_t Machine_GetCommunicationStep(void)
     default:
         return COMMUNICATION_STEP_IDLE;
     }
+}
+
+uint8_t Machine_GetDispenseProgressPercent(void)
+{
+    uint8_t percent;
+
+    if ((machine_combo_running != 0U) && (machine_combo_dispense_ul != 0U))
+    {
+        percent = Machine_CalcDispenseProgressPercent(machine_combo_dispense_done_ul, machine_combo_dispense_ul);
+        return (percent >= 100U) ? 99U : percent;
+    }
+
+    if ((machine_direct_dispense_running != 0U) && (machine_direct_dispense_ul != 0U))
+    {
+        percent = Machine_CalcDispenseProgressPercent(machine_direct_dispense_done_ul, machine_direct_dispense_ul);
+        return (percent >= 100U) ? 99U : percent;
+    }
+
+    return machine_dispense_progress_percent;
 }
 
 uint8_t Machine_IsFlowRunning(void)

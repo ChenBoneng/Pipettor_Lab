@@ -46,6 +46,15 @@
 /** 两台定量泵满行程命令步数。 */
 #define PUMP_DRIVE_FULL_STROKE_STEPS   1600U
 
+/**
+ * 定量泵电机每转一圈对应的 ISC1000 in/out 命令步数。
+ *
+ * 这个常量只用于按角度/按圈点动；按体积发药仍使用满行程体积和满行程步数标定。
+ * 当前现场 `in 10/out 10` 实测不到 10 度，先按 400 步/圈处理。
+ * 如果 10 圈仍有偏差，只需要重新标定这个常量。
+ */
+#define PUMP_DRIVE_STEPS_PER_TURN      400U
+
 /** ISC1000 单条 in/out 命令最大步数，超过该值需要业务层分段执行。 */
 #define PUMP_DRIVE_COMMAND_MAX_STEPS    60000U
 

@@ -1115,12 +1115,12 @@ uint32_t PumpDrive_AngleDegX10ToSteps(PumpDrive_s *pump, uint32_t angle_deg_x10)
 {
     uint32_t steps_per_turn;
 
-    if ((pump == NULL) || (pump->full_stroke_steps == 0U))
+    if (pump == NULL)
     {
         return 0U;
     }
 
-    steps_per_turn = pump->full_stroke_steps;
+    steps_per_turn = PUMP_DRIVE_STEPS_PER_TURN;
     return (angle_deg_x10 * steps_per_turn + 1800U) / 3600U;
 }
 
@@ -1129,12 +1129,12 @@ uint32_t PumpDrive_AngleDegX10ToSteps(PumpDrive_s *pump, uint32_t angle_deg_x10)
  */
 uint32_t PumpDrive_RpmX10ToPps(PumpDrive_s *pump, uint32_t rpm_x10)
 {
-    if ((pump == NULL) || (pump->full_stroke_steps == 0U))
+    if (pump == NULL)
     {
         return 0U;
     }
 
-    return (rpm_x10 * pump->full_stroke_steps + 300U) / 600U;
+    return (rpm_x10 * PUMP_DRIVE_STEPS_PER_TURN + 300U) / 600U;
 }
 
 /**

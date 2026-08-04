@@ -19,15 +19,14 @@
 
 #define MACHINE_CMD_LCD_LINE_BYTES        16U
 #define MACHINE_CMD_INPUT_MAX_LEN         5U
-#define MACHINE_CMD_PREP_BOTTLE_COUNT     1U
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
-#define MACHINE_CMD_DEFAULT_LEFT_ML_X100  12050U
 #define MACHINE_CMD_REMOTE_DIR_REVERSE    0U
 #define MACHINE_CMD_REMOTE_DIR_FORWARD    1U
 #define MACHINE_CMD_REMOTE_PUMP_STOP      0U
 #define MACHINE_CMD_REMOTE_PUMP_IN        1U
 #define MACHINE_CMD_REMOTE_PUMP_OUT       2U
+/** 上位机泵控制未携带体积时，默认按 10 圈点动；角度单位为 0.1 度。 */
 #define MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10 36000U
 #define MACHINE_CMD_REMOTE_MOTOR_A_BUSY   (1U << 0)
 #define MACHINE_CMD_REMOTE_MOTOR_B_BUSY   (1U << 1)
@@ -40,8 +39,9 @@
 
 typedef enum
 {
-    MACHINE_CMD_PREP_FOCUS_RAW_VOLUME = 0, // 配药设置页：当前输入原药体积
-    MACHINE_CMD_PREP_FOCUS_TARGET_CONC,    // 配药设置页：当前输入目标浓度
+    MACHINE_CMD_PREP_FOCUS_CURRENT_CONC = 0, // 配药设置页：当前输入现有活度浓度
+    MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME,   // 配药设置页：当前输入现有溶液体积
+    MACHINE_CMD_PREP_FOCUS_TARGET_CONC,      // 配药设置页：当前输入目标活度浓度
 } MachineCmdPrepFocus_e;
 
 typedef enum
@@ -67,8 +67,9 @@ typedef struct
     uint8_t manual_switches;                            // 手动调试开关位
     uint32_t measure_start_ms;                           // 活度计测量页进入时间
     MachineCmdPage_e paused_page;                        // 暂停前所在运行页
-    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_BOTTLE_COUNT]; // 原药体积，单位 0.01ml
-    uint16_t prep_target_conc_x1000;                      // 目标浓度，单位 0.001mCi/ml
+    uint16_t prep_current_conc_x1000;                    // 当前活度浓度，单位 0.001mCi/ml
+    uint16_t prep_current_ml_x100;                       // 当前溶液体积，单位 0.01ml
+    uint16_t prep_target_conc_x1000;                     // 目标活度浓度，单位 0.001mCi/ml
     uint16_t dispense_ml_x100;                          // 发药体积，单位 0.01ml
     uint16_t left_ml_x100;                               // 当前可发药余量，单位 0.01ml
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
@@ -110,6 +111,9 @@ static void MachineCMD_AppendDot(void);
 static uint16_t MachineCMD_InputToScaledValue(uint16_t scale);
 static uint16_t MachineCMD_InputToMlX100(void);
 static uint16_t MachineCMD_InputToConcX1000(void);
+static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
+                                                  uint16_t current_ml_x100,
+                                                  uint16_t target_conc_x1000);
 static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10);
 static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100);
 static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000);
@@ -123,8 +127,6 @@ static void MachineCMD_HandleRemoteKey(KeypadState_e key);
 static void MachineCMD_HandleManualKey(KeypadState_e key);
 static void MachineCMD_HandlePausedKey(KeypadState_e key);
 static void MachineCMD_SetManualAction(KeypadState_e key);
-static uint8_t MachineCMD_GetManualSwitchMask(MachineCmdManualAction_e action);
-static uint8_t MachineCMD_IsManualSwitchAction(MachineCmdManualAction_e action);
 static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask);
 static void MachineCMD_ClearManualSwitches(void);
 static void MachineCMD_ApplyManualOutputs(void);
@@ -156,9 +158,13 @@ static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const 
 static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, uint8_t switch_mask);
 static void MachineCMD_WriteBytes(DisplayLcdRow_e row, const uint8_t *data, uint8_t len);
 static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *text);
-static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, uint8_t switch_mask);
 static void MachineCMD_FormatActivityAscii(char *buffer, uint8_t size, float value, const char *unit);
 static const MachineCmdText_s *MachineCMD_GetManualActionText(void);
+static const MachineCmdText_s *MachineCMD_GetPrepStepTitle(void);
+static const MachineCmdText_s *MachineCMD_GetPrepStepLabel(void);
+static const MachineCmdText_s *MachineCMD_GetPrepStepHint(void);
+static void MachineCMD_FormatPrepFocusValue(char *buffer, uint8_t size);
+static void MachineCMD_MovePrepFocusBack(void);
 static void MachineCMD_ShowBootPage(void);
 static void MachineCMD_ShowReadyPage(void);
 static void MachineCMD_ShowStandbyPage(void);
@@ -185,8 +191,8 @@ void MachineCMD_Init(void)
 
     machine_cmd.page = MACHINE_CMD_PAGE_BOOT;
     machine_cmd.boot_start_ms = MachineCMD_GetMs();
-    machine_cmd.left_ml_x100 = MACHINE_CMD_DEFAULT_LEFT_ML_X100;
-    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+    machine_cmd.left_ml_x100 = 0U;
+    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
     machine_cmd.remote_enabled = 0U;
     machine_cmd.remote_paused = 0U;
@@ -274,7 +280,7 @@ void MachineCMD_Process(void)
         machine_cmd.dispense_confirmed = 0U;
         machine_cmd.dispense_input_error = 0U;
         machine_cmd.reset_requested = 1U;
-        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
         machine_cmd.remote_enabled = 0U;
         machine_cmd.remote_paused = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
@@ -446,20 +452,28 @@ uint8_t MachineCMD_ConsumeResetRequested(void)
 /**
  * @brief 读取并清除配药参数确认事件。
  *
- * @param volume_ml_x100 输出原药体积，单位 0.01ml，可为 NULL。
- * @param target_conc_x1000 输出目标浓度，单位 0.001mCi/ml，可为 NULL。
+ * @param current_conc_x1000 输出当前活度浓度，单位 0.001mCi/ml，可为 NULL。
+ * @param current_ml_x100 输出当前溶液体积，单位 0.01ml，可为 NULL。
+ * @param target_conc_x1000 输出目标活度浓度，单位 0.001mCi/ml，可为 NULL。
  * @return 1 表示本次读到了新的确认事件；0 表示没有新事件。
  */
-uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *volume_ml_x100, uint16_t *target_conc_x1000)
+uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *current_conc_x1000,
+                                        uint16_t *current_ml_x100,
+                                        uint16_t *target_conc_x1000)
 {
     if (machine_cmd.prep_confirmed == 0U)
     {
         return 0U;
     }
 
-    if (volume_ml_x100 != NULL)
+    if (current_conc_x1000 != NULL)
     {
-        *volume_ml_x100 = machine_cmd.prep_bottle_ml_x100[0];
+        *current_conc_x1000 = machine_cmd.prep_current_conc_x1000;
+    }
+
+    if (current_ml_x100 != NULL)
+    {
+        *current_ml_x100 = machine_cmd.prep_current_ml_x100;
     }
 
     if (target_conc_x1000 != NULL)
@@ -522,9 +536,10 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
 
     if (page == MACHINE_CMD_PAGE_PREP_SETTING)
     {
-        memset(machine_cmd.prep_bottle_ml_x100, 0, sizeof(machine_cmd.prep_bottle_ml_x100));
+        machine_cmd.prep_current_conc_x1000 = 0U;
+        machine_cmd.prep_current_ml_x100 = 0U;
         machine_cmd.prep_target_conc_x1000 = 0U;
-        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
         machine_cmd.prep_confirmed = 0U;
     }
 
@@ -798,6 +813,47 @@ static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t
 }
 
 /**
+ * @brief 计算配药完成后可发药余量。
+ *
+ * @param current_conc_x1000 当前活度浓度，单位 0.001mCi/ml。
+ * @param current_ml_x100 当前溶液体积，单位 0.01ml。
+ * @param target_conc_x1000 目标活度浓度，单位 0.001mCi/ml。
+ * @return 配药完成后的理论总体积，单位 0.01ml。
+ *
+ * @note 这里和 machine 层补水计算保持同一套稀释公式：
+ *       当前总活度不变，目标浓度更低时，最终体积 = 当前浓度 * 当前体积 / 目标浓度。
+ *       如果目标浓度大于等于当前浓度，则不补水，余量就是当前体积。
+ */
+static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
+                                                  uint16_t current_ml_x100,
+                                                  uint16_t target_conc_x1000)
+{
+    uint32_t final_ml_x100;
+
+    if (current_ml_x100 == 0U)
+    {
+        return 0U;
+    }
+
+    if ((current_conc_x1000 == 0U) ||
+        (target_conc_x1000 == 0U) ||
+        (target_conc_x1000 >= current_conc_x1000))
+    {
+        return current_ml_x100;
+    }
+
+    final_ml_x100 = (((uint32_t)current_conc_x1000 * (uint32_t)current_ml_x100) +
+                     (target_conc_x1000 / 2U)) /
+                    target_conc_x1000;
+    if (final_ml_x100 > 0xFFFFU)
+    {
+        final_ml_x100 = 0xFFFFU;
+    }
+
+    return (uint16_t)final_ml_x100;
+}
+
+/**
  * @brief 处理待机页按键。
  *
  * @param key 当前一次性按下事件。
@@ -861,12 +917,13 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
  *
  * @param key 当前一次性按下事件。
  *
- * @note 配药设置页有两个输入焦点：
- *       1. 原药体积，单位 0.01ml；
- *       2. 目标浓度，单位 0.001mCi/ml。
+ * @note 配药设置页使用三步向导，而不是把三项参数挤在同一页：
+ *       1. 当前活度浓度，单位 0.001mCi/ml；
+ *       2. 当前溶液体积，单位 0.01ml；
+ *       3. 目标活度浓度，单位 0.001mCi/ml。
  *
- *       启动键第一次按下用于保存原药体积并切到浓度输入，
- *       第二次按下才确认全部参数并进入配药运行提示页。
+ *       这样每页只有一个输入框，启动键语义固定为“确认当前项”。
+ *       清除键在输入框为空时退回上一项，用来弥补面板没有方向键的问题。
  */
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 {
@@ -886,21 +943,47 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 
     if (key == KEYPAD_STATE_CLEAR_INPUT)
     {
-        MachineCMD_ClearInput();
+        if (machine_cmd.input[0] != '\0')
+        {
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        MachineCMD_MovePrepFocusBack();
         return;
     }
 
     if (key == KEYPAD_STATE_START)
     {
-        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_RAW_VOLUME)
+        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_CONC)
         {
-            machine_cmd.prep_bottle_ml_x100[0] = MachineCMD_InputToMlX100();
+            if (machine_cmd.input[0] != '\0')
+            {
+                machine_cmd.prep_current_conc_x1000 = MachineCMD_InputToConcX1000();
+            }
+            machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME;
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
+        {
+            if (machine_cmd.input[0] != '\0')
+            {
+                machine_cmd.prep_current_ml_x100 = MachineCMD_InputToMlX100();
+            }
             machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_TARGET_CONC;
             MachineCMD_ClearInput();
             return;
         }
 
-        machine_cmd.prep_target_conc_x1000 = MachineCMD_InputToConcX1000();
+        if (machine_cmd.input[0] != '\0')
+        {
+            machine_cmd.prep_target_conc_x1000 = MachineCMD_InputToConcX1000();
+        }
+        machine_cmd.left_ml_x100 = MachineCMD_CalcPreparedLeftMlX100(machine_cmd.prep_current_conc_x1000,
+                                                                     machine_cmd.prep_current_ml_x100,
+                                                                     machine_cmd.prep_target_conc_x1000);
         machine_cmd.prep_confirmed = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
@@ -1123,44 +1206,6 @@ static void MachineCMD_SetManualAction(KeypadState_e key)
 }
 
 /**
- * @brief 获取手动动作对应的逻辑开关位。
- *
- * @param action 当前手动动作。
- * @return 逻辑开关位；0 表示该动作不是阀/泵开关。
- */
-static uint8_t MachineCMD_GetManualSwitchMask(MachineCmdManualAction_e action)
-{
-    switch (action)
-    {
-    case MACHINE_CMD_MANUAL_ACTION_WATER_IN:
-        return MACHINE_CMD_MANUAL_WATER_IN;
-
-    case MACHINE_CMD_MANUAL_ACTION_MED_IN:
-        return MACHINE_CMD_MANUAL_MED_IN;
-
-    case MACHINE_CMD_MANUAL_ACTION_WATER_OUT:
-        return MACHINE_CMD_MANUAL_WATER_OUT;
-
-    case MACHINE_CMD_MANUAL_ACTION_MED_OUT:
-        return MACHINE_CMD_MANUAL_MED_OUT;
-
-    default:
-        return 0U;
-    }
-}
-
-/**
- * @brief 判断当前手动动作是否属于数字键开关动作。
- *
- * @param action 当前手动动作。
- * @return 1 表示是开关动作；0 表示不是。
- */
-static uint8_t MachineCMD_IsManualSwitchAction(MachineCmdManualAction_e action)
-{
-    return (MachineCMD_GetManualSwitchMask(action) != 0U) ? 1U : 0U;
-}
-
-/**
  * @brief 翻转一个手动调试逻辑开关。
  *
  * @param switch_mask 要翻转的开关位，见 MACHINE_CMD_MANUAL_xxx。
@@ -1278,7 +1323,7 @@ static void MachineCMD_EnterRemoteMode(void)
     machine_cmd.prep_confirmed = 0U;
     machine_cmd.dispense_confirmed = 0U;
     machine_cmd.dispense_input_error = 0U;
-    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_RAW_VOLUME;
+    machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
     Communication_OnLocalRemoteKey();
     MachineCMD_SyncRemoteState();
@@ -1882,8 +1927,9 @@ static uint8_t MachineCMD_HandleRemoteValve(const CommunicationHostCommand_s *co
  *
  * @note WATER_PUMP 使用 Byte2=0/1 控制关/开。
  *       PUMP_1/PUMP_2 使用 Byte2=0/1/2 表示停止/吸入/排出。
- *       Byte3~4 非 0 时按体积 ul 精确运动；Byte3~4 为 0 时作为上位机点动命令，
- *       默认转 10 圈，避免上位机只发“转动方向”时下位机换算出 0 步而不动作。
+ *       Byte3~4 非 0 时按体积 ul 精确运动；Byte3~4 为 0 时作为上位机点动命令。
+ *       点动命令固定按 10 圈处理，底层通过独立的每圈步数常量换算成 ISC1000 步数。
+ *       注意不要把满行程 1600 步当成电机一圈，也不要把 `in/out 10` 误认为 10 圈。
  */
 static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *command)
 {
@@ -2185,23 +2231,6 @@ static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, u
 }
 
 /**
- * @brief 向行缓冲追加一个 ASCII 开关状态。
- *
- * @param line 目标行缓冲。
- * @param offset 当前写入偏移。
- * @param switch_mask 手动调试开关位。
- * @return 追加后的偏移。
- *
- * @note 手动页第 3 行使用纯 ASCII，避免中文开关状态被数字挤到奇数字节位置。
- */
-static uint8_t MachineCMD_LineAppendSwitchAscii(uint8_t *line, uint8_t offset, uint8_t switch_mask)
-{
-    return MachineCMD_LineAppendString(line,
-                                       offset,
-                                       ((machine_cmd.manual_switches & switch_mask) != 0U) ? "1" : "0");
-}
-
-/**
  * @brief 把活度值转换成 LCD 可显示的 ASCII 文本。
  *
  * @param buffer 输出缓冲区。
@@ -2266,66 +2295,154 @@ static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *te
 }
 
 /**
- * @brief 获取手动调试页当前动作的 GB2312 文案。
+ * @brief 获取手动动作键对应的提示文案。
  *
- * @return 当前动作对应的文案。
+ * @return 当前动作键文案；NULL 表示当前是数字开关动作或空闲。
+ *
+ * @note 手动页的主体已经用中文显示四个开关状态。
+ *       这里仅用于动作键反馈，避免按【进罐】【插针】这类键时 LCD 看起来没有变化。
  */
 static const MachineCmdText_s *MachineCMD_GetManualActionText(void)
 {
-    const MachineCmdText_s *text = &machine_cmd_text_idle;
-
     switch (machine_cmd.manual_action)
     {
     case MACHINE_CMD_MANUAL_ACTION_IN_TANK:
-        text = &machine_cmd_text_in_tank;
-        break;
+        return &machine_cmd_text_in_tank;
 
     case MACHINE_CMD_MANUAL_ACTION_OUT_TANK:
-        text = &machine_cmd_text_out_tank;
-        break;
+        return &machine_cmd_text_out_tank;
 
     case MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN:
-        text = &machine_cmd_text_needle_in;
-        break;
+        return &machine_cmd_text_needle_in;
 
     case MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT:
-        text = &machine_cmd_text_needle_out;
-        break;
+        return &machine_cmd_text_needle_out;
 
     case MACHINE_CMD_MANUAL_ACTION_DRAW_MED:
-        text = &machine_cmd_text_draw_med;
-        break;
+        return &machine_cmd_text_draw_med;
 
     case MACHINE_CMD_MANUAL_ACTION_EXHAUST:
-        text = &machine_cmd_text_exhaust;
-        break;
+        return &machine_cmd_text_exhaust;
 
-    case MACHINE_CMD_MANUAL_ACTION_REMOTE:
-        text = &machine_cmd_text_remote;
-        break;
-
-    case MACHINE_CMD_MANUAL_ACTION_WATER_IN:
-        text = &machine_cmd_text_water_in;
-        break;
-
-    case MACHINE_CMD_MANUAL_ACTION_MED_IN:
-        text = &machine_cmd_text_med_in;
-        break;
-
-    case MACHINE_CMD_MANUAL_ACTION_WATER_OUT:
-        text = &machine_cmd_text_water_out;
-        break;
-
-    case MACHINE_CMD_MANUAL_ACTION_MED_OUT:
-        text = &machine_cmd_text_med_out;
-        break;
-
-    case MACHINE_CMD_MANUAL_ACTION_IDLE:
     default:
-        break;
+        return NULL;
+    }
+}
+
+/**
+ * @brief 获取配药向导当前步骤标题。
+ *
+ * @return 当前步骤对应的 LCD 文案。
+ */
+static const MachineCmdText_s *MachineCMD_GetPrepStepTitle(void)
+{
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
+    {
+        return &machine_cmd_text_prep_step2;
     }
 
-    return text;
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
+    {
+        return &machine_cmd_text_prep_step3;
+    }
+
+    return &machine_cmd_text_prep_step1;
+}
+
+/**
+ * @brief 获取配药向导当前输入项说明。
+ *
+ * @return 当前输入项对应的 LCD 文案。
+ */
+static const MachineCmdText_s *MachineCMD_GetPrepStepLabel(void)
+{
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
+    {
+        return &machine_cmd_text_current_volume_unit;
+    }
+
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
+    {
+        return &machine_cmd_text_target_conc_unit;
+    }
+
+    return &machine_cmd_text_current_conc_unit;
+}
+
+/**
+ * @brief 获取配药向导当前启动键提示。
+ *
+ * @return 当前步骤对应的 LCD 文案。
+ */
+static const MachineCmdText_s *MachineCMD_GetPrepStepHint(void)
+{
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
+    {
+        return &machine_cmd_text_start_prep;
+    }
+
+    return &machine_cmd_text_start_next_step;
+}
+
+/**
+ * @brief 格式化配药向导当前步骤已经保存的数值。
+ *
+ * @param buffer 输出 ASCII 缓冲。
+ * @param size 缓冲区长度。
+ *
+ * @note 用户按【清除】退回上一项时，已保存的值仍然显示出来。
+ *       如果继续直接按【启动】，该值会被保留；如果重新输入数字，则用新输入覆盖。
+ */
+static void MachineCMD_FormatPrepFocusValue(char *buffer, uint8_t size)
+{
+    if ((buffer == NULL) || (size == 0U))
+    {
+        return;
+    }
+
+    buffer[0] = '\0';
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_CONC)
+    {
+        if (machine_cmd.prep_current_conc_x1000 != 0U)
+        {
+            MachineCMD_FormatConcX1000Ascii(buffer, size, machine_cmd.prep_current_conc_x1000);
+        }
+        return;
+    }
+
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
+    {
+        if (machine_cmd.prep_current_ml_x100 != 0U)
+        {
+            MachineCMD_FormatMlX100Ascii(buffer, size, machine_cmd.prep_current_ml_x100);
+        }
+        return;
+    }
+
+    if (machine_cmd.prep_target_conc_x1000 != 0U)
+    {
+        MachineCMD_FormatConcX1000Ascii(buffer, size, machine_cmd.prep_target_conc_x1000);
+    }
+}
+
+/**
+ * @brief 配药向导退回上一项。
+ *
+ * @note 面板没有上下方向键，所以复用【清除】键：
+ *       当前输入框为空时，再按【清除】就回到上一个输入步骤。
+ */
+static void MachineCMD_MovePrepFocusBack(void)
+{
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
+    {
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME;
+        return;
+    }
+
+    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
+    {
+        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
+    }
 }
 
 /**
@@ -2369,8 +2486,8 @@ static void MachineCMD_ShowStandbyPage(void)
 /**
  * @brief 显示配药参数输入页。
  *
- * @note 当前配药流程每次只输入一瓶配药量。
- *       中文文案从偶数字节位置开始，避免 ST7920 中文双字节错位。
+ * @note 这里使用向导式单项输入，而不是同屏显示三项参数。
+ *       操作员每次只看到一个焦点，避免误以为第一下【启动】会直接开机动作。
  */
 static void MachineCMD_ShowPrepSettingPage(void)
 {
@@ -2378,55 +2495,27 @@ static void MachineCMD_ShowPrepSettingPage(void)
     uint8_t offset;
     char ascii[8];
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_title);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, MachineCMD_GetPrepStepTitle());
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, MachineCMD_GetPrepStepLabel());
 
     /*
-     * 第 2 行：原药:____ml
-     * “原药:”占 5 字节，输入框最多 5 字节，ml 占 2 字节，整行最大 12 字节。
-     * 当前焦点在原药时显示正在输入的内容；焦点离开后显示已保存值。
+     * 第 3 行：> ____
+     * 当前步骤只显示一个输入框。若用户从后续步骤退回来，优先显示已经保存的值；
+     * 一旦重新输入数字，则显示新的输入缓冲。
      */
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_raw_med);
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_RAW_VOLUME)
+    offset = MachineCMD_LineAppendString(line, 0U, "> ");
+    if (machine_cmd.input[0] != '\0')
     {
-        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
-    }
-    else if (machine_cmd.prep_bottle_ml_x100[0] != 0U)
-    {
-        MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.prep_bottle_ml_x100[0]);
-        offset = MachineCMD_LineAppendString(line, offset, ascii);
+        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input);
     }
     else
     {
-        offset = MachineCMD_LineAppendString(line, offset, "____");
+        MachineCMD_FormatPrepFocusValue(ascii, sizeof(ascii));
+        offset = MachineCMD_LineAppendString(line, offset, ascii[0] != '\0' ? ascii : "____");
     }
-    (void)MachineCMD_LineAppendString(line, offset, "ml");
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
-
-    /*
-     * 第 3 行：浓度:____mCi/ml
-     * “浓度:”占 5 字节，输入框最多 5 字节，mCi/ml 占 6 字节，正好 16 字节封顶。
-     * 这里不能再追加光标或提示字符，否则会触碰 ST7920 单行 16 字节上限。
-     */
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_concentration);
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
-    {
-        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
-    }
-    else if (machine_cmd.prep_target_conc_x1000 != 0U)
-    {
-        MachineCMD_FormatConcX1000Ascii(ascii, sizeof(ascii), machine_cmd.prep_target_conc_x1000);
-        offset = MachineCMD_LineAppendString(line, offset, ascii);
-    }
-    else
-    {
-        offset = MachineCMD_LineAppendString(line, offset, "____");
-    }
-    (void)MachineCMD_LineAppendString(line, offset, "mCi/ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
-
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_start_next_confirm);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, MachineCMD_GetPrepStepHint());
 }
 
 /**
@@ -2439,7 +2528,7 @@ static void MachineCMD_ShowPrepRunningPage(void)
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_current_measure);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_activity);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
 }
 
 /**
@@ -2494,7 +2583,7 @@ static void MachineCMD_ShowPrepMeasurePage(void)
     (void)MachineCMD_LineAppendString(line, offset, "s");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
 }
 
 /**
@@ -2519,8 +2608,9 @@ static void MachineCMD_ShowDispSettingPage(void)
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
     /*
-     * 第 3 行： （余量：120.5ml)
-     * 默认余量先用 UI 层占位值，后续 machine 层接入真实余量时只需要更新 left_ml_x100。
+     * 第 3 行： （余量：xxx.xml)
+     * 配药确认后，left_ml_x100 保存“当前原药体积 + 计算出的补水体积”。
+     * 未配药直接进入发药页时保持 0.0ml，用于拦截超余量输入。
      */
     memset(line, ' ', sizeof(line));
     offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_remaining_prefix);
@@ -2543,14 +2633,24 @@ static void MachineCMD_ShowDispSettingPage(void)
 /**
  * @brief 显示发药运行提示页。
  *
- * @note 当前还没有接入真实流程进度，先按 LCD 方案显示固定进度占位。
+ * @note 完成进度由 machine 层按泵2已经确认完成的分段体积换算。
  */
 static void MachineCMD_ShowDispRunningPage(void)
 {
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    char ascii[8];
+
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_disp_run);
     MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_pump2);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_progress);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_hint);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_progress_prefix);
+    (void)snprintf(ascii, sizeof(ascii), "%03u%%", (unsigned int)Machine_GetDispenseProgressPercent());
+    (void)MachineCMD_LineAppendString(line, offset, ascii);
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
 }
 
 /**
@@ -2612,42 +2712,47 @@ static void MachineCMD_ShowRemotePage(void)
 /**
  * @brief 显示手动调试页。
  *
- * @note 第 3、4 行给出四个数字键复用说明：
- *       1=水进，2=药进，4=水出，5=药出。
+ * @note 直接显示四个手动开关的中文开/关状态。
+ *       按 1/2/4/5 翻转后，下一轮刷新会立即反映到对应项目。
  */
 static void MachineCMD_ShowManualPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
-    uint8_t switch_mask;
-    const MachineCmdText_s *text;
+    const MachineCmdText_s *action_text;
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_manual);
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_last);
-    offset = MachineCMD_LineAppendString(line, offset, "  ");
-    text = MachineCMD_GetManualActionText();
-    offset = MachineCMD_LineAppendText(line, offset, text);
-    if (MachineCMD_IsManualSwitchAction(machine_cmd.manual_action) != 0U)
-    {
-        switch_mask = MachineCMD_GetManualSwitchMask(machine_cmd.manual_action);
-        (void)MachineCMD_LineAppendSwitchState(line, offset, switch_mask);
-    }
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_water_in);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
+    offset = MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_WATER_IN);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_med_in);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
+    (void)MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_MED_IN);
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendString(line, 0U, "1:");
-    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_WATER_IN);
-    offset = MachineCMD_LineAppendString(line, offset, " 2:");
-    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_MED_IN);
-    offset = MachineCMD_LineAppendString(line, offset, " 4:");
-    offset = MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_WATER_OUT);
-    offset = MachineCMD_LineAppendString(line, offset, " 5:");
-    (void)MachineCMD_LineAppendSwitchAscii(line, offset, MACHINE_CMD_MANUAL_MED_OUT);
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_water_out);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
+    offset = MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_WATER_OUT);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_med_out);
+    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
+    (void)MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_MED_OUT);
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_reset_exit_manual);
+    action_text = MachineCMD_GetManualActionText();
+    if (action_text != NULL)
+    {
+        memset(line, ' ', sizeof(line));
+        offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_last);
+        offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
+        (void)MachineCMD_LineAppendText(line, offset, action_text);
+        MachineCMD_WriteBytes(DISPLAY_LCD_ROW_4, line, sizeof(line));
+        return;
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_manual_switch_hint);
 }
 
 /**

@@ -29,6 +29,9 @@ uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100);
 // 读取当前流程步骤，供 0x181 状态帧 Byte1 使用。
 uint8_t Machine_GetCommunicationStep(void);
 
+// 读取当前或最近一次发药进度百分比，0~100。
+uint8_t Machine_GetDispenseProgressPercent(void);
+
 // 判断 machine 当前是否有自动流程正在运行。
 uint8_t Machine_IsFlowRunning(void);
 
