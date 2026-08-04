@@ -8,9 +8,11 @@
  * bsp_can 支持“一个 CANInstance 绑定多个接收 ID”，所以这里仍按协议 ID
  * 逐个注册，上层不需要关心这些 ID 最终是否复用同一个底层实例。
  */
-#define COMMUNICATION_RX_ID_COUNT       5U
-#define COMMUNICATION_SEQ_DEFAULT_INDEX 6U
-#define COMMUNICATION_SEQ_TAIL_INDEX    7U
+#define COMMUNICATION_RX_ID_COUNT              6U
+#define COMMUNICATION_COMMAND_QUEUE_CAPACITY   8U
+#define COMMUNICATION_FRAME_QUEUE_CAPACITY     16U
+#define COMMUNICATION_SEQ_DEFAULT_INDEX        6U
+#define COMMUNICATION_SEQ_TAIL_INDEX           7U
 
 /*
  * 产品盐值，用于参与 BoardID 计算。
@@ -55,21 +57,68 @@ static const uint16_t communication_rx_ids[COMMUNICATION_RX_ID_COUNT] =
     COMMUNICATION_CAN_ID_CONTROL,
     COMMUNICATION_CAN_ID_PARAM,
     COMMUNICATION_CAN_ID_QUERY,
+    COMMUNICATION_CAN_ID_CONTROL_RESPONSE,
 };
 
+typedef struct
+{
+    uint16_t id;
+    uint8_t data[COMMUNICATION_CAN_FRAME_LEN];
+} CommunicationFrame_s;
+
 static CANInstance *communication_can[COMMUNICATION_RX_ID_COUNT] = {0};
-static volatile CommunicationHostCommand_s communication_host_command = {0};
+static CommunicationFrame_s communication_rx_queue[COMMUNICATION_FRAME_QUEUE_CAPACITY];
+static CommunicationFrame_s communication_tx_queue[COMMUNICATION_FRAME_QUEUE_CAPACITY];
+static volatile uint8_t communication_rx_head = 0U;
+static volatile uint8_t communication_rx_tail = 0U;
+static volatile uint8_t communication_tx_head = 0U;
+static volatile uint8_t communication_tx_tail = 0U;
+static volatile uint32_t communication_rx_frame_count = 0U;
+static volatile uint32_t communication_rx_drop_count = 0U;
+static volatile uint32_t communication_tx_frame_count = 0U;
+static volatile uint32_t communication_tx_drop_count = 0U;
+static volatile CommunicationHostCommand_s communication_command_queue[COMMUNICATION_COMMAND_QUEUE_CAPACITY];
+static volatile uint8_t communication_command_head = 0U;
+static volatile uint8_t communication_command_tail = 0U;
+static volatile uint32_t communication_command_frame_count = 0U;
+static volatile uint32_t communication_command_drop_count = 0U;
+static CommunicationHostCommand_s communication_last_command = {0};
+static CommunicationStatus_s communication_status_snapshot = {0};
 static CommunicationAuthContext_s communication_auth = {0};
+static CommunicationControlContext_s communication_control = {0};
+static uint8_t communication_last_auth_state = COMMUNICATION_AUTH_LOCKED;
 static uint8_t communication_inited = 0U;
 
 static void Communication_CANCallback(CANInstance *instance);
+static uint8_t Communication_StoreRxFrame(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
+static uint8_t Communication_TryGetRxFrame(CommunicationFrame_s *frame);
+static void Communication_ProcessTxQueue(void);
+static void Communication_HandleRxFrame(const CommunicationFrame_s *frame);
 static uint8_t Communication_RegisterRxId(uint8_t index, uint16_t rx_id);
 static uint8_t Communication_GetSeqFromFrame(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
-static void Communication_StoreHostCommand(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
+static uint8_t Communication_StoreHostCommand(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
+static uint8_t Communication_NextCommandIndex(uint8_t index);
+static uint8_t Communication_NextFrameIndex(uint8_t index);
+static uint32_t Communication_EnterCritical(void);
+static void Communication_ExitCritical(uint32_t primask);
 static void Communication_HandleAuthRequest(const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
 static void Communication_HandleAuthResponse(const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
 static void Communication_HandleAuthHeartbeat(void);
 static uint8_t Communication_HandleAuthFrame(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
+static void Communication_HandleControlResponse(const uint8_t data[COMMUNICATION_CAN_FRAME_LEN]);
+static void Communication_OnPcFrame(uint16_t std_id, uint8_t cmd);
+static void Communication_SyncAuthState(void);
+static void Communication_SetControlMode(uint8_t control_mode, uint8_t reason);
+static uint8_t Communication_CanAutoEnterRemote(void);
+static uint8_t Communication_CanLocalRequestRemote(void);
+static uint8_t Communication_IsQueryOrSafeCommand(uint16_t std_id, uint8_t cmd);
+static uint8_t Communication_IsRemoteCommandAllowed(uint16_t std_id,
+                                                    uint8_t cmd,
+                                                    uint8_t *result,
+                                                    uint16_t *error);
+static uint8_t Communication_IsKnownCommand(uint8_t cmd);
+static uint8_t Communication_NextControlEventSeq(void);
+static void Communication_RequestSafetyAction(uint8_t action);
 static uint32_t Communication_MakeNonce(void);
 static uint32_t Communication_Crc32Update(uint32_t crc, const uint8_t *data, uint32_t length);
 static uint32_t Communication_Crc32Finish(uint32_t crc);
@@ -83,8 +132,25 @@ uint8_t Communication_Init(void)
         return 1U;
     }
 
-    memset((void *)&communication_host_command, 0, sizeof(communication_host_command));
+    memset(communication_rx_queue, 0, sizeof(communication_rx_queue));
+    memset(communication_tx_queue, 0, sizeof(communication_tx_queue));
+    memset((void *)communication_command_queue, 0, sizeof(communication_command_queue));
+    memset(&communication_last_command, 0, sizeof(communication_last_command));
+    memset(&communication_status_snapshot, 0, sizeof(communication_status_snapshot));
     memset(&communication_auth, 0, sizeof(communication_auth));
+    memset(&communication_control, 0, sizeof(communication_control));
+    communication_rx_head = 0U;
+    communication_rx_tail = 0U;
+    communication_tx_head = 0U;
+    communication_tx_tail = 0U;
+    communication_rx_frame_count = 0U;
+    communication_rx_drop_count = 0U;
+    communication_tx_frame_count = 0U;
+    communication_tx_drop_count = 0U;
+    communication_command_head = 0U;
+    communication_command_tail = 0U;
+    communication_command_frame_count = 0U;
+    communication_command_drop_count = 0U;
 
     /*
      * 板卡上电后立即计算 BoardID。
@@ -94,6 +160,17 @@ uint8_t Communication_Init(void)
     communication_auth.state = COMMUNICATION_AUTH_LOCKED;
     communication_auth.license_type = COMMUNICATION_LICENSE_TYPE_NORMAL;
     communication_auth.flags = COMMUNICATION_AUTH_FLAGS_NONE;
+    communication_last_auth_state = COMMUNICATION_AUTH_LOCKED;
+
+    /*
+     * 设备默认面向上位机使用，但真正的动作控制权仍按新协议状态机判定：
+     * 上电先处于 LOCAL，完成授权且设备空闲后自动进入 REMOTE。
+     */
+    communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+    communication_control.control_mode = COMMUNICATION_CONTROL_LOCAL;
+    communication_status_snapshot.sys_state = COMMUNICATION_SYS_IDLE;
+    communication_status_snapshot.step = COMMUNICATION_STEP_IDLE;
+    communication_status_snapshot.activity_state = COMMUNICATION_ACTIVITY_NOT_READ;
 
     for (uint8_t i = 0U; i < COMMUNICATION_RX_ID_COUNT; i++)
     {
@@ -109,23 +186,87 @@ uint8_t Communication_Init(void)
 
 void Communication_Process(void)
 {
+    CommunicationFrame_s frame;
     uint32_t now;
 
-    if ((communication_inited == 0U) ||
-        (communication_auth.state != COMMUNICATION_AUTH_UNLOCKED))
+    if (communication_inited == 0U)
     {
         return;
     }
 
+    /*
+     * 先冲一次发送队列，保证上一次循环里生成的 ACK/状态帧尽快发出；
+     * 再集中处理 RX 队列，所有协议解析、授权判断和业务命令缓存都在任务上下文完成。
+     * 这样 CAN 中断回调只负责拷贝入队，不会在中断里调用发送、校验密钥或驱动业务状态机。
+     */
+    Communication_ProcessTxQueue();
+
+    while (Communication_TryGetRxFrame(&frame) != 0U)
+    {
+        Communication_HandleRxFrame(&frame);
+    }
+
+    /*
+     * RX 处理完成后再做超时状态机，是为了让本周期刚收到的授权心跳、控制帧或状态查询
+     * 先刷新 last_heartbeat / last_remote_frame_tick，避免“刚收到帧又被同一轮判超时”。
+     */
     now = HAL_GetTick();
-    if ((uint32_t)(now - communication_auth.last_heartbeat) > COMMUNICATION_SESSION_TIMEOUT_MS)
+    if ((communication_auth.state == COMMUNICATION_AUTH_UNLOCKED) &&
+        ((uint32_t)(now - communication_auth.last_heartbeat) > COMMUNICATION_SESSION_TIMEOUT_MS))
     {
         /*
-         * 心跳超时后只锁定通信权限。
-         * 是否立即停止机械动作，应由机器主流程根据业务安全策略决定。
+         * 授权心跳超时只撤销动作资格。若此时处于 REMOTE，
+         * 控制权状态机会进一步转入 REMOTE_PAUSED 并要求业务层停机。
          */
         communication_auth.state = COMMUNICATION_AUTH_LOCKED;
+        Communication_SyncAuthState();
     }
+
+    if ((communication_control.pc_connected != 0U) &&
+        ((uint32_t)(now - communication_control.last_remote_frame_tick) >
+         COMMUNICATION_PC_ONLINE_TIMEOUT_MS))
+    {
+        communication_control.pc_connected = 0U;
+        /*
+         * 上位机短时间没有继续发帧，只能说明“当前不在线”，不能直接等同于本机接管。
+         * 设备空闲时保持 REMOTE 控制权，等下一帧上位机命令进来后 OnPcFrame() 会重新置位
+         * pc_connected；这样 LCD 不会在空闲远控页和本地页之间来回跳。
+         *
+         * 只有已经处于 RUNNING 的远控动作，才需要因为 PC 掉线转入不可启动恢复的安全暂停。
+         * 这里不设置 remote_resume_allowed，避免 LCD 提示“启动键继续”但启动键又没有恢复条件。
+         */
+        if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) &&
+            ((communication_control.sys_state == COMMUNICATION_SYS_RUNNING) ||
+             (communication_control.local_flow_running != 0U)))
+        {
+            communication_control.remote_resume_allowed = 0U;
+            communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
+            Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                         COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
+        }
+    }
+
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING) &&
+        ((uint32_t)(now - communication_control.remote_request_tick) >
+         COMMUNICATION_REMOTE_REQUEST_TIMEOUT_MS))
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                     COMMUNICATION_CONTROL_REASON_HANDSHAKE_TIMEOUT);
+    }
+
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_LOCAL) &&
+        (Communication_CanAutoEnterRemote() != 0U))
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
+                                     COMMUNICATION_CONTROL_REASON_PC_AUTH_SUCCESS);
+    }
+
+    /*
+     * 本轮 RX 可能又生成了 ACK、0x181、0x184 或授权响应，末尾再冲一次发送队列。
+     * 保留这个顺序可以降低上位机一问一答等待时间，同时不改变原有任务调度模型。
+     */
+    Communication_ProcessTxQueue();
 }
 
 uint8_t Communication_IsReady(void)
@@ -135,7 +276,7 @@ uint8_t Communication_IsReady(void)
 
 uint8_t Communication_HasNewCommand(void)
 {
-    return (communication_host_command.updated != 0U) ? 1U : 0U;
+    return (communication_command_tail != communication_command_head) ? 1U : 0U;
 }
 
 uint8_t Communication_GetHostCommand(CommunicationHostCommand_s *command)
@@ -145,20 +286,25 @@ uint8_t Communication_GetHostCommand(CommunicationHostCommand_s *command)
         return 0U;
     }
 
+    if (communication_command_tail == communication_command_head)
+    {
+        return 0U;
+    }
+
     /*
-     * CAN 接收回调可能在中断中更新 communication_host_command。
-     * 这里按字段复制，保持逻辑简单；业务层只处理最近一帧命令。
+     * CAN 回调按顺序写入环形队列，业务层每次读取 tail 对应的一帧。
+     * ClearNewCommandFlag() 再推进 tail，保持原有 Has/Get/Clear 调用习惯。
      */
-    command->id = communication_host_command.id;
-    command->cmd = communication_host_command.cmd;
-    command->obj = communication_host_command.obj;
-    command->seq = communication_host_command.seq;
-    command->updated = communication_host_command.updated;
-    command->frame_count = communication_host_command.frame_count;
+    command->id = communication_command_queue[communication_command_tail].id;
+    command->cmd = communication_command_queue[communication_command_tail].cmd;
+    command->obj = communication_command_queue[communication_command_tail].obj;
+    command->seq = communication_command_queue[communication_command_tail].seq;
+    command->updated = communication_command_queue[communication_command_tail].updated;
+    command->frame_count = communication_command_queue[communication_command_tail].frame_count;
 
     for (uint8_t i = 0U; i < COMMUNICATION_CAN_FRAME_LEN; i++)
     {
-        command->data[i] = communication_host_command.data[i];
+        command->data[i] = communication_command_queue[communication_command_tail].data[i];
     }
 
     return 1U;
@@ -166,17 +312,132 @@ uint8_t Communication_GetHostCommand(CommunicationHostCommand_s *command)
 
 void Communication_ClearNewCommandFlag(void)
 {
-    communication_host_command.updated = 0U;
+    if (communication_command_tail != communication_command_head)
+    {
+        communication_command_tail = Communication_NextCommandIndex(communication_command_tail);
+    }
 }
 
 uint8_t Communication_SendFrame(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
 {
+    uint8_t next;
+    uint32_t primask;
+
     if ((communication_inited == 0U) || (std_id > 0x7FFU) || (data == NULL))
     {
         return 0U;
     }
 
-    return canx_send_data(&hcan, std_id, (uint8_t *)data, COMMUNICATION_CAN_FRAME_LEN);
+    primask = Communication_EnterCritical();
+
+    if ((communication_tx_head == communication_tx_tail) &&
+        (canx_send_data(&hcan, std_id, (uint8_t *)data, COMMUNICATION_CAN_FRAME_LEN) != 0U))
+    {
+        communication_tx_frame_count++;
+        Communication_ExitCritical(primask);
+        return 1U;
+    }
+
+    next = Communication_NextFrameIndex(communication_tx_head);
+    if (next == communication_tx_tail)
+    {
+        communication_tx_drop_count++;
+        Communication_ExitCritical(primask);
+        return 0U;
+    }
+
+    communication_tx_queue[communication_tx_head].id = std_id;
+    for (uint8_t i = 0U; i < COMMUNICATION_CAN_FRAME_LEN; i++)
+    {
+        communication_tx_queue[communication_tx_head].data[i] = data[i];
+    }
+    communication_tx_head = next;
+    Communication_ExitCritical(primask);
+    return 1U;
+}
+
+static uint8_t Communication_StoreRxFrame(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
+{
+    uint8_t next;
+
+    if ((std_id > 0x7FFU) || (data == NULL))
+    {
+        return 0U;
+    }
+
+    next = Communication_NextFrameIndex(communication_rx_head);
+    if (next == communication_rx_tail)
+    {
+        communication_rx_drop_count++;
+        return 0U;
+    }
+
+    communication_rx_queue[communication_rx_head].id = std_id;
+    for (uint8_t i = 0U; i < COMMUNICATION_CAN_FRAME_LEN; i++)
+    {
+        communication_rx_queue[communication_rx_head].data[i] = data[i];
+    }
+    __DMB();
+    communication_rx_head = next;
+    communication_rx_frame_count++;
+    return 1U;
+}
+
+static uint8_t Communication_TryGetRxFrame(CommunicationFrame_s *frame)
+{
+    uint32_t primask;
+
+    if (frame == NULL)
+    {
+        return 0U;
+    }
+
+    primask = Communication_EnterCritical();
+    if (communication_rx_tail == communication_rx_head)
+    {
+        Communication_ExitCritical(primask);
+        return 0U;
+    }
+
+    *frame = communication_rx_queue[communication_rx_tail];
+    communication_rx_tail = Communication_NextFrameIndex(communication_rx_tail);
+    Communication_ExitCritical(primask);
+    return 1U;
+}
+
+static void Communication_ProcessTxQueue(void)
+{
+    CommunicationFrame_s *frame;
+    uint32_t primask;
+
+    if (communication_inited == 0U)
+    {
+        return;
+    }
+
+    for (;;)
+    {
+        primask = Communication_EnterCritical();
+        if (communication_tx_tail == communication_tx_head)
+        {
+            Communication_ExitCritical(primask);
+            return;
+        }
+
+        frame = &communication_tx_queue[communication_tx_tail];
+        if (canx_send_data(&hcan,
+                           frame->id,
+                           frame->data,
+                           COMMUNICATION_CAN_FRAME_LEN) == 0U)
+        {
+            Communication_ExitCritical(primask);
+            return;
+        }
+
+        communication_tx_tail = Communication_NextFrameIndex(communication_tx_tail);
+        communication_tx_frame_count++;
+        Communication_ExitCritical(primask);
+    }
 }
 
 uint8_t Communication_SendAck(uint8_t cmd,
@@ -213,8 +474,20 @@ uint8_t Communication_SendStatus(const CommunicationStatus_s *status)
     data[2] = status->motor_state;
     data[3] = status->output_state;
     data[4] = status->sensor_state;
-    data[5] = status->activity_state;
+    data[5] = (uint8_t)((status->activity_state & 0x3FU) |
+                        ((communication_control.control_mode & 0x03U) << 6U));
     Communication_WriteU16LE(&data[6], status->alarm);
+    communication_status_snapshot = *status;
+    /*
+     * 0x181 Byte0 是对外显示的系统状态，communication_control.sys_state 是控制权
+     * 状态机内部使用的运行状态。大多数状态可以同步，但 AUTH_LOCKED 只是周期帧里
+     * 给上位机看的授权提示，不能反写到控制权状态机，否则授权未完成时会把本地/远控
+     * 模式判断污染成一个业务状态，后续远控申请和自动进入远控都会被误判。
+     */
+    if (status->sys_state != COMMUNICATION_SYS_AUTH_LOCKED)
+    {
+        communication_control.sys_state = status->sys_state;
+    }
 
     return Communication_SendFrame(COMMUNICATION_CAN_ID_STATUS, data);
 }
@@ -347,15 +620,32 @@ uint8_t Communication_SendAuthResult(uint8_t auth_state,
     return Communication_SendFrame(COMMUNICATION_CAN_ID_AUTH_RESULT, data);
 }
 
+uint8_t Communication_SendControlEvent(uint8_t event,
+                                       uint8_t control_mode,
+                                       uint8_t sys_state,
+                                       uint8_t reason,
+                                       uint8_t seq)
+{
+    uint8_t data[COMMUNICATION_CAN_FRAME_LEN] = {0};
+
+    data[0] = event;
+    data[1] = control_mode;
+    data[2] = sys_state;
+    data[3] = reason;
+    data[6] = seq;
+    data[7] = 0U;
+
+    return Communication_SendFrame(COMMUNICATION_CAN_ID_CONTROL_EVENT, data);
+}
+
 uint8_t Communication_GetAuthState(void)
 {
-    Communication_Process();
     return communication_auth.state;
 }
 
 uint8_t Communication_IsUnlocked(void)
 {
-    return (Communication_GetAuthState() == COMMUNICATION_AUTH_UNLOCKED) ? 1U : 0U;
+    return (communication_auth.state == COMMUNICATION_AUTH_UNLOCKED) ? 1U : 0U;
 }
 
 uint32_t Communication_GetBoardId(void)
@@ -371,6 +661,179 @@ uint32_t Communication_GetNonce(void)
 const CommunicationAuthContext_s *Communication_GetAuthContext(void)
 {
     return &communication_auth;
+}
+
+uint8_t Communication_GetControlMode(void)
+{
+    return communication_control.control_mode;
+}
+
+uint8_t Communication_IsRemoteControlActive(void)
+{
+    return ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) ||
+            (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) ||
+            (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING)) ? 1U : 0U;
+}
+
+const CommunicationControlContext_s *Communication_GetControlContext(void)
+{
+    return &communication_control;
+}
+
+void Communication_SetSystemState(uint8_t sys_state)
+{
+    communication_control.sys_state = sys_state;
+}
+
+void Communication_OnLocalFlowStarted(void)
+{
+    communication_control.local_flow_running = 1U;
+    communication_control.sys_state = COMMUNICATION_SYS_RUNNING;
+}
+
+void Communication_OnLocalFlowStopped(void)
+{
+    communication_control.local_flow_running = 0U;
+    if ((communication_control.alarm_active == 0U) &&
+        (communication_control.estop_active == 0U))
+    {
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+    }
+}
+
+void Communication_OnAlarmChanged(uint8_t active)
+{
+    communication_control.alarm_active = (active != 0U) ? 1U : 0U;
+    if (communication_control.alarm_active != 0U)
+    {
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.sys_state = COMMUNICATION_SYS_ALARM;
+        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+        {
+            Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                         COMMUNICATION_CONTROL_REASON_ALARM);
+        }
+    }
+}
+
+void Communication_OnEStopChanged(uint8_t active)
+{
+    communication_control.estop_active = (active != 0U) ? 1U : 0U;
+    if (communication_control.estop_active != 0U)
+    {
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.sys_state = COMMUNICATION_SYS_ESTOP;
+        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+        {
+            Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                         COMMUNICATION_CONTROL_REASON_ESTOP);
+        }
+    }
+}
+
+void Communication_OnLocalPauseKey(void)
+{
+    if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+    {
+        communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
+        communication_control.remote_resume_allowed = 1U;
+        Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+        Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                     COMMUNICATION_CONTROL_REASON_KEY_PAUSE);
+        (void)Communication_SendControlEvent(COMMUNICATION_CONTROL_EVENT_LOCAL_PAUSE,
+                                             communication_control.control_mode,
+                                             communication_control.sys_state,
+                                             COMMUNICATION_CONTROL_REASON_KEY_PAUSE,
+                                             Communication_NextControlEventSeq());
+    }
+}
+
+void Communication_OnLocalStartKey(void)
+{
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) &&
+        (communication_control.remote_resume_allowed != 0U) &&
+        (communication_control.pc_authorized != 0U) &&
+        (communication_control.alarm_active == 0U) &&
+        (communication_control.estop_active == 0U))
+    {
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.local_takeover_latched = 0U;
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+        Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
+                                     COMMUNICATION_CONTROL_REASON_KEY_START);
+    }
+}
+
+void Communication_OnLocalResetKey(void)
+{
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) ||
+        (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) ||
+        (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING))
+    {
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.local_flow_running = 0U;
+        communication_control.local_takeover_latched = 1U;
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+        Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_TAKEOVER_LOCAL);
+        Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                     COMMUNICATION_CONTROL_REASON_KEY_RESET);
+        (void)Communication_SendControlEvent(COMMUNICATION_CONTROL_EVENT_LOCAL_TAKEOVER,
+                                             communication_control.control_mode,
+                                             communication_control.sys_state,
+                                             COMMUNICATION_CONTROL_REASON_KEY_RESET,
+                                             Communication_NextControlEventSeq());
+    }
+    else if (communication_control.control_mode == COMMUNICATION_CONTROL_LOCAL)
+    {
+        /*
+         * 复位键在本机侧含义是“本地收回/保持控制权”，不再承担解除接管锁存的职责。
+         * 如果在 LOCAL 下按复位就清锁存，下一轮收到上位机心跳可能马上自动回 REMOTE，
+         * 用户就会看到上位机显示远控、LCD 却还停在本地页面的错觉。
+         * 解除锁存统一交给远控键处理，语义更单一。
+         */
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.local_flow_running = 0U;
+        communication_control.local_takeover_latched = 1U;
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+    }
+}
+
+void Communication_OnLocalRemoteKey(void)
+{
+    uint8_t seq;
+
+    /*
+     * 用户主动按远控键，含义就是解除本地接管并重新申请上位机控制权。
+     * 先清锁存再判断条件，避免“本地已接管”把本次远控申请挡在门外，
+     * 也避免必须先按一次复位、再按远控才能恢复的绕路操作。
+     */
+    communication_control.local_takeover_latched = 0U;
+
+    if (Communication_CanLocalRequestRemote() == 0U)
+    {
+        return;
+    }
+
+    seq = Communication_NextControlEventSeq();
+    communication_control.remote_request_seq = seq;
+    communication_control.remote_request_tick = HAL_GetTick();
+    Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_SWITCHING,
+                                 COMMUNICATION_CONTROL_REASON_KEY_REMOTE);
+    (void)Communication_SendControlEvent(COMMUNICATION_CONTROL_EVENT_REMOTE_REQUEST,
+                                         communication_control.control_mode,
+                                         communication_control.sys_state,
+                                         COMMUNICATION_CONTROL_REASON_KEY_REMOTE,
+                                         seq);
+}
+
+uint8_t Communication_ConsumeSafetyAction(void)
+{
+    uint8_t action = communication_control.pending_safety_action;
+
+    communication_control.pending_safety_action = COMMUNICATION_SAFETY_ACTION_NONE;
+    return action;
 }
 
 uint8_t Communication_IsCommandAllowed(uint8_t cmd, uint16_t std_id)
@@ -399,7 +862,8 @@ uint8_t Communication_IsHostCommandId(uint16_t std_id)
 uint8_t Communication_CommandRequiresAuth(uint8_t cmd, uint16_t std_id)
 {
     if ((std_id == COMMUNICATION_CAN_ID_AUTH_REQUEST) ||
-        (std_id == COMMUNICATION_CAN_ID_AUTH_RESPONSE))
+        (std_id == COMMUNICATION_CAN_ID_AUTH_RESPONSE) ||
+        (std_id == COMMUNICATION_CAN_ID_CONTROL_RESPONSE))
     {
         return 0U;
     }
@@ -421,6 +885,17 @@ uint8_t Communication_CommandRequiresAuth(uint8_t cmd, uint16_t std_id)
     default:
         return 1U;
     }
+}
+
+static uint8_t Communication_IsKnownCommand(uint8_t cmd)
+{
+    return (((cmd >= COMMUNICATION_CMD_START_PROCESS) &&
+             (cmd <= COMMUNICATION_CMD_STOP_OBJECT)) ||
+            (cmd == COMMUNICATION_CMD_AUTH_REQUEST) ||
+            (cmd == COMMUNICATION_CMD_AUTH_CHALLENGE) ||
+            (cmd == COMMUNICATION_CMD_AUTH_RESPONSE) ||
+            (cmd == COMMUNICATION_CMD_AUTH_RESULT) ||
+            (cmd == COMMUNICATION_CMD_AUTH_CHALLENGE_EXT)) ? 1U : 0U;
 }
 
 uint32_t Communication_CalculateLicenseKey(uint32_t board_id, uint8_t license_type)
@@ -586,29 +1061,66 @@ static uint8_t Communication_GetSeqFromFrame(uint16_t std_id, const uint8_t data
     return data[COMMUNICATION_SEQ_DEFAULT_INDEX];
 }
 
-static void Communication_StoreHostCommand(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
+static uint8_t Communication_StoreHostCommand(uint16_t std_id, const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
 {
+    CommunicationHostCommand_s *command;
+    uint8_t next;
+
     /*
-     * 当前通信层只缓存“最近一帧已通过权限检查的命令”。
-     *
-     * 这样做有两个考虑：
-     * 1. 现在 MachineCMDTask 还没有正式接管 CAN 命令队列，单帧缓存最简单；
-     * 2. LCD 联调页面只需要显示最近一条上位机命令含义。
-     *
-     * 后续如果上位机连续高速下发动作命令，再把这里升级为环形队列。
+     * 上位机通常会连续发送 PREPARE_PARAM、PREPARE_VOLUME_PARAM、
+     * START_PROCESS。这里用小环形队列保序，避免旧的“最近一帧”缓存覆盖参数。
      */
-    communication_host_command.id = std_id;
-    communication_host_command.cmd = data[0];
-    communication_host_command.obj = data[1];
-    communication_host_command.seq = Communication_GetSeqFromFrame(std_id, data);
+    next = Communication_NextCommandIndex(communication_command_head);
+    if (next == communication_command_tail)
+    {
+        communication_command_drop_count++;
+        return 0U;
+    }
+
+    command = (CommunicationHostCommand_s *)&communication_command_queue[communication_command_head];
+    command->id = std_id;
+    command->cmd = data[0];
+    command->obj = data[1];
+    command->seq = Communication_GetSeqFromFrame(std_id, data);
+    command->updated = 1U;
+    command->frame_count = ++communication_command_frame_count;
 
     for (uint8_t i = 0U; i < COMMUNICATION_CAN_FRAME_LEN; i++)
     {
-        communication_host_command.data[i] = data[i];
+        command->data[i] = data[i];
     }
 
-    communication_host_command.updated = 1U;
-    communication_host_command.frame_count++;
+    communication_last_command = *command;
+    communication_command_head = next;
+    return 1U;
+}
+
+static uint8_t Communication_NextCommandIndex(uint8_t index)
+{
+    return (uint8_t)((index + 1U) % COMMUNICATION_COMMAND_QUEUE_CAPACITY);
+}
+
+static uint8_t Communication_NextFrameIndex(uint8_t index)
+{
+    return (uint8_t)((index + 1U) % COMMUNICATION_FRAME_QUEUE_CAPACITY);
+}
+
+static uint32_t Communication_EnterCritical(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    __DMB();
+    return primask;
+}
+
+static void Communication_ExitCritical(uint32_t primask)
+{
+    __DMB();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
 }
 
 static void Communication_HandleAuthRequest(const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
@@ -631,6 +1143,7 @@ static void Communication_HandleAuthRequest(const uint8_t data[COMMUNICATION_CAN
     }
 
     communication_auth.state = COMMUNICATION_AUTH_LOCKED;
+    Communication_SyncAuthState();
     (void)Communication_SendAuthChallenge(communication_auth.board_id, communication_auth.nonce);
 }
 
@@ -668,6 +1181,7 @@ static void Communication_HandleAuthResponse(const uint8_t data[COMMUNICATION_CA
          */
         communication_auth.state = COMMUNICATION_AUTH_LOCKED;
         communication_auth.fail_count++;
+        Communication_SyncAuthState();
         (void)Communication_SendAuthResult(communication_auth.state,
                                            COMMUNICATION_AUTH_RESULT_BAD_NONCE,
                                            communication_auth.fail_count,
@@ -698,6 +1212,7 @@ static void Communication_HandleAuthResponse(const uint8_t data[COMMUNICATION_CA
         communication_auth.fail_count = 0U;
         communication_auth.license_type = license_type;
         communication_auth.flags = flags;
+        Communication_SyncAuthState();
 
         (void)Communication_SendAuthResult(communication_auth.state,
                                            COMMUNICATION_AUTH_RESULT_OK,
@@ -716,6 +1231,7 @@ static void Communication_HandleAuthResponse(const uint8_t data[COMMUNICATION_CA
          */
         communication_auth.state = COMMUNICATION_AUTH_LOCKED;
         communication_auth.fail_count++;
+        Communication_SyncAuthState();
 
         (void)Communication_SendAuthResult(communication_auth.state,
                                            COMMUNICATION_AUTH_RESULT_BAD_KEY,
@@ -780,6 +1296,224 @@ static uint8_t Communication_HandleAuthFrame(uint16_t std_id, const uint8_t data
     }
 
     return 0U;
+}
+
+static void Communication_HandleControlResponse(const uint8_t data[COMMUNICATION_CAN_FRAME_LEN])
+{
+    if (data == NULL)
+    {
+        return;
+    }
+
+    /*
+     * 0x103 只用于回应本地远控键发出的 REMOTE_REQUEST。
+     * 必须同时匹配模式、SEQ、上位机结果和当前安全条件，避免过期响应抢控制权。
+     */
+    if ((communication_control.control_mode != COMMUNICATION_CONTROL_REMOTE_SWITCHING) ||
+        (data[6] != communication_control.remote_request_seq) ||
+        (data[0] != COMMUNICATION_CONTROL_RESPONSE_ACCEPT_REMOTE) ||
+        (data[1] != COMMUNICATION_CONTROL_RESPONSE_OK) ||
+        (communication_control.sys_state != COMMUNICATION_SYS_IDLE) ||
+        (communication_control.pc_connected == 0U) ||
+        (communication_control.pc_authorized == 0U) ||
+        (communication_control.alarm_active != 0U) ||
+        (communication_control.estop_active != 0U))
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                     COMMUNICATION_CONTROL_REASON_KEY_REMOTE);
+        return;
+    }
+
+    communication_control.local_takeover_latched = 0U;
+    communication_control.remote_resume_allowed = 0U;
+    Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
+                                 COMMUNICATION_CONTROL_REASON_KEY_REMOTE);
+}
+
+static void Communication_OnPcFrame(uint16_t std_id, uint8_t cmd)
+{
+    (void)cmd;
+
+    if ((std_id == COMMUNICATION_CAN_ID_AUTH_REQUEST) ||
+        (std_id == COMMUNICATION_CAN_ID_AUTH_RESPONSE) ||
+        (std_id == COMMUNICATION_CAN_ID_CONTROL) ||
+        (std_id == COMMUNICATION_CAN_ID_PARAM) ||
+        (std_id == COMMUNICATION_CAN_ID_QUERY) ||
+        (std_id == COMMUNICATION_CAN_ID_CONTROL_RESPONSE))
+    {
+        communication_control.pc_connected = 1U;
+        communication_control.last_remote_frame_tick = HAL_GetTick();
+    }
+}
+
+static void Communication_SyncAuthState(void)
+{
+    uint8_t was_authorized = communication_control.pc_authorized;
+
+    communication_control.pc_authorized =
+        (communication_auth.state == COMMUNICATION_AUTH_UNLOCKED) ? 1U : 0U;
+    communication_last_auth_state = communication_auth.state;
+
+    if ((was_authorized == 0U) && (communication_control.pc_authorized != 0U))
+    {
+        communication_control.pc_connected = 1U;
+        communication_control.last_remote_frame_tick = HAL_GetTick();
+    }
+
+    if (communication_control.pc_authorized == 0U)
+    {
+        communication_control.remote_resume_allowed = 0U;
+        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+        {
+            /*
+             * 授权失效后不能继续执行动作命令。
+             * 如果正在运行，先进入安全暂停并停输出；如果只是空闲远控页，
+             * 直接回到 LOCAL + 等待授权显示，避免 LCD 出现“启动键继续”但实际未授权无法恢复。
+             */
+            if ((communication_control.sys_state == COMMUNICATION_SYS_RUNNING) ||
+                (communication_control.local_flow_running != 0U))
+            {
+                communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
+                Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+                Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                             COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
+            }
+            else
+            {
+                communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+                Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                             COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
+            }
+        }
+        else if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING)
+        {
+            Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                         COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
+        }
+    }
+}
+
+static void Communication_SetControlMode(uint8_t control_mode, uint8_t reason)
+{
+    if (communication_control.control_mode == control_mode)
+    {
+        return;
+    }
+
+    communication_control.control_mode = control_mode;
+    (void)Communication_SendControlEvent(COMMUNICATION_CONTROL_EVENT_MODE_CHANGED,
+                                         communication_control.control_mode,
+                                         communication_control.sys_state,
+                                         reason,
+                                         Communication_NextControlEventSeq());
+}
+
+static uint8_t Communication_CanAutoEnterRemote(void)
+{
+    return ((communication_control.pc_connected != 0U) &&
+            (communication_control.pc_authorized != 0U) &&
+            (communication_control.local_takeover_latched == 0U) &&
+            (communication_control.local_flow_running == 0U) &&
+            (communication_control.alarm_active == 0U) &&
+            (communication_control.estop_active == 0U) &&
+            (communication_control.sys_state == COMMUNICATION_SYS_IDLE)) ? 1U : 0U;
+}
+
+static uint8_t Communication_CanLocalRequestRemote(void)
+{
+    return ((communication_control.control_mode == COMMUNICATION_CONTROL_LOCAL) &&
+            (communication_control.pc_connected != 0U) &&
+            (communication_control.pc_authorized != 0U) &&
+            (communication_control.local_flow_running == 0U) &&
+            (communication_control.alarm_active == 0U) &&
+            (communication_control.estop_active == 0U) &&
+            (communication_control.sys_state == COMMUNICATION_SYS_IDLE)) ? 1U : 0U;
+}
+
+static uint8_t Communication_IsQueryOrSafeCommand(uint16_t std_id, uint8_t cmd)
+{
+    if ((std_id == COMMUNICATION_CAN_ID_AUTH_REQUEST) ||
+        (std_id == COMMUNICATION_CAN_ID_AUTH_RESPONSE) ||
+        (std_id == COMMUNICATION_CAN_ID_CONTROL_RESPONSE) ||
+        (std_id == COMMUNICATION_CAN_ID_QUERY))
+    {
+        return 1U;
+    }
+
+    return ((std_id == COMMUNICATION_CAN_ID_CONTROL) &&
+            ((cmd == COMMUNICATION_CMD_STOP_PROCESS) ||
+             (cmd == COMMUNICATION_CMD_RESET_ERROR))) ? 1U : 0U;
+}
+
+static uint8_t Communication_IsRemoteCommandAllowed(uint16_t std_id,
+                                                    uint8_t cmd,
+                                                    uint8_t *result,
+                                                    uint16_t *error)
+{
+    if (result != NULL)
+    {
+        *result = COMMUNICATION_RESULT_OK;
+    }
+    if (error != NULL)
+    {
+        *error = COMMUNICATION_ERROR_NONE;
+    }
+
+    if (Communication_IsQueryOrSafeCommand(std_id, cmd) != 0U)
+    {
+        return 1U;
+    }
+
+    if ((communication_control.control_mode != COMMUNICATION_CONTROL_REMOTE) ||
+        (communication_control.pc_connected == 0U))
+    {
+        if (result != NULL)
+        {
+            *result = COMMUNICATION_RESULT_BUSY;
+        }
+        if (error != NULL)
+        {
+            *error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+        return 0U;
+    }
+
+    if ((communication_control.sys_state == COMMUNICATION_SYS_ALARM) ||
+        (communication_control.sys_state == COMMUNICATION_SYS_ESTOP) ||
+        (communication_control.alarm_active != 0U) ||
+        (communication_control.estop_active != 0U))
+    {
+        if (result != NULL)
+        {
+            *result = COMMUNICATION_RESULT_ALARM;
+        }
+        if (error != NULL)
+        {
+            *error = (communication_control.estop_active != 0U) ?
+                     COMMUNICATION_ERROR_ESTOP : COMMUNICATION_ERROR_PROCESS_FAILED;
+        }
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static uint8_t Communication_NextControlEventSeq(void)
+{
+    communication_control.next_event_seq++;
+    return communication_control.next_event_seq;
+}
+
+static void Communication_RequestSafetyAction(uint8_t action)
+{
+    /*
+     * 本地接管优先级高于远控暂停，避免尚未消费的接管动作被暂停覆盖。
+     */
+    if ((action == COMMUNICATION_SAFETY_ACTION_TAKEOVER_LOCAL) ||
+        (communication_control.pending_safety_action == COMMUNICATION_SAFETY_ACTION_NONE))
+    {
+        communication_control.pending_safety_action = action;
+    }
 }
 
 static uint32_t Communication_MakeNonce(void)
@@ -861,39 +1595,60 @@ static void Communication_Crc32AddU8(uint32_t *crc, uint8_t value)
     *crc = Communication_Crc32Update(*crc, &value, 1U);
 }
 
-static void Communication_CANCallback(CANInstance *instance)
+static void Communication_HandleRxFrame(const CommunicationFrame_s *frame)
 {
     uint16_t std_id;
     uint8_t cmd;
     uint8_t obj;
     uint8_t seq;
+    uint8_t result;
+    uint16_t error;
 
-    if ((instance == NULL) ||
-        (instance->rx_len != COMMUNICATION_CAN_FRAME_LEN) ||
-        (Communication_IsHostCommandId((uint16_t)instance->rx_id) == 0U))
+    if ((frame == NULL) ||
+        (Communication_IsHostCommandId(frame->id) == 0U))
     {
         /*
-         * 协议只接受上位机方向的标准 8 字节数据帧。
-         * bsp_can 已经按标准 ID 过滤到对应实例，这里再检查长度和 ID，
-         * 主要是为了防止误配置或后续扩展时把非协议帧送进来。
+         * CAN 中断只负责收帧入队；协议解析统一在任务上下文执行。
+         * 这里再检查一次 ID，避免后续扩展时把非协议帧误送进准入逻辑。
          */
         return;
     }
 
-    std_id = (uint16_t)instance->rx_id;
+    std_id = frame->id;
+    cmd = frame->data[0];
+    obj = frame->data[1];
+    seq = Communication_GetSeqFromFrame(std_id, frame->data);
+    Communication_OnPcFrame(std_id, cmd);
 
     /*
      * 第一步先处理授权相关帧。
      * 授权帧不是业务命令，不需要写入 command cache，也不需要普通 ACK。
      */
-    if (Communication_HandleAuthFrame(std_id, instance->rx_buff) != 0U)
+    if (Communication_HandleAuthFrame(std_id, frame->data) != 0U)
     {
         return;
     }
 
-    cmd = instance->rx_buff[0];
-    obj = instance->rx_buff[1];
-    seq = Communication_GetSeqFromFrame(std_id, instance->rx_buff);
+    if (std_id == COMMUNICATION_CAN_ID_CONTROL_RESPONSE)
+    {
+        Communication_HandleControlResponse(frame->data);
+        return;
+    }
+
+    if (Communication_IsKnownCommand(cmd) == 0U)
+    {
+        if ((std_id == COMMUNICATION_CAN_ID_CONTROL) ||
+            (std_id == COMMUNICATION_CAN_ID_PARAM))
+        {
+            (void)Communication_SendAck(cmd,
+                                        obj,
+                                        COMMUNICATION_RESULT_UNSUPPORTED,
+                                        COMMUNICATION_ERROR_NONE,
+                                        0U,
+                                        seq);
+        }
+        return;
+    }
 
     if (Communication_IsCommandAllowed(cmd, std_id) == 0U)
     {
@@ -914,7 +1669,45 @@ static void Communication_CANCallback(CANInstance *instance)
         return;
     }
 
-    Communication_StoreHostCommand(std_id, instance->rx_buff);
+    if (Communication_IsRemoteCommandAllowed(std_id, cmd, &result, &error) == 0U)
+    {
+        (void)Communication_SendAck(cmd, obj, result, error, 0U, seq);
+        return;
+    }
+
+    /*
+     * QUERY_STATUS 和普通心跳由通信层即时处理，不占用业务命令队列。
+     * 状态查询只需要 communication_status_snapshot + control_mode，通信层本来就有完整数据；
+     * 如果再转给 MachineCMD，会多等一个任务周期，而且可能和远控动作命令抢同一个业务队列。
+     *
+     * READ_ACTIVITY、QUERY_VERSION 仍入队给 MachineCMD 回复 0x183 数据帧，因为它们需要业务层
+     * 读取活度计缓存或版本信息，不能只靠通信层快照完成。
+     */
+    if ((std_id == COMMUNICATION_CAN_ID_QUERY) &&
+        (cmd == COMMUNICATION_CMD_HEARTBEAT))
+    {
+        return;
+    }
+    if ((std_id == COMMUNICATION_CAN_ID_QUERY) &&
+        (cmd == COMMUNICATION_CMD_QUERY_STATUS))
+    {
+        CommunicationStatus_s status = communication_status_snapshot;
+
+        status.sys_state = communication_control.sys_state;
+        (void)Communication_SendStatus(&status);
+        return;
+    }
+
+    if (Communication_StoreHostCommand(std_id, frame->data) == 0U)
+    {
+        (void)Communication_SendAck(cmd,
+                                    obj,
+                                    COMMUNICATION_RESULT_BUSY,
+                                    COMMUNICATION_ERROR_CAN_TIMEOUT,
+                                    0U,
+                                    seq);
+        return;
+    }
 
     if ((std_id == COMMUNICATION_CAN_ID_CONTROL) || (std_id == COMMUNICATION_CAN_ID_PARAM))
     {
@@ -933,4 +1726,22 @@ static void Communication_CANCallback(CANInstance *instance)
                                     0U,
                                     seq);
     }
+}
+
+static void Communication_CANCallback(CANInstance *instance)
+{
+    if ((instance == NULL) ||
+        (instance->rx_len != COMMUNICATION_CAN_FRAME_LEN) ||
+        (Communication_IsHostCommandId((uint16_t)instance->rx_id) == 0U))
+    {
+        return;
+    }
+
+    /*
+     * CAN 回调运行在 HAL 接收中断里，只做固定长度复制和入队。
+     * 授权、ACK、控制权状态机和业务命令缓存都放到 Communication_Process()。
+     * 这样做的核心原因是：ACK 发送、授权 CRC、远控状态切换都可能继续访问 CAN 队列或业务状态，
+     * 放在中断里容易造成重入和响应时间抖动；回调只入队可以把中断时间压到固定长度。
+     */
+    (void)Communication_StoreRxFrame((uint16_t)instance->rx_id, instance->rx_buff);
 }

@@ -81,6 +81,52 @@ static const char *const activity_meter_nuclide_name[] = {
     "Ir192",
 };
 
+/*
+ * RAM-100 的 nuclide_id 是上面 activity_meter_nuclide_name[] 的数组下标，
+ * 但 CAN 协议里的 isotope 字段要求的是核素质量数。两张表保持同一顺序，
+ * 这样解析到内部 ID 后，可以用 O(1) 查表得到上位机需要显示的数值。
+ *
+ * 例如：
+ * - nuclide_id = 1 表示 I131，协议 isotope 应发送 131；
+ * - nuclide_id = 2 表示 Tc99m，协议 isotope 应发送 99；
+ * - 未知或越界 ID 发送 0，让上位机按未知核素处理。
+ */
+static const uint16_t activity_meter_nuclide_mass_number[] = {
+    0U,
+    131U,
+    99U,
+    18U,
+    125U,
+    137U,
+    133U,
+    241U,
+    60U,
+    226U,
+    152U,
+    57U,
+    67U,
+    68U,
+    111U,
+    123U,
+    133U,
+    201U,
+    14U,
+    131U,
+    51U,
+    177U,
+    223U,
+    90U,
+    15U,
+    11U,
+    13U,
+    64U,
+    67U,
+    99U,
+    22U,
+    24U,
+    192U,
+};
+
 /**
  * @brief 获取当前毫秒时间轴。
  *
@@ -301,6 +347,20 @@ const char *ActivityMeter_GetNuclideString(uint16_t nuclide_id)
     }
 
     return activity_meter_nuclide_name[nuclide_id];
+}
+
+/**
+ * @brief 内部核素 ID 转协议质量数。
+ */
+uint16_t ActivityMeter_GetNuclideMassNumber(uint16_t nuclide_id)
+{
+    if (nuclide_id >=
+        (sizeof(activity_meter_nuclide_mass_number) / sizeof(activity_meter_nuclide_mass_number[0])))
+    {
+        return 0U;
+    }
+
+    return activity_meter_nuclide_mass_number[nuclide_id];
 }
 
 /**

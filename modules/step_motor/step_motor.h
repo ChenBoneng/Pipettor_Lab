@@ -11,8 +11,8 @@
  * 转换成 DM542 可以识别的 PUL/DIR 时序。
  *
  * 当前硬件连接：
- * - 电机 A：PA0/TIM2_CH1 输出 PUL，PA7/PA6 输出 DIR+/DIR-；
- * - 电机 B：PA1/TIM2_CH2 输出 PUL，PA5/PA4 输出 DIR+/DIR-；
+ * - 进罐导轨（电机A）：PA0/TIM2_CH1 输出 PUL，PA7/PA6 输出 DIR+/DIR-；
+ * - 插针导轨（电机B）：PA1/TIM2_CH2 输出 PUL，PA5/PA4 输出 DIR+/DIR-；
  * - ENA 未看到独立 MCU 控制网络，按 DM542 默认悬空使能处理。
  *
  * @note TIM2_CH1 和 TIM2_CH2 共用同一个计数周期，因此理论上两路同时运行时
@@ -27,8 +27,8 @@
  */
 typedef enum
 {
-    STEP_MOTOR_ID_A = 0, /**< 电机 A，对应 CN6 接口，PUL 使用 TIM2_CH1/PA0。 */
-    STEP_MOTOR_ID_B,     /**< 电机 B，对应 CN5 接口，PUL 使用 TIM2_CH2/PA1。 */
+    STEP_MOTOR_ID_A = 0, /**< 进罐导轨（电机A），对应 CN6 接口，PUL 使用 TIM2_CH1/PA0。 */
+    STEP_MOTOR_ID_B,     /**< 插针导轨（电机B），对应 CN5 接口，PUL 使用 TIM2_CH2/PA1。 */
     STEP_MOTOR_ID_MAX    /**< 电机数量边界值，仅用于数组长度和参数检查。 */
 } StepMotorId_e;
 

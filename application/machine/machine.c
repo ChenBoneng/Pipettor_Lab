@@ -4,18 +4,20 @@
 #include "solenoid_valve.h"
 #include "step_motor.h"
 #include "water_pump.h"
+#include "Communication.h"
+#include "activity_meter.h"
 #include "main.h"
 
 /*
  * 配药/发药整机测试流程：
  * 1. 配药页确认“原药体积”和“目标浓度”后启动；
- * 2. 导杆 A 推 3cm，导杆 B 推 5cm；
+ * 2. 进罐导轨（电机A）推 3cm，插针导轨（电机B）推 5cm；
  * 3. 抽水泵打开 5s，把铅罐中原药抽入活度计；
  * 4. 等待活度计读数稳定，当前未接入实物，先使用固定假活度；
  * 5. 按目标浓度、原药体积和实际活度计算需要补入的纯净水体积；
  * 6. 打开电磁阀 1，通过泵1抽取所需纯净水；
  * 7. 抽水泵再次打开 5s，把铅罐中的纯净水抽到活度计；
- * 8. 等待读数稳定后认为配药完成，并让导杆 A/B 回原点；
+ * 8. 等待读数稳定后认为配药完成，先回退插针导轨（电机B），再回退进罐导轨（电机A）；
  * 9. 等待用户按发药键并确认发药量；
  * 10. 泵2吸入本次发药体积，流程结束。
  *
@@ -34,10 +36,10 @@
 typedef enum
 {
     MACHINE_COMBO_STATE_IDLE = 0,              // 空闲，等待配药参数确认
-    MACHINE_COMBO_STATE_STEP_A_PUSH,           // 导杆 A 推 3cm
-    MACHINE_COMBO_STATE_GAP_AFTER_A,           // A 动作完成后的间隔
-    MACHINE_COMBO_STATE_STEP_B_PUSH,           // 导杆 B 推 5cm
-    MACHINE_COMBO_STATE_GAP_AFTER_B,           // B 动作完成后的间隔
+    MACHINE_COMBO_STATE_STEP_A_PUSH,           // 进罐导轨（电机A）推 3cm
+    MACHINE_COMBO_STATE_GAP_AFTER_A,           // 进罐导轨动作完成后的间隔
+    MACHINE_COMBO_STATE_STEP_B_PUSH,           // 插针导轨（电机B）推 5cm
+    MACHINE_COMBO_STATE_GAP_AFTER_B,           // 插针导轨动作完成后的间隔
     MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵抽原药进入活度计
     MACHINE_COMBO_STATE_RAW_PUMP_OFF,          // 关闭抽水泵并等待流路稳定
     MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY,     // 等待原药活度读数稳定
@@ -49,10 +51,10 @@ typedef enum
     MACHINE_COMBO_STATE_WATER_PUMP_ON,         // 抽水泵抽纯净水进入活度计
     MACHINE_COMBO_STATE_WATER_PUMP_OFF,        // 关闭抽水泵并等待流路稳定
     MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY,   // 等待最终活度读数稳定
-    MACHINE_COMBO_STATE_STEP_A_HOME,           // 导杆 A 回原点
-    MACHINE_COMBO_STATE_GAP_AFTER_A_HOME,      // A 回原点后的间隔
-    MACHINE_COMBO_STATE_STEP_B_HOME,           // 导杆 B 回原点
-    MACHINE_COMBO_STATE_GAP_AFTER_B_HOME,      // B 回原点后的间隔
+    MACHINE_COMBO_STATE_STEP_A_HOME,           // 进罐导轨（电机A）回原点
+    MACHINE_COMBO_STATE_GAP_AFTER_A_HOME,      // 进罐导轨回原点后的间隔
+    MACHINE_COMBO_STATE_STEP_B_HOME,           // 插针导轨（电机B）回原点
+    MACHINE_COMBO_STATE_GAP_AFTER_B_HOME,      // 插针导轨回原点后的间隔
     MACHINE_COMBO_STATE_WAIT_DISPENSE,         // 等待发药量确认
     MACHINE_COMBO_STATE_PUMP2_ENABLE,          // 发送泵2使能命令
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE, // 泵2使能后等待总线和驱动响应
@@ -73,13 +75,25 @@ typedef enum
     MACHINE_DIRECT_DISPENSE_STATE_ERROR        // 泵2动作启动失败
 } MachineDirectDispenseState_e;
 
+typedef enum
+{
+    MACHINE_FLOW_OWNER_LOCAL = 0,  // 本地 LCD/按键启动的流程
+    MACHINE_FLOW_OWNER_REMOTE      // 上位机协议启动的流程
+} MachineFlowOwner_e;
+
 static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
 static uint8_t machine_combo_running = 0U;
+static MachineFlowOwner_e machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
 static uint16_t machine_combo_raw_ml_x100 = 0U;
 static uint16_t machine_combo_target_conc_x1000 = 0U;
 static uint16_t machine_combo_dispense_ml_x100 = 0U;
 static uint32_t machine_combo_water_ul = 0U;
+static uint16_t machine_combo_remote_water_ml_x100 = 0U;
+static uint16_t machine_combo_remote_final_ml_x100 = 0U;
+static uint16_t machine_combo_remote_target_activity_x100 = 0U;
+static uint8_t machine_combo_remote_volume_valid = 0U;
+static uint8_t machine_combo_remote_seq = 0U;
 static uint32_t machine_combo_dispense_ul = 0U;
 static uint32_t machine_combo_dispense_remaining_ul = 0U;
 static uint32_t machine_combo_dispense_segment_ul = 0U;
@@ -90,6 +104,7 @@ static uint32_t machine_combo_pause_start_ms = 0U;
 static MachineDirectDispenseState_e machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
 static uint32_t machine_direct_dispense_state_start_ms = 0U;
 static uint8_t machine_direct_dispense_running = 0U;
+static MachineFlowOwner_e machine_direct_dispense_owner = MACHINE_FLOW_OWNER_LOCAL;
 static uint16_t machine_direct_dispense_ml_x100 = 0U;
 static uint32_t machine_direct_dispense_ul = 0U;
 static uint32_t machine_direct_dispense_remaining_ul = 0U;
@@ -109,7 +124,9 @@ static void Machine_PauseCombo(void);
 static void Machine_ResumeCombo(void);
 static void Machine_StopPump2Output(void);
 static uint8_t Machine_StartPump2DispenseSegment(void);
-static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000);
+static void Machine_StartCombo(uint16_t raw_ml_x100,
+                               uint16_t target_conc_x1000,
+                               MachineFlowOwner_e owner);
 static void Machine_UpdateCombo(void);
 static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_state);
 static void Machine_ExecuteDirectDispenseState(void);
@@ -117,8 +134,12 @@ static void Machine_AbortDirectDispense(void);
 static void Machine_PauseDirectDispense(void);
 static void Machine_ResumeDirectDispense(void);
 static uint8_t Machine_StartDirectDispenseSegment(void);
-static void Machine_StartDirectDispense(uint16_t dispense_ml_x100);
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner);
 static void Machine_UpdateDirectDispense(void);
+static uint8_t Machine_IsRemoteFlowBlocked(MachineFlowOwner_e owner);
+static uint16_t Machine_GetMeasuredActivityMciX100(void);
+static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner);
+static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step);
 
 /**
  * @brief 获取当前毫秒时间轴。
@@ -166,6 +187,122 @@ static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t raw_ml_x100,
 
     water_ml_x100 = final_ml_x100 - raw_ml_x100;
     return water_ml_x100 * 10U;
+}
+
+/**
+ * @brief 判断当前流程是否被远控状态阻断。
+ *
+ * 本地流程在上位机取得控制权后退出；远程流程只允许在 REMOTE 下继续。
+ */
+static uint8_t Machine_IsRemoteFlowBlocked(MachineFlowOwner_e owner)
+{
+    if (owner == MACHINE_FLOW_OWNER_REMOTE)
+    {
+        return (Communication_GetControlMode() == COMMUNICATION_CONTROL_REMOTE) ? 0U : 1U;
+    }
+
+    return (MachineCMD_IsRemoteMode() != 0U) ? 1U : 0U;
+}
+
+/**
+ * @brief 获取最近一次活度计读数，并换算成 0.01mCi。
+ *
+ * @return 有效读数返回 mCi * 100；没有有效实测值时返回 0。
+ */
+static uint16_t Machine_GetMeasuredActivityMciX100(void)
+{
+    ActivityMeterData_s activity_data;
+    float activity_mci;
+
+    if ((ActivityMeter_GetData(&activity_data) == 0U) ||
+        (activity_data.state != ACTIVITY_METER_STATE_OK) ||
+        (activity_data.activity <= 0.0f))
+    {
+        return 0U;
+    }
+
+    switch (activity_data.activity_unit)
+    {
+    case ACTIVITY_METER_UNIT_UCI:
+        activity_mci = activity_data.activity / 1000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_MCI:
+        activity_mci = activity_data.activity;
+        break;
+
+    case ACTIVITY_METER_UNIT_CI:
+        activity_mci = activity_data.activity * 1000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_BQ:
+        activity_mci = activity_data.activity / 37000000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_KBQ:
+        activity_mci = activity_data.activity / 37000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_MBQ:
+        activity_mci = activity_data.activity / 37.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_GBQ:
+        activity_mci = activity_data.activity * 27.027027f;
+        break;
+
+    default:
+        return 0U;
+    }
+
+    if (activity_mci <= 0.0f)
+    {
+        return 0U;
+    }
+    if (activity_mci >= 655.35f)
+    {
+        return 0xFFFFU;
+    }
+
+    return (uint16_t)((activity_mci * 100.0f) + 0.5f);
+}
+
+/**
+ * @brief 同步流程开始状态给通信层。
+ */
+static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner)
+{
+    Communication_SetSystemState(COMMUNICATION_SYS_RUNNING);
+    if (owner == MACHINE_FLOW_OWNER_LOCAL)
+    {
+        Communication_OnLocalFlowStarted();
+    }
+}
+
+/**
+ * @brief 同步流程结束状态给通信层。
+ */
+static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
+{
+    uint16_t measured_activity_x100;
+
+    if (owner == MACHINE_FLOW_OWNER_LOCAL)
+    {
+        Communication_OnLocalFlowStopped();
+    }
+    else
+    {
+        Communication_SetSystemState(COMMUNICATION_SYS_IDLE);
+    }
+
+    if ((owner == MACHINE_FLOW_OWNER_REMOTE) &&
+        (step == COMMUNICATION_STEP_PREPARE_DONE))
+    {
+        measured_activity_x100 = Machine_GetMeasuredActivityMciX100();
+        (void)Communication_SendPrepareResult(machine_combo_remote_final_ml_x100,
+                                              measured_activity_x100,
+                                              machine_combo_remote_seq);
+    }
 }
 
 
@@ -217,6 +354,7 @@ static void Machine_StopPump2Output(void)
  */
 static void Machine_AbortCombo(void)
 {
+    Machine_NotifyFlowStopped(machine_combo_owner, COMMUNICATION_STEP_FAILED);
     Machine_StopComboOutputs();
     machine_combo_running = 0U;
     machine_combo_state = MACHINE_COMBO_STATE_ERROR;
@@ -355,14 +493,21 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_CALC_WATER:
         /*
-         * 活度计未接入前先使用固定假活度。后续接入真实活度计时，只需要把
-         * machine_combo_raw_activity_mci_x1000 替换成 ActivityMeter_GetData()
-         * 读取到的实际原药总活度即可。
+         * 本地配药沿用当前假活度稀释计算；远程配药必须使用上位机随
+         * PREPARE_VOLUME_PARAM 下发的理论补水量，避免下位机缺参数硬算。
          */
         machine_combo_raw_activity_mci_x1000 = MACHINE_COMBO_FAKE_RAW_ACTIVITY_MCI_X1000;
-        machine_combo_water_ul = Machine_CalcPureWaterVolumeUl(machine_combo_raw_ml_x100,
-                                                               machine_combo_target_conc_x1000,
-                                                               machine_combo_raw_activity_mci_x1000);
+        if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
+            (machine_combo_remote_volume_valid != 0U))
+        {
+            machine_combo_water_ul = (uint32_t)machine_combo_remote_water_ml_x100 * 10U;
+        }
+        else
+        {
+            machine_combo_water_ul = Machine_CalcPureWaterVolumeUl(machine_combo_raw_ml_x100,
+                                                                   machine_combo_target_conc_x1000,
+                                                                   machine_combo_raw_activity_mci_x1000);
+        }
         break;
 
     case MACHINE_COMBO_STATE_WATER_VALVE_ON:
@@ -434,6 +579,12 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_FINISHED:
     case MACHINE_COMBO_STATE_ERROR:
         Machine_StopComboOutputs();
+        Machine_NotifyFlowStopped(machine_combo_owner,
+                                  (machine_combo_state == MACHINE_COMBO_STATE_FINISHED) ?
+                                  ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) ?
+                                   COMMUNICATION_STEP_PREPARE_DONE :
+                                   COMMUNICATION_STEP_DISPENSE_DONE) :
+                                  COMMUNICATION_STEP_FAILED);
         machine_combo_running = 0U;
         break;
 
@@ -460,8 +611,11 @@ static void Machine_ExecuteComboState(void)
  * @param raw_ml_x100 配药页确认的原药体积，单位 0.01ml。
  * @param target_conc_x1000 配药页确认的目标浓度，单位 0.001mCi/ml。
  */
-static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000)
+static void Machine_StartCombo(uint16_t raw_ml_x100,
+                               uint16_t target_conc_x1000,
+                               MachineFlowOwner_e owner)
 {
+    machine_combo_owner = owner;
     machine_combo_raw_ml_x100 = raw_ml_x100;
     machine_combo_target_conc_x1000 = target_conc_x1000;
     machine_combo_dispense_ml_x100 = 0U;
@@ -475,6 +629,7 @@ static void Machine_StartCombo(uint16_t raw_ml_x100, uint16_t target_conc_x1000)
     machine_combo_running = 1U;
 
     Machine_StopComboOutputs();
+    Machine_NotifyFlowStarted(owner);
     Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_A_PUSH);
 }
 
@@ -490,13 +645,14 @@ static void Machine_UpdateCombo(void)
         return;
     }
 
-    if (MachineCMD_IsRemoteMode() != 0U)
+    if (Machine_IsRemoteFlowBlocked(machine_combo_owner) != 0U)
     {
         Machine_AbortCombo();
         return;
     }
 
-    if (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED)
+    if ((machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL) &&
+        (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED))
     {
         Machine_PauseCombo();
         return;
@@ -607,7 +763,11 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
         if (elapsed_ms >= MACHINE_COMBO_ACTIVITY_STABLE_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_A_HOME);
+            /*
+             * 回退导轨时先收插针导轨（电机B），再收进罐导轨（电机A）。
+             * 插针先退出可以先解除针头和瓶口/管路的机械约束，再移动进罐方向。
+             */
+            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_B_HOME);
         }
         break;
 
@@ -621,7 +781,14 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_B_HOME);
+            if (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_DISPENSE);
+            }
         }
         break;
 
@@ -635,7 +802,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_DISPENSE);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_A_HOME);
         }
         break;
 
@@ -783,6 +950,10 @@ static void Machine_ExecuteDirectDispenseState(void)
     case MACHINE_DIRECT_DISPENSE_STATE_FINISHED:
     case MACHINE_DIRECT_DISPENSE_STATE_ERROR:
         Machine_StopPump2Output();
+        Machine_NotifyFlowStopped(machine_direct_dispense_owner,
+                                  (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FINISHED) ?
+                                  COMMUNICATION_STEP_DISPENSE_DONE :
+                                  COMMUNICATION_STEP_FAILED);
         machine_direct_dispense_running = 0U;
         break;
 
@@ -799,6 +970,7 @@ static void Machine_ExecuteDirectDispenseState(void)
  */
 static void Machine_AbortDirectDispense(void)
 {
+    Machine_NotifyFlowStopped(machine_direct_dispense_owner, COMMUNICATION_STEP_FAILED);
     Machine_StopPump2Output();
     machine_direct_dispense_running = 0U;
     machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_ERROR;
@@ -847,8 +1019,9 @@ static void Machine_ResumeDirectDispense(void)
  *
  * @param dispense_ml_x100 发药体积，单位 0.01ml。
  */
-static void Machine_StartDirectDispense(uint16_t dispense_ml_x100)
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner)
 {
+    machine_direct_dispense_owner = owner;
     machine_direct_dispense_ml_x100 = dispense_ml_x100;
     machine_direct_dispense_ul = 0U;
     machine_direct_dispense_remaining_ul = 0U;
@@ -856,6 +1029,7 @@ static void Machine_StartDirectDispense(uint16_t dispense_ml_x100)
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
     machine_direct_dispense_running = 1U;
+    Machine_NotifyFlowStarted(owner);
 
     /*
      * 待机直接发药刚启动时不先发急停。
@@ -876,13 +1050,14 @@ static void Machine_UpdateDirectDispense(void)
         return;
     }
 
-    if (MachineCMD_IsRemoteMode() != 0U)
+    if (Machine_IsRemoteFlowBlocked(machine_direct_dispense_owner) != 0U)
     {
         Machine_AbortDirectDispense();
         return;
     }
 
-    if (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED)
+    if ((machine_direct_dispense_owner == MACHINE_FLOW_OWNER_LOCAL) &&
+        (MachineCMD_GetPage() == MACHINE_CMD_PAGE_PAUSED))
     {
         Machine_PauseDirectDispense();
         return;
@@ -956,10 +1131,16 @@ void MachineInit(void)
 {
     machine_combo_state = MACHINE_COMBO_STATE_IDLE;
     machine_combo_running = 0U;
+    machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
     machine_combo_raw_ml_x100 = 0U;
     machine_combo_target_conc_x1000 = 0U;
     machine_combo_dispense_ml_x100 = 0U;
     machine_combo_water_ul = 0U;
+    machine_combo_remote_water_ml_x100 = 0U;
+    machine_combo_remote_final_ml_x100 = 0U;
+    machine_combo_remote_target_activity_x100 = 0U;
+    machine_combo_remote_volume_valid = 0U;
+    machine_combo_remote_seq = 0U;
     machine_combo_dispense_ul = 0U;
     machine_combo_dispense_remaining_ul = 0U;
     machine_combo_dispense_segment_ul = 0U;
@@ -970,6 +1151,7 @@ void MachineInit(void)
     machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
     machine_direct_dispense_state_start_ms = 0U;
     machine_direct_dispense_running = 0U;
+    machine_direct_dispense_owner = MACHINE_FLOW_OWNER_LOCAL;
     machine_direct_dispense_ml_x100 = 0U;
     machine_direct_dispense_ul = 0U;
     machine_direct_dispense_remaining_ul = 0U;
@@ -1010,14 +1192,15 @@ void MachineControl(void)
     if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumePrepConfirmed(&raw_ml_x100, &target_conc_x1000) != 0U))
     {
-        Machine_StartCombo(raw_ml_x100, target_conc_x1000);
+        machine_combo_remote_volume_valid = 0U;
+        Machine_StartCombo(raw_ml_x100, target_conc_x1000, MACHINE_FLOW_OWNER_LOCAL);
         return;
     }
 
     if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumeDispenseConfirmed(&dispense_ml_x100) != 0U))
     {
-        Machine_StartDirectDispense(dispense_ml_x100);
+        Machine_StartDirectDispense(dispense_ml_x100, MACHINE_FLOW_OWNER_LOCAL);
         return;
     }
 
@@ -1038,4 +1221,134 @@ uint8_t MachineCombinationTestCanDispense(void)
     }
 
     return 0U;
+}
+
+uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
+                                   uint16_t final_volume_x100,
+                                   uint16_t target_activity_x100,
+                                   uint16_t target_conc_x1000,
+                                   uint8_t seq)
+{
+    uint16_t raw_ml_x100 = 0U;
+
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
+        (machine_combo_running != 0U) ||
+        (machine_direct_dispense_running != 0U) ||
+        (final_volume_x100 == 0U) ||
+        (target_conc_x1000 == 0U))
+    {
+        return 0U;
+    }
+
+    if (final_volume_x100 > water_volume_x100)
+    {
+        raw_ml_x100 = final_volume_x100 - water_volume_x100;
+    }
+
+    machine_combo_remote_water_ml_x100 = water_volume_x100;
+    machine_combo_remote_final_ml_x100 = final_volume_x100;
+    machine_combo_remote_target_activity_x100 = target_activity_x100;
+    machine_combo_remote_volume_valid = 1U;
+    machine_combo_remote_seq = seq;
+
+    Machine_StartCombo(raw_ml_x100, target_conc_x1000, MACHINE_FLOW_OWNER_REMOTE);
+    return 1U;
+}
+
+uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100)
+{
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
+        (machine_combo_running != 0U) ||
+        (machine_direct_dispense_running != 0U) ||
+        (volume_ml_x100 == 0U))
+    {
+        return 0U;
+    }
+
+    Machine_StartDirectDispense(volume_ml_x100, MACHINE_FLOW_OWNER_REMOTE);
+    return 1U;
+}
+
+uint8_t Machine_GetCommunicationStep(void)
+{
+    if (machine_direct_dispense_running != 0U)
+    {
+        if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_ENABLE) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE))
+        {
+            return COMMUNICATION_STEP_DISPENSE_START;
+        }
+
+        if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2))
+        {
+            return COMMUNICATION_STEP_DISPENSE_RUNNING;
+        }
+
+        return COMMUNICATION_STEP_DISPENSE_DONE;
+    }
+
+    if (machine_combo_running == 0U)
+    {
+        return COMMUNICATION_STEP_IDLE;
+    }
+
+    switch (machine_combo_state)
+    {
+    case MACHINE_COMBO_STATE_STEP_A_PUSH:
+    case MACHINE_COMBO_STATE_GAP_AFTER_A:
+    case MACHINE_COMBO_STATE_STEP_B_PUSH:
+    case MACHINE_COMBO_STATE_GAP_AFTER_B:
+    case MACHINE_COMBO_STATE_RAW_PUMP_ON:
+    case MACHINE_COMBO_STATE_RAW_PUMP_OFF:
+        return COMMUNICATION_STEP_PREPARE_START;
+
+    case MACHINE_COMBO_STATE_CALC_WATER:
+    case MACHINE_COMBO_STATE_WATER_VALVE_ON:
+    case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
+    case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
+    case MACHINE_COMBO_STATE_WATER_PUMP_ON:
+    case MACHINE_COMBO_STATE_WATER_PUMP_OFF:
+        return COMMUNICATION_STEP_PREPARE_WATER_FILL;
+
+    case MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY:
+    case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
+        return COMMUNICATION_STEP_PREPARE_WAIT_ACTIVITY;
+
+    case MACHINE_COMBO_STATE_STEP_A_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
+    case MACHINE_COMBO_STATE_STEP_B_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
+        return COMMUNICATION_STEP_PREPARE_RESULT;
+
+    case MACHINE_COMBO_STATE_WAIT_DISPENSE:
+        return COMMUNICATION_STEP_PREPARE_DONE;
+
+    case MACHINE_COMBO_STATE_PUMP2_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE:
+        return COMMUNICATION_STEP_DISPENSE_START;
+
+    case MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2:
+        return COMMUNICATION_STEP_DISPENSE_RUNNING;
+
+    case MACHINE_COMBO_STATE_FINISHED:
+        return (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) ?
+               COMMUNICATION_STEP_PREPARE_DONE :
+               COMMUNICATION_STEP_DISPENSE_DONE;
+
+    case MACHINE_COMBO_STATE_ERROR:
+        return COMMUNICATION_STEP_FAILED;
+
+    case MACHINE_COMBO_STATE_IDLE:
+    default:
+        return COMMUNICATION_STEP_IDLE;
+    }
+}
+
+uint8_t Machine_IsFlowRunning(void)
+{
+    return ((machine_combo_running != 0U) ||
+            (machine_direct_dispense_running != 0U)) ? 1U : 0U;
 }

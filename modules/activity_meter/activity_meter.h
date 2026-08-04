@@ -142,6 +142,19 @@ const char *ActivityMeter_GetUnitString(ActivityMeterUnit_e unit);
 const char *ActivityMeter_GetNuclideString(uint16_t nuclide_id);
 
 /**
+ * @brief 把 RAM-100 内部核素 ID 转换成上位机协议使用的核素质量数。
+ *
+ * @param nuclide_id RAM-100 内置核素表下标。
+ * @return 协议 isotope 字段使用的质量数，例如 I131 返回 131；未知 ID 返回 0。
+ *
+ * @note RAM-100 返回的 nuclide_id 是设备内部核素表序号，不是协议里直接显示的核素值。
+ *       如果把内部序号原样发给上位机，上位机只能看到 1、2、3 这类索引，无法按
+ *       I-131、Tc-99m 等业务含义显示。本函数把这个转换固定在活度计驱动层，
+ *       CAN 协议层只需要拿到已经符合协议定义的 isotope 数值。
+ */
+uint16_t ActivityMeter_GetNuclideMassNumber(uint16_t nuclide_id);
+
+/**
  * @brief 计算标准 Modbus CRC16。
  *
  * @param data 待校验数据。

@@ -59,6 +59,9 @@
 /** 上位机 -> 下位机：查询命令。 */
 #define COMMUNICATION_CAN_ID_QUERY               0x102U
 
+/** 上位机 -> 下位机：控制权响应。 */
+#define COMMUNICATION_CAN_ID_CONTROL_RESPONSE    0x103U
+
 /** 下位机 -> 上位机：命令应答。 */
 #define COMMUNICATION_CAN_ID_ACK                 0x180U
 
@@ -70,6 +73,15 @@
 
 /** 下位机 -> 上位机：查询数据返回。 */
 #define COMMUNICATION_CAN_ID_DATA                0x183U
+
+/** 下位机 -> 上位机：控制权事件。 */
+#define COMMUNICATION_CAN_ID_CONTROL_EVENT       0x184U
+
+/** 上位机在线判定超时时间，超过该时间未收到有效帧则暂停远控。 */
+#define COMMUNICATION_PC_ONLINE_TIMEOUT_MS       3000U
+
+/** 本地下位机申请远控后等待 0x103 响应的超时时间。 */
+#define COMMUNICATION_REMOTE_REQUEST_TIMEOUT_MS  3000U
 
 /** 0x090 授权请求子命令：请求 BoardID 和 nonce。 */
 #define COMMUNICATION_AUTH_MSG_REQUEST           0x01U
@@ -126,8 +138,8 @@ typedef enum
 typedef enum
 {
     COMMUNICATION_OBJ_SYSTEM = 0x00U,              /**< 系统整体对象。 */
-    COMMUNICATION_OBJ_MOTOR_A = 0x01U,             /**< A 轴步进电机。 */
-    COMMUNICATION_OBJ_MOTOR_B = 0x02U,             /**< B 轴步进电机。 */
+    COMMUNICATION_OBJ_MOTOR_A = 0x01U,             /**< 进罐导轨（电机A）。 */
+    COMMUNICATION_OBJ_MOTOR_B = 0x02U,             /**< 插针导轨（电机B）。 */
     COMMUNICATION_OBJ_PUMP_1 = 0x03U,              /**< 泵1：300ul 定量泵。 */
     COMMUNICATION_OBJ_VALVE_1 = 0x04U,             /**< 阀门 1。 */
     COMMUNICATION_OBJ_VALVE_2 = 0x05U,             /**< 阀门 2。 */
@@ -167,8 +179,8 @@ typedef enum
 {
     COMMUNICATION_ERROR_NONE = 0x0000U,              /**< 无错误。 */
     COMMUNICATION_ERROR_ESTOP = 0x0001U,             /**< 急停触发。 */
-    COMMUNICATION_ERROR_MOTOR_A_TIMEOUT = 0x0002U,   /**< A 轴运动超时。 */
-    COMMUNICATION_ERROR_MOTOR_B_TIMEOUT = 0x0003U,   /**< B 轴运动超时。 */
+    COMMUNICATION_ERROR_MOTOR_A_TIMEOUT = 0x0002U,   /**< 进罐导轨（电机A）运动超时。 */
+    COMMUNICATION_ERROR_MOTOR_B_TIMEOUT = 0x0003U,   /**< 插针导轨（电机B）运动超时。 */
     COMMUNICATION_ERROR_ACTIVITY_TIMEOUT = 0x0004U,  /**< 活度计通信超时。 */
     COMMUNICATION_ERROR_CAN_TIMEOUT = 0x0005U,       /**< CAN 通信超时。 */
     COMMUNICATION_ERROR_BAD_PARAM = 0x0006U,         /**< 参数非法。 */
@@ -177,7 +189,10 @@ typedef enum
     COMMUNICATION_ERROR_AUTH_FAILED = 0x0009U,       /**< 认证失败。 */
     COMMUNICATION_ERROR_SESSION_TIMEOUT = 0x000AU,   /**< 会话心跳超时。 */
     COMMUNICATION_ERROR_LIMIT_TRIGGERED = 0x000BU,   /**< 限位触发。 */
-    COMMUNICATION_ERROR_STATE_NOT_ALLOWED = 0x000CU  /**< 当前状态不允许执行。 */
+    COMMUNICATION_ERROR_STATE_NOT_ALLOWED = 0x000CU, /**< 当前状态不允许执行。 */
+    COMMUNICATION_ERROR_LOCAL_PAUSE = 0x000DU,       /**< 本地暂停远控流程。 */
+    COMMUNICATION_ERROR_LOCAL_TAKEOVER = 0x000EU,    /**< 本地已接管控制权。 */
+    COMMUNICATION_ERROR_REMOTE_HANDSHAKE_TIMEOUT = 0x000FU /**< 远控握手超时。 */
 } CommunicationError_e;
 
 /** 系统状态，放在 0x181 周期状态帧 Byte0。 */
@@ -201,6 +216,84 @@ typedef enum
     COMMUNICATION_ACTIVITY_CRC_ERROR = 0x03U,     /**< CRC 错误。 */
     COMMUNICATION_ACTIVITY_BAD_RESPONSE = 0x04U   /**< 响应格式错误。 */
 } CommunicationActivityState_e;
+
+/** 业务流程步骤，放在 0x181 周期状态帧 Byte1。 */
+typedef enum
+{
+    COMMUNICATION_STEP_IDLE = 0x00U,                  /**< 无活动业务步骤。 */
+    COMMUNICATION_STEP_PREPARE_PARAM_READY = 0x10U,   /**< 配药参数已就绪。 */
+    COMMUNICATION_STEP_PREPARE_START = 0x11U,         /**< 配药流程启动。 */
+    COMMUNICATION_STEP_PREPARE_WATER_FILL = 0x12U,    /**< 配药补水阶段。 */
+    COMMUNICATION_STEP_PREPARE_WAIT_ACTIVITY = 0x14U, /**< 等待活度测量。 */
+    COMMUNICATION_STEP_PREPARE_RESULT = 0x15U,        /**< 配药结果已生成。 */
+    COMMUNICATION_STEP_PREPARE_DONE = 0x16U,          /**< 配药流程完成。 */
+    COMMUNICATION_STEP_DISPENSE_PARAM_READY = 0x20U,  /**< 发药参数已就绪。 */
+    COMMUNICATION_STEP_DISPENSE_START = 0x21U,        /**< 发药流程启动。 */
+    COMMUNICATION_STEP_DISPENSE_RUNNING = 0x22U,      /**< 发药泵送中。 */
+    COMMUNICATION_STEP_DISPENSE_DONE = 0x23U,         /**< 发药流程完成。 */
+    COMMUNICATION_STEP_REMOTE_PAUSED = 0x40U,         /**< 远程流程被本地暂停。 */
+    COMMUNICATION_STEP_LOCAL_TAKEOVER = 0x41U,        /**< 本地已接管远程流程。 */
+    COMMUNICATION_STEP_FAILED = 0x7FU                 /**< 当前流程失败。 */
+} CommunicationProcessStep_e;
+
+/** 控制权模式，占 0x181 Byte5 高两位。 */
+typedef enum
+{
+    COMMUNICATION_CONTROL_LOCAL = 0U,             /**< 本地控制。 */
+    COMMUNICATION_CONTROL_REMOTE = 1U,            /**< 上位机已取得动作控制权。 */
+    COMMUNICATION_CONTROL_REMOTE_PAUSED = 2U,     /**< 远控已被本地安全暂停。 */
+    COMMUNICATION_CONTROL_REMOTE_SWITCHING = 3U   /**< 正在等待 0x103 远控响应。 */
+} CommunicationControlMode_e;
+
+/** 0x184 控制权事件类型。 */
+typedef enum
+{
+    COMMUNICATION_CONTROL_EVENT_REMOTE_REQUEST = 0x01U, /**< 本地申请远控。 */
+    COMMUNICATION_CONTROL_EVENT_LOCAL_PAUSE = 0x02U,    /**< 本地暂停远控。 */
+    COMMUNICATION_CONTROL_EVENT_LOCAL_TAKEOVER = 0x03U, /**< 本地接管控制权。 */
+    COMMUNICATION_CONTROL_EVENT_MODE_CHANGED = 0x04U    /**< 控制模式变化。 */
+} CommunicationControlEvent_e;
+
+/** 0x184 控制权事件原因。 */
+typedef enum
+{
+    COMMUNICATION_CONTROL_REASON_NONE = 0x00U,              /**< 无特定原因。 */
+    COMMUNICATION_CONTROL_REASON_KEY_PAUSE = 0x01U,         /**< 本地暂停键触发。 */
+    COMMUNICATION_CONTROL_REASON_KEY_RESET = 0x02U,         /**< 本地复位键触发。 */
+    COMMUNICATION_CONTROL_REASON_KEY_REMOTE = 0x03U,        /**< 本地远控键触发。 */
+    COMMUNICATION_CONTROL_REASON_PC_AUTH_SUCCESS = 0x04U,   /**< 上位机授权成功。 */
+    COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT = 0x05U, /**< 上位机在线或授权心跳超时。 */
+    COMMUNICATION_CONTROL_REASON_HANDSHAKE_TIMEOUT = 0x06U, /**< 控制权握手超时。 */
+    COMMUNICATION_CONTROL_REASON_ALARM = 0x07U,             /**< 普通报警触发。 */
+    COMMUNICATION_CONTROL_REASON_ESTOP = 0x08U,             /**< 急停触发。 */
+    COMMUNICATION_CONTROL_REASON_KEY_START = 0x09U          /**< 本地启动键恢复远控。 */
+} CommunicationControlReason_e;
+
+/** 0x103 Byte0：上位机对远控申请的动作。 */
+typedef enum
+{
+    COMMUNICATION_CONTROL_RESPONSE_ACCEPT_REMOTE = 0x01U, /**< 接受远控申请。 */
+    COMMUNICATION_CONTROL_RESPONSE_REJECT_REMOTE = 0x02U  /**< 拒绝远控申请。 */
+} CommunicationControlResponseAction_e;
+
+/** 0x103 Byte1：上位机响应远控申请的结果。 */
+typedef enum
+{
+    COMMUNICATION_CONTROL_RESPONSE_OK = 0x00U,             /**< 允许切换。 */
+    COMMUNICATION_CONTROL_RESPONSE_PC_NOT_READY = 0x01U,   /**< 上位机未准备好。 */
+    COMMUNICATION_CONTROL_RESPONSE_UNAUTHORIZED = 0x02U,   /**< 上位机认为授权无效。 */
+    COMMUNICATION_CONTROL_RESPONSE_BUSY = 0x03U,           /**< 上位机忙。 */
+    COMMUNICATION_CONTROL_RESPONSE_BAD_STATE = 0x04U,      /**< 状态不允许切换。 */
+    COMMUNICATION_CONTROL_RESPONSE_BAD_SEQ = 0x05U         /**< 握手序号不匹配。 */
+} CommunicationControlResponseResult_e;
+
+/** 通信层要求业务层执行的安全动作。 */
+typedef enum
+{
+    COMMUNICATION_SAFETY_ACTION_NONE = 0U,        /**< 无待处理动作。 */
+    COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE,     /**< 安全暂停远控输出。 */
+    COMMUNICATION_SAFETY_ACTION_TAKEOVER_LOCAL    /**< 停止远控并回到本地控制。 */
+} CommunicationSafetyAction_e;
 
 /** 板卡授权状态。 */
 typedef enum
@@ -277,6 +370,25 @@ typedef struct
     uint8_t license_type;    /**< 最近一次授权成功的 LicenseKey 类型。 */
     uint8_t flags;           /**< 最近一次授权成功的标志位。 */
 } CommunicationAuthContext_s;
+
+/** 控制权状态机运行状态。 */
+typedef struct
+{
+    uint8_t pc_connected;             /**< 3 秒内收到有效上位机帧。 */
+    uint8_t pc_authorized;            /**< 当前板卡授权是否有效。 */
+    uint8_t local_takeover_latched;   /**< 本地接管锁存。 */
+    uint8_t local_flow_running;       /**< 本地流程运行中。 */
+    uint8_t alarm_active;             /**< 普通报警有效。 */
+    uint8_t estop_active;             /**< 急停有效。 */
+    uint8_t sys_state;                /**< 对外系统状态。 */
+    uint8_t control_mode;             /**< 当前控制权模式。 */
+    uint8_t remote_resume_allowed;    /**< 本地暂停后是否允许启动键恢复远控。 */
+    uint32_t last_remote_frame_tick;  /**< 最近有效上位机帧时间。 */
+    uint32_t remote_request_tick;     /**< 最近一次远控申请时间。 */
+    uint8_t remote_request_seq;       /**< 等待 0x103 响应的序号。 */
+    uint8_t next_event_seq;           /**< 下位机控制权事件序号。 */
+    uint8_t pending_safety_action;    /**< 待业务层执行的安全动作。 */
+} CommunicationControlContext_s;
 
 /**
  * @brief 初始化上位机 CAN 通信模块。
@@ -452,6 +564,13 @@ uint8_t Communication_SendAuthResult(uint8_t auth_state,
                                      uint16_t session_timeout_sec,
                                      uint8_t seq);
 
+/** 发送 0x184 控制权事件帧。 */
+uint8_t Communication_SendControlEvent(uint8_t event,
+                                       uint8_t control_mode,
+                                       uint8_t sys_state,
+                                       uint8_t reason,
+                                       uint8_t seq);
+
 /** 获取当前授权状态。 */
 uint8_t Communication_GetAuthState(void);
 
@@ -466,6 +585,45 @@ uint32_t Communication_GetNonce(void);
 
 /** 获取授权上下文，只读使用，不要在业务层修改内容。 */
 const CommunicationAuthContext_s *Communication_GetAuthContext(void);
+
+/** 获取当前控制权模式，见 CommunicationControlMode_e。 */
+uint8_t Communication_GetControlMode(void);
+
+/** 判断当前是否真正处于上位机动作控制权。 */
+uint8_t Communication_IsRemoteControlActive(void);
+
+/** 获取控制权上下文，只读使用，不要在业务层修改内容。 */
+const CommunicationControlContext_s *Communication_GetControlContext(void);
+
+/** 同步业务层当前系统状态，影响 0x184 事件和 0x181 状态。 */
+void Communication_SetSystemState(uint8_t sys_state);
+
+/** 通知通信层本地流程已经开始，阻止授权后自动抢占本地流程。 */
+void Communication_OnLocalFlowStarted(void);
+
+/** 通知通信层本地流程已经结束。 */
+void Communication_OnLocalFlowStopped(void);
+
+/** 同步普通报警状态。 */
+void Communication_OnAlarmChanged(uint8_t active);
+
+/** 同步急停状态。 */
+void Communication_OnEStopChanged(uint8_t active);
+
+/** 本地暂停键事件。 */
+void Communication_OnLocalPauseKey(void);
+
+/** 本地启动键事件。 */
+void Communication_OnLocalStartKey(void);
+
+/** 本地复位键事件。 */
+void Communication_OnLocalResetKey(void);
+
+/** 本地远控键事件，满足条件时发送 0x184 REMOTE_REQUEST。 */
+void Communication_OnLocalRemoteKey(void);
+
+/** 读取并清除一个待执行安全动作。 */
+uint8_t Communication_ConsumeSafetyAction(void);
 
 /**
  * @brief 判断该命令当前是否允许执行。
