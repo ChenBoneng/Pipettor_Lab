@@ -21,6 +21,7 @@
 #define MACHINE_CMD_INPUT_MAX_LEN         5U
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
+#define MACHINE_CMD_DISPENSE_DONE_HOLD_MS 3000U
 #define MACHINE_CMD_REMOTE_DIR_REVERSE    0U
 #define MACHINE_CMD_REMOTE_DIR_FORWARD    1U
 #define MACHINE_CMD_REMOTE_PUMP_STOP      0U
@@ -66,6 +67,8 @@ typedef struct
     uint32_t boot_start_ms;                             // 开机页进入时间
     uint8_t manual_switches;                            // 手动调试开关位
     uint32_t measure_start_ms;                           // 活度计测量页进入时间
+    uint32_t dispense_done_start_ms;                     // 发药完成页开始保持 100% 的时间
+    uint8_t dispense_done_holding;                       // 发药完成后正在保持 100% 页面
     MachineCmdPage_e paused_page;                        // 暂停前所在运行页
     uint16_t prep_current_conc_x1000;                    // 当前活度浓度，单位 0.001mCi/ml
     uint16_t prep_current_ml_x100;                       // 当前溶液体积，单位 0.01ml
@@ -242,6 +245,28 @@ void MachineCMD_Process(void)
 
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) &&
         ((now_ms - machine_cmd.measure_start_ms) >= MACHINE_CMD_MEASURE_HOLD_MS))
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+    }
+
+    if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) &&
+        (Machine_ConsumeCombinationFinalActivityReady() != 0U))
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_MEASURE);
+    }
+
+    if (Machine_ConsumeLocalDispenseCompleted() != 0U)
+    {
+        if (machine_cmd.page == MACHINE_CMD_PAGE_DISP_RUNNING)
+        {
+            machine_cmd.dispense_done_start_ms = now_ms;
+            machine_cmd.dispense_done_holding = 1U;
+        }
+    }
+
+    if ((machine_cmd.page == MACHINE_CMD_PAGE_DISP_RUNNING) &&
+        (machine_cmd.dispense_done_holding != 0U) &&
+        ((now_ms - machine_cmd.dispense_done_start_ms) >= MACHINE_CMD_DISPENSE_DONE_HOLD_MS))
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
     }
@@ -588,6 +613,8 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
 
     if (page == MACHINE_CMD_PAGE_PREP_SETTING)
     {
+        /* 新一轮配药开始前丢弃上一次可能残留的测量完成事件。 */
+        (void)Machine_ConsumeCombinationFinalActivityReady();
         machine_cmd.prep_current_conc_x1000 = 0U;
         machine_cmd.prep_current_ml_x100 = 0U;
         machine_cmd.prep_target_conc_x1000 = 0U;
@@ -604,6 +631,19 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
     if (page == MACHINE_CMD_PAGE_PREP_MEASURE)
     {
         machine_cmd.measure_start_ms = MachineCMD_GetMs();
+    }
+
+    if (page == MACHINE_CMD_PAGE_DISP_RUNNING)
+    {
+        /* 新一次发药开始前丢弃上一次可能残留的完成事件。 */
+        (void)Machine_ConsumeLocalDispenseCompleted();
+        machine_cmd.dispense_done_start_ms = 0U;
+        machine_cmd.dispense_done_holding = 0U;
+    }
+    else
+    {
+        machine_cmd.dispense_done_start_ms = 0U;
+        machine_cmd.dispense_done_holding = 0U;
     }
 }
 
@@ -1136,20 +1176,14 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
  *
  * @param key 当前一次性按下事件。
  *
- * @note 启动键表示用户已经确认铅罐放置，页面进入活度计测量倒计时。
- *       暂停键用于先挂起 UI 流程，真实流程暂停后续应由 machine 层同步执行。
+ * @note 最终活度等待结束后由页面状态同步逻辑自动进入测量倒计时，
+ *       不再要求用户额外按启动键。暂停键仍用于挂起当前流程。
  */
 static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
 {
     if (key == KEYPAD_STATE_SEND_MEDICINE)
     {
         MachineCMD_TryEnterDispSettingPage(0U);
-        return;
-    }
-
-    if (key == KEYPAD_STATE_START)
-    {
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_MEASURE);
         return;
     }
 
@@ -2851,8 +2885,9 @@ static void MachineCMD_ShowPrepMeasurePage(void)
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
 
+    /* 轮询进入 WAITING 时继续显示最近一次有效值，避免数值和“检测中”来回闪烁。 */
     if ((ActivityMeter_GetData(&activity_data) != 0U) &&
-        (activity_data.state == ACTIVITY_METER_STATE_OK))
+        (activity_data.update_count != 0U))
     {
         memset(line, ' ', sizeof(line));
         offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_activity);

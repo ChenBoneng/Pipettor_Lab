@@ -111,6 +111,7 @@ static uint32_t machine_combo_dispense_segment_ul = 0U;
 static uint32_t machine_combo_dispense_done_ul = 0U;
 static uint8_t machine_combo_paused = 0U;
 static uint32_t machine_combo_pause_start_ms = 0U;
+static uint8_t machine_combo_final_activity_ready = 0U;
 
 static MachineDirectDispenseState_e machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
 static uint32_t machine_direct_dispense_state_start_ms = 0U;
@@ -124,6 +125,7 @@ static uint32_t machine_direct_dispense_done_ul = 0U;
 static uint8_t machine_direct_dispense_paused = 0U;
 static uint32_t machine_direct_dispense_pause_start_ms = 0U;
 static uint8_t machine_dispense_progress_percent = 0U;
+static uint8_t machine_local_dispense_completed = 0U;
 static uint8_t machine_transfer_running = 0U;
 static uint8_t machine_transfer_done = 0U;
 static uint8_t machine_transfer_activity_waiting = 0U;
@@ -451,6 +453,11 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
         }
 
         MachineCMD_ConsumeStandbyInventory(dispense_ml_x100);
+
+        if (owner == MACHINE_FLOW_OWNER_LOCAL)
+        {
+            machine_local_dispense_completed = 1U;
+        }
     }
 }
 
@@ -912,6 +919,7 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
     machine_dispense_progress_percent = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
+    machine_combo_final_activity_ready = 0U;
     machine_combo_running = 1U;
     machine_activity_wait_active = 0U;
     machine_activity_wait_started = 0U;
@@ -1078,6 +1086,10 @@ static void Machine_UpdateCombo(void)
         if (Machine_IsActivityWaitReadyForCombo(activity_wait, elapsed_ms) != 0U)
         {
             Machine_UpdateStandbyInventoryAfterPrepare((activity_wait == MACHINE_ACTIVITY_WAIT_OK) ? 1U : 0U);
+            if (machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL)
+            {
+                machine_combo_final_activity_ready = 1U;
+            }
 
             /*
              * 回退导轨时先收插针导轨（电机B），再收进罐导轨（电机A）。
@@ -1555,6 +1567,7 @@ void MachineInit(void)
     machine_combo_dispense_done_ul = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
+    machine_combo_final_activity_ready = 0U;
 
     machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
     machine_direct_dispense_state_start_ms = 0U;
@@ -1568,6 +1581,7 @@ void MachineInit(void)
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
     machine_dispense_progress_percent = 0U;
+    machine_local_dispense_completed = 0U;
     machine_transfer_running = 0U;
     machine_transfer_done = 0U;
     machine_transfer_activity_waiting = 0U;
@@ -1651,6 +1665,22 @@ uint8_t MachineCombinationTestCanDispense(void)
     }
 
     return 0U;
+}
+
+uint8_t Machine_ConsumeCombinationFinalActivityReady(void)
+{
+    uint8_t ready = machine_combo_final_activity_ready;
+
+    machine_combo_final_activity_ready = 0U;
+    return ready;
+}
+
+uint8_t Machine_ConsumeLocalDispenseCompleted(void)
+{
+    uint8_t completed = machine_local_dispense_completed;
+
+    machine_local_dispense_completed = 0U;
+    return completed;
 }
 
 uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,

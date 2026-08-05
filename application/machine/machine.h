@@ -16,6 +16,12 @@ uint8_t MachineCombinationTestIsRunning(void);
 // 判断当前组合测试流程是否已经走到允许输入发药量的阶段。
 uint8_t MachineCombinationTestCanDispense(void);
 
+// 读取并清除“本地组合流程最终活度等待已经完成”事件。
+uint8_t Machine_ConsumeCombinationFinalActivityReady(void);
+
+// 读取并清除“本地发药已经成功完成”事件。
+uint8_t Machine_ConsumeLocalDispenseCompleted(void);
+
 // 上位机启动配药流程，体积单位均为 0.01ml。
 uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                                    uint16_t final_volume_x100,
