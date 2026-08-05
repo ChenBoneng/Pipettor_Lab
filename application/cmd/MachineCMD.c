@@ -72,6 +72,9 @@ typedef struct
     uint16_t prep_target_conc_x1000;                     // 目标活度浓度，单位 0.001mCi/ml
     uint16_t dispense_ml_x100;                          // 发药体积，单位 0.01ml
     uint16_t left_ml_x100;                               // 当前可发药余量，单位 0.01ml
+    uint16_t standby_conc_x1000;                         // 待机页当前浓度，单位 0.001mCi/ml
+    uint16_t standby_activity_x100;                      // 待机页活度计实时活度，单位 0.01mCi
+    uint16_t standby_volume_ml_x100;                     // 待机页当前剩余体积，单位 0.01ml
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
     uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
     uint8_t dispense_input_error;                         // 发药输入超余量提示标志
@@ -115,6 +118,8 @@ static uint16_t MachineCMD_InputToConcX1000(void);
 static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
                                                   uint16_t current_ml_x100,
                                                   uint16_t target_conc_x1000);
+static uint16_t MachineCMD_ActivityToMciX100(const ActivityMeterData_s *activity_data);
+static void MachineCMD_UpdateStandbyActivityFromMeter(void);
 static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10);
 static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100);
 static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000);
@@ -522,6 +527,38 @@ uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100)
     return 1U;
 }
 
+void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
+                                    uint16_t activity_x100,
+                                    uint16_t volume_ml_x100)
+{
+    machine_cmd.standby_conc_x1000 = conc_x1000;
+    machine_cmd.standby_activity_x100 = activity_x100;
+    machine_cmd.standby_volume_ml_x100 = volume_ml_x100;
+
+    /* 发药设置页的超余量判断仍然按“剩余可发体积”拦截。 */
+    machine_cmd.left_ml_x100 = volume_ml_x100;
+}
+
+void MachineCMD_ConsumeStandbyInventory(uint16_t volume_ml_x100)
+{
+    uint16_t next_volume_ml_x100;
+    if ((volume_ml_x100 == 0U) || (machine_cmd.standby_volume_ml_x100 == 0U))
+    {
+        return;
+    }
+
+    if (volume_ml_x100 >= machine_cmd.standby_volume_ml_x100)
+    {
+        MachineCMD_SetStandbyInventory(0U, 0U, 0U);
+        return;
+    }
+
+    next_volume_ml_x100 = machine_cmd.standby_volume_ml_x100 - volume_ml_x100;
+    MachineCMD_SetStandbyInventory(machine_cmd.standby_conc_x1000,
+                                   machine_cmd.standby_activity_x100,
+                                   next_volume_ml_x100);
+}
+
 /**
  * @brief 获取 DWT 毫秒时间轴。
  *
@@ -866,6 +903,95 @@ static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
     }
 
     return (uint16_t)final_ml_x100;
+}
+
+/**
+ * @brief 将 RAM-100 活度读数统一换算为 mCi * 100。
+ *
+ * @param activity_data 活度计最近一次有效数据。
+ * @return 活度，单位 0.01mCi；没有有效读数时返回 0。
+ *
+ * @note 待机页“活度”只反映活度计实时读数，不再由目标浓度和体积反算。
+ */
+static uint16_t MachineCMD_ActivityToMciX100(const ActivityMeterData_s *activity_data)
+{
+    float activity_mci;
+
+    if ((activity_data == NULL) ||
+        (activity_data->state != ACTIVITY_METER_STATE_OK) ||
+        (activity_data->update_count == 0U))
+    {
+        return 0U;
+    }
+
+    switch (activity_data->activity_unit)
+    {
+    case ACTIVITY_METER_UNIT_UCI:
+        activity_mci = activity_data->activity / 1000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_MCI:
+        activity_mci = activity_data->activity;
+        break;
+
+    case ACTIVITY_METER_UNIT_CI:
+        activity_mci = activity_data->activity * 1000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_BQ:
+        activity_mci = activity_data->activity / 37000000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_KBQ:
+        activity_mci = activity_data->activity / 37000.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_MBQ:
+        activity_mci = activity_data->activity / 37.0f;
+        break;
+
+    case ACTIVITY_METER_UNIT_GBQ:
+        activity_mci = activity_data->activity * 27.027027f;
+        break;
+
+    default:
+        return 0U;
+    }
+
+    if (activity_mci <= 0.0f)
+    {
+        return 0U;
+    }
+    if (activity_mci >= 655.35f)
+    {
+        return 0xFFFFU;
+    }
+
+    return (uint16_t)((activity_mci * 100.0f) + 0.5f);
+}
+
+/**
+ * @brief 用活度计最新成功读数刷新待机页活度。
+ *
+ * @note 只在有 OK 读数时覆盖，通信异常时保留上一笔有效活度，避免待机页闪成 0。
+ */
+static void MachineCMD_UpdateStandbyActivityFromMeter(void)
+{
+    ActivityMeterData_s activity_data;
+    uint16_t activity_x100;
+
+    memset(&activity_data, 0, sizeof(activity_data));
+    if (ActivityMeter_GetData(&activity_data) == 0U)
+    {
+        return;
+    }
+
+    if ((activity_data.state == ACTIVITY_METER_STATE_OK) &&
+        (activity_data.update_count != 0U))
+    {
+        activity_x100 = MachineCMD_ActivityToMciX100(&activity_data);
+        machine_cmd.standby_activity_x100 = activity_x100;
+    }
 }
 
 /**
@@ -1633,8 +1759,16 @@ static void MachineCMD_HandleRemoteActivityRead(uint8_t seq)
 
     if (Machine_IsTransferToActivityDone() == 0U)
     {
+        state = (uint8_t)ActivityMeter_GetState();
+        if ((state != (uint8_t)ACTIVITY_METER_STATE_TIMEOUT) &&
+            (state != (uint8_t)ACTIVITY_METER_STATE_CRC_ERROR) &&
+            (state != (uint8_t)ACTIVITY_METER_STATE_BAD_RESPONSE))
+        {
+            state = COMMUNICATION_ACTIVITY_NOT_READ;
+        }
+
         (void)MachineCMD_SendActivityState(&activity_data,
-                                           COMMUNICATION_ACTIVITY_NOT_READ,
+                                           state,
                                            seq);
         return;
     }
@@ -2259,7 +2393,16 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
     activity_state = (uint8_t)ActivityMeter_GetState();
     if (Machine_IsTransferToActivityDone() == 0U)
     {
-        status.activity_state = COMMUNICATION_ACTIVITY_NOT_READ;
+        if ((activity_state == (uint8_t)COMMUNICATION_ACTIVITY_TIMEOUT) ||
+            (activity_state == (uint8_t)COMMUNICATION_ACTIVITY_CRC_ERROR) ||
+            (activity_state == (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE))
+        {
+            status.activity_state = activity_state;
+        }
+        else
+        {
+            status.activity_state = COMMUNICATION_ACTIVITY_NOT_READ;
+        }
     }
     else
     {
@@ -2600,15 +2743,40 @@ static void MachineCMD_ShowReadyPage(void)
 /**
  * @brief 显示待机看板页。
  *
- * @note 当前浓度、余量、体积先使用占位值。后续接入活度计和业务状态后，
- *       只需要替换对应 GB2312 + ASCII 混合行内容。
+ * @note 浓度显示配药后的目标浓度；活度来自 RAM-100 最新有效读数；体积仍表示当前可发药体积。
  */
 static void MachineCMD_ShowStandbyPage(void)
 {
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    char ascii[12];
+
+    MachineCMD_UpdateStandbyActivityFromMeter();
+
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_standby);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_conc);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_left);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_volume);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_concentration);
+    MachineCMD_FormatConcX1000Ascii(ascii, sizeof(ascii), machine_cmd.standby_conc_x1000);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    (void)MachineCMD_LineAppendString(line, offset, "mCi/ml");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_activity);
+    MachineCMD_FormatFixed1Ascii(ascii,
+                                 sizeof(ascii),
+                                 ((uint32_t)machine_cmd.standby_activity_x100 + 5U) / 10U);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    (void)MachineCMD_LineAppendString(line, offset, "mCi");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_volume_prefix);
+    MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.standby_volume_ml_x100);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    (void)MachineCMD_LineAppendString(line, offset, "ml");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_4, line, sizeof(line));
 }
 
 /**

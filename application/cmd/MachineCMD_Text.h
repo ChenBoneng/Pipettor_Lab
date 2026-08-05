@@ -27,7 +27,6 @@ extern const MachineCmdText_s machine_cmd_text_system_ready;
 extern const MachineCmdText_s machine_cmd_text_any_key_start;
 extern const MachineCmdText_s machine_cmd_text_standby;
 extern const MachineCmdText_s machine_cmd_text_conc;
-extern const MachineCmdText_s machine_cmd_text_left;
 extern const MachineCmdText_s machine_cmd_text_volume;
 extern const MachineCmdText_s machine_cmd_text_prep_title;
 extern const MachineCmdText_s machine_cmd_text_prep_step1;

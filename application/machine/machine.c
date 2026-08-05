@@ -7,6 +7,7 @@
 #include "Communication.h"
 #include "activity_meter.h"
 #include "main.h"
+#include <string.h>
 
 /*
  * 配药/发药整机测试流程：
@@ -30,7 +31,7 @@
 #define MACHINE_COMBO_STEP_SPEED_MM_S_X100       2000U
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
-#define MACHINE_COMBO_PUMP2_SEGMENT_UL           PUMP_DRIVE_PUMP2_FULL_STROKE_UL
+#define MACHINE_DISPENSE_PUMP_SEGMENT_UL         PUMP_DRIVE_PUMP2_FULL_STROKE_UL
 #define MACHINE_TRANSFER_TO_ACTIVITY_MS           2000U
 
 typedef enum
@@ -46,6 +47,8 @@ typedef enum
     MACHINE_COMBO_STATE_CALC_WATER,            // 根据当前浓度和目标浓度计算补水量
     MACHINE_COMBO_STATE_WATER_VALVE_ON,        // 打开电磁阀 1（水路阀）
     MACHINE_COMBO_STATE_GAP_AFTER_VALVE,       // 阀门动作后的间隔
+    MACHINE_COMBO_STATE_PUMP1_ENABLE,          // 使能泵1，避免未使能时体积命令不动作
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE, // 泵1使能后的 RS485 间隔
     MACHINE_COMBO_STATE_PUMP1_WATER_IN,        // 泵1抽取纯净水
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP1,       // 泵1动作后的间隔
     MACHINE_COMBO_STATE_WATER_PUMP_ON,         // 抽水泵抽纯净水进入活度计
@@ -80,6 +83,13 @@ typedef enum
     MACHINE_FLOW_OWNER_LOCAL = 0,  // 本地 LCD/按键启动的流程
     MACHINE_FLOW_OWNER_REMOTE      // 上位机协议启动的流程
 } MachineFlowOwner_e;
+
+typedef enum
+{
+    MACHINE_ACTIVITY_WAIT_PENDING = 0, // 活度计读数仍在等待中
+    MACHINE_ACTIVITY_WAIT_OK,          // 已收到进入等待状态后的新读数
+    MACHINE_ACTIVITY_WAIT_ERROR        // 活度计通信超时、CRC 错误或响应格式错误
+} MachineActivityWaitResult_e;
 
 static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
@@ -116,7 +126,12 @@ static uint32_t machine_direct_dispense_pause_start_ms = 0U;
 static uint8_t machine_dispense_progress_percent = 0U;
 static uint8_t machine_transfer_running = 0U;
 static uint8_t machine_transfer_done = 0U;
+static uint8_t machine_transfer_activity_waiting = 0U;
 static uint32_t machine_transfer_start_ms = 0U;
+static uint8_t machine_activity_wait_active = 0U;
+static uint8_t machine_activity_wait_started = 0U;
+static uint32_t machine_activity_wait_start_ms = 0U;
+static uint32_t machine_activity_wait_update_count = 0U;
 
 static uint32_t Machine_GetMs(void);
 static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
@@ -129,8 +144,9 @@ static void Machine_StopComboOutputs(void);
 static void Machine_AbortCombo(void);
 static void Machine_PauseCombo(void);
 static void Machine_ResumeCombo(void);
-static void Machine_StopPump2Output(void);
-static uint8_t Machine_StartPump2DispenseSegment(void);
+static PumpDrive_s *Machine_GetDispensePump(void);
+static void Machine_StopDispensePumpOutput(void);
+static uint8_t Machine_StartDispensePumpSegment(void);
 static void Machine_StartCombo(uint16_t current_conc_x1000,
                                uint16_t current_ml_x100,
                                uint16_t target_conc_x1000,
@@ -146,8 +162,15 @@ static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOw
 static void Machine_UpdateDirectDispense(void);
 static void Machine_AbortTransferToActivity(void);
 static void Machine_UpdateTransferToActivity(void);
+static void Machine_BeginActivityWait(void);
+static MachineActivityWaitResult_e Machine_UpdateActivityWait(uint32_t stable_delay_ms);
+static uint8_t Machine_IsActivityMeterErrorState(ActivityMeterState_e state);
 static uint8_t Machine_IsRemoteFlowBlocked(MachineFlowOwner_e owner);
 static uint16_t Machine_GetMeasuredActivityMciX100(void);
+static uint16_t Machine_GetPreparedVolumeMlX100(void);
+static void Machine_UpdateStandbyInventoryAfterPrepare(uint8_t use_measured_activity);
+static uint8_t Machine_IsActivityWaitReadyForCombo(MachineActivityWaitResult_e result,
+                                                   uint32_t elapsed_ms);
 static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner);
 static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step);
 
@@ -307,6 +330,78 @@ static uint16_t Machine_GetMeasuredActivityMciX100(void)
 }
 
 /**
+ * @brief 读取本次配药完成后的理论体积。
+ *
+ * @return 体积，单位 0.01ml。
+ *
+ * @note 本地配药的补水量由下位机计算，单位是 ul，需要换算回 0.01ml；
+ *       远程配药的最终体积由上位机随 PREPARE_VOLUME_PARAM 下发，优先使用该值。
+ */
+static uint16_t Machine_GetPreparedVolumeMlX100(void)
+{
+    uint32_t volume_ml_x100;
+
+    if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
+        (machine_combo_remote_volume_valid != 0U))
+    {
+        return machine_combo_remote_final_ml_x100;
+    }
+
+    volume_ml_x100 = (uint32_t)machine_combo_current_ml_x100 +
+                     (machine_combo_water_ul / 10U);
+    if (volume_ml_x100 > 0xFFFFU)
+    {
+        volume_ml_x100 = 0xFFFFU;
+    }
+
+    return (uint16_t)volume_ml_x100;
+}
+
+/**
+ * @brief 配药完成后同步待机页浓度、活度和体积。
+ *
+ * @note 浓度显示本次输入的目标浓度；活度只来自 RAM-100 当前有效读数，不再用
+ *       “目标浓度 * 体积”反算；体积继续使用本次配药后的理论最终体积。
+ */
+static void Machine_UpdateStandbyInventoryAfterPrepare(uint8_t use_measured_activity)
+{
+    uint16_t volume_ml_x100 = Machine_GetPreparedVolumeMlX100();
+    uint16_t activity_x100 = 0U;
+
+    if (use_measured_activity != 0U)
+    {
+        activity_x100 = Machine_GetMeasuredActivityMciX100();
+    }
+
+    MachineCMD_SetStandbyInventory(machine_combo_target_conc_x1000,
+                                   activity_x100,
+                                   volume_ml_x100);
+}
+
+/**
+ * @brief 判断组合配药流程是否可以离开活度等待状态。
+ *
+ * @note 本地按键流程要保证机械动作能走完，活度计读数作为检测更新库存，不能把泵和导轨永久卡住；
+ *       上位机远控流程则继续严格等待真实新读数，保证协议结果可追溯。
+ */
+static uint8_t Machine_IsActivityWaitReadyForCombo(MachineActivityWaitResult_e result,
+                                                   uint32_t elapsed_ms)
+{
+    if (result == MACHINE_ACTIVITY_WAIT_OK)
+    {
+        return 1U;
+    }
+
+    if ((machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL) &&
+        (elapsed_ms >= MACHINE_COMBO_ACTIVITY_STABLE_MS))
+    {
+        return 1U;
+    }
+
+    return 0U;
+}
+
+/**
  * @brief 同步流程开始状态给通信层。
  */
 static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner)
@@ -324,6 +419,7 @@ static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner)
 static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
 {
     uint16_t measured_activity_x100;
+    uint16_t dispense_ml_x100 = 0U;
 
     if (owner == MACHINE_FLOW_OWNER_LOCAL)
     {
@@ -341,6 +437,20 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
         (void)Communication_SendPrepareResult(machine_combo_remote_final_ml_x100,
                                               measured_activity_x100,
                                               machine_combo_remote_seq);
+    }
+
+    if (step == COMMUNICATION_STEP_DISPENSE_DONE)
+    {
+        if (machine_combo_dispense_ul != 0U)
+        {
+            dispense_ml_x100 = machine_combo_dispense_ml_x100;
+        }
+        else if (machine_direct_dispense_ul != 0U)
+        {
+            dispense_ml_x100 = machine_direct_dispense_ml_x100;
+        }
+
+        MachineCMD_ConsumeStandbyInventory(dispense_ml_x100);
     }
 }
 
@@ -374,13 +484,23 @@ static void Machine_StopComboOutputs(void)
 }
 
 /**
- * @brief 只停止泵2输出。
+ * @brief 获取现场用于发药的定量泵。
  *
- * @note 待机直接发药流程只涉及泵2，不应该顺手改动导杆、阀门、抽水泵或泵1。
+ * @note 发药流程使用泵2；泵1只在配药补水阶段抽取纯净水。
  */
-static void Machine_StopPump2Output(void)
+static PumpDrive_s *Machine_GetDispensePump(void)
 {
-    PumpDrive_s *pump = PumpDrive_GetPump2();
+    return PumpDrive_GetPump2();
+}
+
+/**
+ * @brief 只停止发药定量泵输出。
+ *
+ * @note 待机直接发药流程只涉及发药泵，不应该顺手改动导杆、阀门或抽水泵。
+ */
+static void Machine_StopDispensePumpOutput(void)
+{
+    PumpDrive_s *pump = Machine_GetDispensePump();
 
     if (pump != NULL)
     {
@@ -400,6 +520,8 @@ static void Machine_AbortCombo(void)
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_dispense_segment_ul = 0U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
 }
 
 /**
@@ -444,14 +566,13 @@ static void Machine_ResumeCombo(void)
 }
 
 /**
- * @brief 启动泵2的一段发药吸液。
+ * @brief 启动发药泵的一段吸液。
  *
- * 泵2满行程为 100ul。发 1ml 时不再一次下发 16000 步，
- * 而是拆成 10 段，每段 100ul，便于暂停和后续光电门校准。
+ * 发药泵按满行程体积分段，避免一次下发过大步数，也便于暂停和后续光电门校准。
  */
-static uint8_t Machine_StartPump2DispenseSegment(void)
+static uint8_t Machine_StartDispensePumpSegment(void)
 {
-    PumpDrive_s *pump = PumpDrive_GetPump2();
+    PumpDrive_s *pump = Machine_GetDispensePump();
     uint32_t segment_ul;
 
     if ((pump == NULL) || (machine_combo_dispense_remaining_ul == 0U))
@@ -463,9 +584,9 @@ static uint8_t Machine_StartPump2DispenseSegment(void)
     if (segment_ul == 0U)
     {
         segment_ul = machine_combo_dispense_remaining_ul;
-        if (segment_ul > MACHINE_COMBO_PUMP2_SEGMENT_UL)
+        if (segment_ul > MACHINE_DISPENSE_PUMP_SEGMENT_UL)
         {
-            segment_ul = MACHINE_COMBO_PUMP2_SEGMENT_UL;
+            segment_ul = MACHINE_DISPENSE_PUMP_SEGMENT_UL;
         }
     }
 
@@ -476,6 +597,107 @@ static uint8_t Machine_StartPump2DispenseSegment(void)
 
     machine_combo_dispense_segment_ul = segment_ul;
     return 1U;
+}
+
+/**
+ * @brief 启动一次活度计读数等待。
+ *
+ * @note 活度计模块本身会周期轮询，但整机流程需要确认“进入本步骤以后”的新读数，
+ *       不能直接使用旧缓存。因此这里记录当前 update_count，再主动请求一次读取；
+ *       如果底层已经处于 WAITING，说明已有一帧读命令在路上，直接接管这次等待。
+ */
+static void Machine_BeginActivityWait(void)
+{
+    ActivityMeterData_s activity_data;
+
+    memset(&activity_data, 0, sizeof(activity_data));
+    (void)ActivityMeter_GetData(&activity_data);
+
+    machine_activity_wait_active = 1U;
+    machine_activity_wait_started = 0U;
+    machine_activity_wait_start_ms = Machine_GetMs();
+    machine_activity_wait_update_count = activity_data.update_count;
+
+    if (ActivityMeter_GetState() == ACTIVITY_METER_STATE_WAITING)
+    {
+        machine_activity_wait_started = 1U;
+    }
+    else if (ActivityMeter_RequestRead() != 0U)
+    {
+        machine_activity_wait_started = 1U;
+    }
+}
+
+/**
+ * @brief 判断活度计状态是否为本次流程不可继续的通信错误。
+ */
+static uint8_t Machine_IsActivityMeterErrorState(ActivityMeterState_e state)
+{
+    return ((state == ACTIVITY_METER_STATE_TIMEOUT) ||
+            (state == ACTIVITY_METER_STATE_CRC_ERROR) ||
+            (state == ACTIVITY_METER_STATE_BAD_RESPONSE)) ? 1U : 0U;
+}
+
+/**
+ * @brief 推进当前活度计读数等待。
+ *
+ * @param stable_delay_ms 读数等待状态至少保留的时间，单位 ms；0 表示收到新读数即可继续。
+ * @return MACHINE_ACTIVITY_WAIT_PENDING/OK/ERROR。
+ */
+static MachineActivityWaitResult_e Machine_UpdateActivityWait(uint32_t stable_delay_ms)
+{
+    ActivityMeterData_s activity_data;
+    ActivityMeterState_e state;
+    uint32_t elapsed_ms;
+
+    if (machine_activity_wait_active == 0U)
+    {
+        Machine_BeginActivityWait();
+    }
+
+    if (machine_activity_wait_started == 0U)
+    {
+        if (ActivityMeter_GetState() == ACTIVITY_METER_STATE_WAITING)
+        {
+            machine_activity_wait_started = 1U;
+        }
+        else if (ActivityMeter_RequestRead() != 0U)
+        {
+            machine_activity_wait_started = 1U;
+        }
+        else
+        {
+            return MACHINE_ACTIVITY_WAIT_PENDING;
+        }
+    }
+
+    memset(&activity_data, 0, sizeof(activity_data));
+    (void)ActivityMeter_GetData(&activity_data);
+    state = ActivityMeter_GetState();
+
+    if ((activity_data.state == ACTIVITY_METER_STATE_OK) &&
+        (activity_data.update_count != machine_activity_wait_update_count))
+    {
+        elapsed_ms = Machine_GetMs() - machine_activity_wait_start_ms;
+        if (elapsed_ms >= stable_delay_ms)
+        {
+            machine_activity_wait_active = 0U;
+            machine_activity_wait_started = 0U;
+            return MACHINE_ACTIVITY_WAIT_OK;
+        }
+
+        return MACHINE_ACTIVITY_WAIT_PENDING;
+    }
+
+    if ((machine_activity_wait_started != 0U) &&
+        (Machine_IsActivityMeterErrorState(state) != 0U))
+    {
+        machine_activity_wait_active = 0U;
+        machine_activity_wait_started = 0U;
+        return MACHINE_ACTIVITY_WAIT_ERROR;
+    }
+
+    return MACHINE_ACTIVITY_WAIT_PENDING;
 }
 
 /**
@@ -553,6 +775,17 @@ static void Machine_ExecuteComboState(void)
                                      SOLENOID_VALVE_STATE_ON_NC_OPEN);
         break;
 
+    case MACHINE_COMBO_STATE_PUMP1_ENABLE:
+        /*
+         * 泵1和泵2同属 ISC1000 定量泵，体积运动前都需要确认电机处于使能态。
+         * 使能命令单独占一个状态，避免紧跟 in 命令时被 RS485 一问一答保护挡住。
+         */
+        if (PumpDrive_Enable(PumpDrive_GetPump1()) != 0U)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE);
+        }
+        break;
+
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
         if (machine_combo_water_ul == 0U)
         {
@@ -589,7 +822,7 @@ static void Machine_ExecuteComboState(void)
          * 泵2发药前先显式使能，并等待一个状态间隔后再发 in 命令。
          * 这样避免上一条 stop / set / sta 命令后的 RS485 一问一答保护挡住吸液命令。
          */
-        if (PumpDrive_Enable(PumpDrive_GetPump2()) != 0U)
+        if (PumpDrive_Enable(Machine_GetDispensePump()) != 0U)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE);
         }
@@ -610,10 +843,15 @@ static void Machine_ExecuteComboState(void)
             break;
         }
 
-        if (Machine_StartPump2DispenseSegment() == 0U)
+        if (Machine_StartDispensePumpSegment() == 0U)
         {
             Machine_AbortCombo();
         }
+        break;
+
+    case MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY:
+    case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
+        Machine_BeginActivityWait();
         break;
 
     case MACHINE_COMBO_STATE_FINISHED:
@@ -636,10 +874,9 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_IDLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_A:
     case MACHINE_COMBO_STATE_GAP_AFTER_B:
-    case MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY:
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
-    case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
     case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
     case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
@@ -676,6 +913,8 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_running = 1U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
 
     Machine_StopComboOutputs();
     Machine_NotifyFlowStarted(owner);
@@ -688,6 +927,7 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
 static void Machine_UpdateCombo(void)
 {
     uint32_t elapsed_ms;
+    MachineActivityWaitResult_e activity_wait;
 
     if (machine_combo_running == 0U)
     {
@@ -759,9 +999,15 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY:
-        if (elapsed_ms >= MACHINE_COMBO_ACTIVITY_STABLE_MS)
+        activity_wait = Machine_UpdateActivityWait(MACHINE_COMBO_ACTIVITY_STABLE_MS);
+        if (Machine_IsActivityWaitReadyForCombo(activity_wait, elapsed_ms) != 0U)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_CALC_WATER);
+        }
+        else if ((activity_wait == MACHINE_ACTIVITY_WAIT_ERROR) &&
+                 (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL))
+        {
+            Machine_AbortCombo();
         }
         break;
 
@@ -774,6 +1020,24 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            if (machine_combo_water_ul == 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_ENABLE);
+            }
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_ENABLE:
+        Machine_ExecuteComboState();
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_WATER_IN);
@@ -810,13 +1074,21 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
-        if (elapsed_ms >= MACHINE_COMBO_ACTIVITY_STABLE_MS)
+        activity_wait = Machine_UpdateActivityWait(MACHINE_COMBO_ACTIVITY_STABLE_MS);
+        if (Machine_IsActivityWaitReadyForCombo(activity_wait, elapsed_ms) != 0U)
         {
+            Machine_UpdateStandbyInventoryAfterPrepare((activity_wait == MACHINE_ACTIVITY_WAIT_OK) ? 1U : 0U);
+
             /*
              * 回退导轨时先收插针导轨（电机B），再收进罐导轨（电机A）。
              * 插针先退出可以先解除针头和瓶口/管路的机械约束，再移动进罐方向。
              */
             Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_B_HOME);
+        }
+        else if ((activity_wait == MACHINE_ACTIVITY_WAIT_ERROR) &&
+                 (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL))
+        {
+            Machine_AbortCombo();
         }
         break;
 
@@ -878,7 +1150,7 @@ static void Machine_UpdateCombo(void)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
         }
-        else if (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U)
+        else if (PumpDrive_IsMoveDone(Machine_GetDispensePump()) != 0U)
         {
             if (machine_combo_dispense_remaining_ul >= machine_combo_dispense_segment_ul)
             {
@@ -933,13 +1205,13 @@ static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_s
 }
 
 /**
- * @brief 启动待机直接发药的一段泵2吸液。
+ * @brief 启动待机直接发药的一段发药泵吸液。
  *
- * @return 1 表示本段动作已经下发；0 表示泵2不可用或启动失败。
+ * @return 1 表示本段动作已经下发；0 表示发药泵不可用或启动失败。
  */
 static uint8_t Machine_StartDirectDispenseSegment(void)
 {
-    PumpDrive_s *pump = PumpDrive_GetPump2();
+    PumpDrive_s *pump = Machine_GetDispensePump();
     uint32_t segment_ul;
 
     if ((pump == NULL) || (machine_direct_dispense_remaining_ul == 0U))
@@ -951,9 +1223,9 @@ static uint8_t Machine_StartDirectDispenseSegment(void)
     if (segment_ul == 0U)
     {
         segment_ul = machine_direct_dispense_remaining_ul;
-        if (segment_ul > MACHINE_COMBO_PUMP2_SEGMENT_UL)
+        if (segment_ul > MACHINE_DISPENSE_PUMP_SEGMENT_UL)
         {
-            segment_ul = MACHINE_COMBO_PUMP2_SEGMENT_UL;
+            segment_ul = MACHINE_DISPENSE_PUMP_SEGMENT_UL;
         }
     }
 
@@ -974,7 +1246,7 @@ static void Machine_ExecuteDirectDispenseState(void)
     switch (machine_direct_dispense_state)
     {
     case MACHINE_DIRECT_DISPENSE_STATE_ENABLE:
-        if (PumpDrive_Enable(PumpDrive_GetPump2()) != 0U)
+        if (PumpDrive_Enable(Machine_GetDispensePump()) != 0U)
         {
             Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE);
         }
@@ -1008,7 +1280,7 @@ static void Machine_ExecuteDirectDispenseState(void)
         {
             machine_dispense_progress_percent = 100U;
         }
-        Machine_StopPump2Output();
+        Machine_StopDispensePumpOutput();
         Machine_NotifyFlowStopped(machine_direct_dispense_owner,
                                   (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FINISHED) ?
                                   COMMUNICATION_STEP_DISPENSE_DONE :
@@ -1030,7 +1302,7 @@ static void Machine_ExecuteDirectDispenseState(void)
 static void Machine_AbortDirectDispense(void)
 {
     Machine_NotifyFlowStopped(machine_direct_dispense_owner, COMMUNICATION_STEP_FAILED);
-    Machine_StopPump2Output();
+    Machine_StopDispensePumpOutput();
     machine_direct_dispense_running = 0U;
     machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_ERROR;
     machine_direct_dispense_paused = 0U;
@@ -1048,7 +1320,7 @@ static void Machine_PauseDirectDispense(void)
         return;
     }
 
-    Machine_StopPump2Output();
+    Machine_StopDispensePumpOutput();
     machine_direct_dispense_paused = 1U;
     machine_direct_dispense_pause_start_ms = Machine_GetMs();
 }
@@ -1149,7 +1421,7 @@ static void Machine_UpdateDirectDispense(void)
         {
             Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FINISHED);
         }
-        else if (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) != 0U)
+        else if (PumpDrive_IsMoveDone(Machine_GetDispensePump()) != 0U)
         {
             if (machine_direct_dispense_remaining_ul >= machine_direct_dispense_segment_ul)
             {
@@ -1206,7 +1478,10 @@ static void Machine_AbortTransferToActivity(void)
 
     machine_transfer_running = 0U;
     machine_transfer_done = 0U;
+    machine_transfer_activity_waiting = 0U;
     machine_transfer_start_ms = 0U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
 }
 
 /**
@@ -1218,6 +1493,7 @@ static void Machine_AbortTransferToActivity(void)
 static void Machine_UpdateTransferToActivity(void)
 {
     uint32_t now_ms;
+    MachineActivityWaitResult_e activity_wait;
 
     if (machine_transfer_running == 0U)
     {
@@ -1231,12 +1507,30 @@ static void Machine_UpdateTransferToActivity(void)
     }
 
     now_ms = Machine_GetMs();
-    if ((uint32_t)(now_ms - machine_transfer_start_ms) >= MACHINE_TRANSFER_TO_ACTIVITY_MS)
+    if (machine_transfer_activity_waiting == 0U)
+    {
+        if ((uint32_t)(now_ms - machine_transfer_start_ms) < MACHINE_TRANSFER_TO_ACTIVITY_MS)
+        {
+            return;
+        }
+
+        machine_transfer_activity_waiting = 1U;
+        Machine_BeginActivityWait();
+        return;
+    }
+
+    activity_wait = Machine_UpdateActivityWait(0U);
+    if (activity_wait == MACHINE_ACTIVITY_WAIT_OK)
     {
         machine_transfer_running = 0U;
         machine_transfer_done = 1U;
+        machine_transfer_activity_waiting = 0U;
         machine_transfer_start_ms = 0U;
         Communication_SetSystemState(COMMUNICATION_SYS_IDLE);
+    }
+    else if (activity_wait == MACHINE_ACTIVITY_WAIT_ERROR)
+    {
+        Machine_AbortTransferToActivity();
     }
 }
 
@@ -1276,7 +1570,10 @@ void MachineInit(void)
     machine_dispense_progress_percent = 0U;
     machine_transfer_running = 0U;
     machine_transfer_done = 0U;
+    machine_transfer_activity_waiting = 0U;
     machine_transfer_start_ms = 0U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
 
     Machine_StopComboOutputs();
 }
@@ -1409,7 +1706,10 @@ uint8_t Machine_StartRemoteTransferToActivity(void)
 
     machine_transfer_running = 1U;
     machine_transfer_done = 0U;
+    machine_transfer_activity_waiting = 0U;
     machine_transfer_start_ms = Machine_GetMs();
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
     Communication_SetSystemState(COMMUNICATION_SYS_RUNNING);
     return 1U;
 }
@@ -1480,6 +1780,8 @@ uint8_t Machine_GetCommunicationStep(void)
     case MACHINE_COMBO_STATE_CALC_WATER:
     case MACHINE_COMBO_STATE_WATER_VALVE_ON:
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
+    case MACHINE_COMBO_STATE_PUMP1_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE:
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
     case MACHINE_COMBO_STATE_WATER_PUMP_ON:

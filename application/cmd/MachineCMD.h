@@ -73,4 +73,10 @@ uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *current_conc_x1000,
 // 读取并清除“发药量已经确认”事件，volume_ml_x100 单位为 0.01ml。
 uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100);
 
+/* 待机页库存状态接口，供 machine 层在流程完成时同步真实数据。 */
+void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
+                                    uint16_t activity_x100,
+                                    uint16_t volume_ml_x100);
+void MachineCMD_ConsumeStandbyInventory(uint16_t volume_ml_x100);
+
 #endif //MACHINECMD_H
