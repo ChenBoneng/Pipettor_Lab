@@ -2071,7 +2071,8 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
             result = COMMUNICATION_RESULT_BAD_PARAM;
             error = COMMUNICATION_ERROR_BAD_PARAM;
         }
-        else if (Machine_StartRemoteDispense(machine_cmd.remote_dispense_volume_x100) != 0U)
+        else if (Machine_StartRemoteDispense(machine_cmd.remote_dispense_volume_x100,
+                                             command->seq) != 0U)
         {
             machine_cmd.remote_dispense_param_ready = 0U;
         }

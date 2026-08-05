@@ -32,6 +32,7 @@
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
 #define MACHINE_DISPENSE_PUMP_SEGMENT_UL         PUMP_DRIVE_PUMP2_FULL_STROKE_UL
+#define MACHINE_REMOTE_DISPENSE_DONE_HOLD_MS     (COMMUNICATION_STATUS_PERIOD_MS * 2U)
 
 typedef enum
 {
@@ -124,6 +125,8 @@ static uint32_t machine_direct_dispense_segment_ul = 0U;
 static uint32_t machine_direct_dispense_done_ul = 0U;
 static uint8_t machine_direct_dispense_paused = 0U;
 static uint32_t machine_direct_dispense_pause_start_ms = 0U;
+static uint8_t machine_direct_dispense_seq = 0U;
+static uint32_t machine_remote_dispense_done_until_ms = 0U;
 static uint8_t machine_dispense_progress_percent = 0U;
 static uint8_t machine_local_dispense_completed = 0U;
 static uint8_t machine_transfer_done = 0U;
@@ -452,6 +455,17 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
         if (owner == MACHINE_FLOW_OWNER_LOCAL)
         {
             machine_local_dispense_completed = 1U;
+        }
+        else
+        {
+            machine_remote_dispense_done_until_ms =
+                Machine_GetMs() + MACHINE_REMOTE_DISPENSE_DONE_HOLD_MS;
+            (void)Communication_SendAck(COMMUNICATION_CMD_START_PROCESS,
+                                        COMMUNICATION_OBJ_SYSTEM,
+                                        COMMUNICATION_RESULT_OK,
+                                        COMMUNICATION_ERROR_NONE,
+                                        COMMUNICATION_STEP_DISPENSE_DONE,
+                                        machine_direct_dispense_seq);
         }
     }
 }
@@ -1518,6 +1532,8 @@ void MachineInit(void)
     machine_direct_dispense_done_ul = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
+    machine_direct_dispense_seq = 0U;
+    machine_remote_dispense_done_until_ms = 0U;
     machine_dispense_progress_percent = 0U;
     machine_local_dispense_completed = 0U;
     machine_transfer_done = 0U;
@@ -1676,7 +1692,7 @@ uint8_t Machine_IsTransferToActivityDone(void)
     return (machine_transfer_done != 0U) ? 1U : 0U;
 }
 
-uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100)
+uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq)
 {
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
@@ -1686,6 +1702,8 @@ uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100)
         return 0U;
     }
 
+    machine_direct_dispense_seq = seq;
+    machine_remote_dispense_done_until_ms = 0U;
     Machine_StartDirectDispense(volume_ml_x100, MACHINE_FLOW_OWNER_REMOTE);
     return 1U;
 }
@@ -1711,6 +1729,14 @@ uint8_t Machine_GetCommunicationStep(void)
 
     if (machine_combo_running == 0U)
     {
+        if ((machine_remote_dispense_done_until_ms != 0U) &&
+            ((int32_t)(machine_remote_dispense_done_until_ms - Machine_GetMs()) > 0))
+        {
+            return COMMUNICATION_STEP_DISPENSE_DONE;
+        }
+
+        machine_remote_dispense_done_until_ms = 0U;
+
         if (machine_transfer_done != 0U)
         {
             return COMMUNICATION_STEP_TRANSFER_DONE;

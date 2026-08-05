@@ -480,6 +480,7 @@ uint8_t Communication_SendFrame(uint16_t std_id, const uint8_t data[COMMUNICATIO
  * ACK 表示“命令是否被通信层/业务层接受”，不一定表示动作已经完成。
  * 例如步进电机运动命令收到 ACK OK 后，电机可能仍在运行中，
  * 上位机应结合 0x181 状态帧判断忙闲状态。
+ * 对异步流程可在完成时使用原 SEQ 补发 ACK，并在 exec_state 中携带最终流程步骤。
  */
 uint8_t Communication_SendAck(uint8_t cmd,
                               uint8_t obj,

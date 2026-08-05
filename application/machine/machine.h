@@ -29,8 +29,8 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                                    uint16_t target_conc_x1000,
                                    uint8_t seq);
 
-// 上位机启动独立发药流程，volume_ml_x100 单位为 0.01ml。
-uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100);
+// 上位机启动独立发药流程，volume_ml_x100 单位为 0.01ml，seq 用于完成 ACK 回传。
+uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq);
 
 // 上位机启动“转移药液进活度计”流程，执行至原液活度读取完成后等待开始配药。
 uint8_t Machine_StartRemoteTransferToActivity(void);
