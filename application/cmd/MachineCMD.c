@@ -78,7 +78,7 @@ typedef struct
     uint8_t reset_requested;                              // 复位键事件，machine 层读取后终止当前流程
     uint8_t remote_enabled;                               // 上位机远控接管标志
     uint8_t remote_paused;                                // 远控暂停标志，本地暂停键置位
-    uint16_t remote_prepare_target_activity_x100;          // 远程配药目标活度，单位 0.01mCi
+    uint16_t remote_prepare_initial_activity_x100;         // 远程配药初始活度，单位 0.01mCi
     uint16_t remote_prepare_target_conc_x1000;             // 远程配药目标浓度，单位 0.001mCi/ml
     uint16_t remote_prepare_water_volume_x100;             // 远程配药补水量，单位 0.01ml
     uint16_t remote_prepare_final_volume_x100;             // 远程配药理论最终体积，单位 0.01ml
@@ -87,6 +87,7 @@ typedef struct
     uint8_t remote_prepare_param_ready;                    // 已收到 PREPARE_PARAM
     uint8_t remote_prepare_volume_ready;                   // 已收到 PREPARE_VOLUME_PARAM
     uint8_t remote_dispense_param_ready;                   // 已收到 DISPENSE_PARAM
+    uint8_t remote_transfer_activity_reported;             // 转移完成后的活度主动上报已经发送
     uint32_t remote_status_last_ms;                         // 0x181 周期状态上报时间
     uint8_t activity_request_pending;                       // READ_ACTIVITY 异步查询正在等待最终读数
     uint8_t activity_request_started;                       // 本次查询已经触发或接上活度计读取
@@ -145,6 +146,7 @@ static uint8_t MachineCMD_SendActivityState(const ActivityMeterData_s *activity_
 static void MachineCMD_HandleRemoteActivityRead(uint8_t seq);
 static void MachineCMD_CompleteActivityRequest(void);
 static void MachineCMD_ReportActivityUpdate(void);
+static void MachineCMD_ReportTransferActivityIfReady(void);
 static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *command);
 static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s *command);
 static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *command);
@@ -214,6 +216,7 @@ void MachineCMD_Process(void)
     now_ms = MachineCMD_GetMs();
     MachineCMD_SyncRemoteState();
     MachineCMD_ApplyCommunicationSafetyAction();
+    MachineCMD_ReportTransferActivityIfReady();
 
     if ((uint32_t)(now_ms - machine_cmd.remote_status_last_ms) >=
         COMMUNICATION_STATUS_PERIOD_MS)
@@ -266,11 +269,23 @@ void MachineCMD_Process(void)
      */
     if (key == KEYPAD_STATE_RESET)
     {
+        uint8_t mode = Communication_GetControlMode();
+
+        if ((mode == COMMUNICATION_CONTROL_REMOTE) ||
+            (mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING))
+        {
+            /*
+             * 新版控制调度要求 REMOTE 下复位键不能直接抢回本地控制权。
+             * 用户必须先按暂停键让输出进入安全暂停，再按复位完成本地接管。
+             */
+            MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+            MachineCMD_SyncRemoteState();
+            return;
+        }
+
         /*
-         * 复位键直接表示本机接管/退出当前页面。
-         * 旧逻辑在 REMOTE 下先调用本地暂停，再调用本地复位，
-         * 一个按键会连续上报 LOCAL_PAUSE 和 LOCAL_TAKEOVER，容易让上位机和 LCD
-         * 对同一次操作得出两个不同状态。这里改为只走复位接管路径。
+         * REMOTE_PAUSED 下复位表示本地接管；LOCAL 下复位保持本地控制。
+         * REMOTE 下直接复位已在上面拦截，避免绕过“先暂停、再接管”的安全步骤。
          */
         Communication_OnLocalResetKey();
         MachineCMD_ClearInput();
@@ -1616,6 +1631,14 @@ static void MachineCMD_HandleRemoteActivityRead(uint8_t seq)
     memset(&activity_data, 0, sizeof(activity_data));
     (void)ActivityMeter_GetData(&activity_data);
 
+    if (Machine_IsTransferToActivityDone() == 0U)
+    {
+        (void)MachineCMD_SendActivityState(&activity_data,
+                                           COMMUNICATION_ACTIVITY_NOT_READ,
+                                           seq);
+        return;
+    }
+
     if (activity_data.state == ACTIVITY_METER_STATE_OK)
     {
         if (MachineCMD_SendActivityData(&activity_data, seq) != 0U)
@@ -1712,6 +1735,11 @@ static void MachineCMD_ReportActivityUpdate(void)
 {
     ActivityMeterData_s activity_data;
 
+    if (Machine_IsTransferToActivityDone() == 0U)
+    {
+        return;
+    }
+
     if (machine_cmd.activity_request_pending != 0U)
     {
         return;
@@ -1733,10 +1761,44 @@ static void MachineCMD_ReportActivityUpdate(void)
 }
 
 /**
+ * @brief 药液转移完成后主动上报一次稳定活度。
+ *
+ * @note processId=4 完成后，状态帧会进入 0x18。若 RAM-100 已经有稳定读数，
+ *       这里主动发送 07 01 + 07 02，SEQ 固定为 0；若暂时没有稳定读数，
+ *       不伪造成功状态，等待上位机 READ_ACTIVITY 或后续真实读数更新。
+ */
+static void MachineCMD_ReportTransferActivityIfReady(void)
+{
+    ActivityMeterData_s activity_data;
+
+    if ((Machine_IsTransferToActivityDone() == 0U) ||
+        (machine_cmd.remote_transfer_activity_reported != 0U))
+    {
+        return;
+    }
+
+    memset(&activity_data, 0, sizeof(activity_data));
+    if ((ActivityMeter_GetData(&activity_data) == 0U) ||
+        (activity_data.state != ACTIVITY_METER_STATE_OK))
+    {
+        return;
+    }
+
+    if (MachineCMD_SendActivityData(&activity_data, MACHINE_CMD_ACTIVITY_PUSH_SEQ) != 0U)
+    {
+        machine_cmd.remote_transfer_activity_reported = 1U;
+        machine_cmd.activity_reported_update_count = activity_data.update_count;
+    }
+}
+
+/**
  * @brief 缓存上位机 SET_PARAM 参数。
  */
 static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *command)
 {
+    uint8_t result = COMMUNICATION_RESULT_OK;
+    uint16_t error = COMMUNICATION_ERROR_NONE;
+
     if (command == NULL)
     {
         return;
@@ -1745,7 +1807,7 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
     switch (command->obj)
     {
     case COMMUNICATION_OBJ_PREPARE_PARAM:
-        machine_cmd.remote_prepare_target_activity_x100 =
+        machine_cmd.remote_prepare_initial_activity_x100 =
             Communication_ReadU16LE(&command->data[2]);
         machine_cmd.remote_prepare_target_conc_x1000 =
             Communication_ReadU16LE(&command->data[4]);
@@ -1769,8 +1831,17 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
         break;
 
     default:
+        result = COMMUNICATION_RESULT_BAD_PARAM;
+        error = COMMUNICATION_ERROR_BAD_PARAM;
         break;
     }
+
+    (void)Communication_SendAck(command->cmd,
+                                command->obj,
+                                result,
+                                error,
+                                0U,
+                                command->seq);
 }
 
 /**
@@ -1779,45 +1850,95 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
 static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s *command)
 {
     uint8_t process_id;
+    uint8_t result = COMMUNICATION_RESULT_OK;
+    uint16_t error = COMMUNICATION_ERROR_NONE;
 
     if ((command == NULL) || (command->obj != COMMUNICATION_OBJ_SYSTEM))
     {
+        if (command != NULL)
+        {
+            (void)Communication_SendAck(command->cmd,
+                                        command->obj,
+                                        COMMUNICATION_RESULT_BAD_PARAM,
+                                        COMMUNICATION_ERROR_BAD_PARAM,
+                                        0U,
+                                        command->seq);
+        }
         return;
     }
 
     process_id = command->data[2];
-    if (process_id == 1U)
+    if (process_id == COMMUNICATION_PROCESS_PREPARE)
     {
-        if ((machine_cmd.remote_prepare_param_ready == 0U) ||
+        if (Machine_IsTransferToActivityDone() == 0U)
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+        else if ((machine_cmd.remote_prepare_param_ready == 0U) ||
             (machine_cmd.remote_prepare_volume_ready == 0U))
         {
-            return;
+            result = COMMUNICATION_RESULT_BAD_PARAM;
+            error = COMMUNICATION_ERROR_BAD_PARAM;
         }
-
-        if (Machine_StartRemotePrepare(machine_cmd.remote_prepare_water_volume_x100,
-                                       machine_cmd.remote_prepare_final_volume_x100,
-                                       machine_cmd.remote_prepare_target_activity_x100,
-                                       machine_cmd.remote_prepare_target_conc_x1000,
-                                       command->seq) != 0U)
+        else if (Machine_StartRemotePrepare(machine_cmd.remote_prepare_water_volume_x100,
+                                            machine_cmd.remote_prepare_final_volume_x100,
+                                            machine_cmd.remote_prepare_initial_activity_x100,
+                                            machine_cmd.remote_prepare_target_conc_x1000,
+                                            command->seq) != 0U)
         {
             machine_cmd.remote_prepare_param_ready = 0U;
             machine_cmd.remote_prepare_volume_ready = 0U;
         }
-        return;
+        else
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
     }
-
-    if (process_id == 2U)
+    else if (process_id == COMMUNICATION_PROCESS_DISPENSE)
     {
         if (machine_cmd.remote_dispense_param_ready == 0U)
         {
-            return;
+            result = COMMUNICATION_RESULT_BAD_PARAM;
+            error = COMMUNICATION_ERROR_BAD_PARAM;
         }
-
-        if (Machine_StartRemoteDispense(machine_cmd.remote_dispense_volume_x100) != 0U)
+        else if (Machine_StartRemoteDispense(machine_cmd.remote_dispense_volume_x100) != 0U)
         {
             machine_cmd.remote_dispense_param_ready = 0U;
         }
+        else
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
     }
+    else if (process_id == COMMUNICATION_PROCESS_TRANSFER_TO_ACTIVITY)
+    {
+        if (Machine_StartRemoteTransferToActivity() != 0U)
+        {
+            machine_cmd.remote_prepare_param_ready = 0U;
+            machine_cmd.remote_prepare_volume_ready = 0U;
+            machine_cmd.remote_transfer_activity_reported = 0U;
+        }
+        else
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+    }
+    else
+    {
+        result = COMMUNICATION_RESULT_UNSUPPORTED;
+        error = COMMUNICATION_ERROR_NONE;
+    }
+
+    (void)Communication_SendAck(command->cmd,
+                                command->obj,
+                                result,
+                                error,
+                                0U,
+                                command->seq);
 }
 
 /**
@@ -2136,9 +2257,16 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
     }
 
     activity_state = (uint8_t)ActivityMeter_GetState();
-    status.activity_state = (activity_state <= (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE) ?
-                            activity_state :
-                            COMMUNICATION_ACTIVITY_NOT_READ;
+    if (Machine_IsTransferToActivityDone() == 0U)
+    {
+        status.activity_state = COMMUNICATION_ACTIVITY_NOT_READ;
+    }
+    else
+    {
+        status.activity_state = (activity_state <= (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE) ?
+                                activity_state :
+                                COMMUNICATION_ACTIVITY_NOT_READ;
+    }
 
     (void)Communication_SendStatus(&status);
 }
@@ -2706,7 +2834,14 @@ static void MachineCMD_ShowRemotePage(void)
         MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_remote_key_request);
     }
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_remote_reset);
+    if (mode == COMMUNICATION_CONTROL_REMOTE)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_remote_pause_first);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_remote_reset);
+    }
 }
 
 /**

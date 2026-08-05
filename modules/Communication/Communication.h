@@ -146,11 +146,20 @@ typedef enum
     COMMUNICATION_OBJ_WATER_PUMP = 0x06U,          /**< 抽水泵。 */
     COMMUNICATION_OBJ_ACTIVITY_METER = 0x07U,      /**< 活度计。 */
     COMMUNICATION_OBJ_PUMP_2 = 0x08U,              /**< 泵2：100ul 定量泵。 */
-    COMMUNICATION_OBJ_PREPARE_PARAM = 0x10U,       /**< 配药目标参数。 */
+    COMMUNICATION_OBJ_PREPARE_PARAM = 0x10U,       /**< 配药参数：初始活度和目标浓度。 */
     COMMUNICATION_OBJ_DISPENSE_PARAM = 0x11U,      /**< 发药参数。 */
     COMMUNICATION_OBJ_PREPARE_RESULT = 0x12U,      /**< 配药结果返回对象。 */
     COMMUNICATION_OBJ_PREPARE_VOLUME_PARAM = 0x13U /**< 配药体积参数。 */
 } CommunicationObject_e;
+
+/** START_PROCESS Byte2 的流程编号。 */
+typedef enum
+{
+    COMMUNICATION_PROCESS_PREPARE = 0x01U,              /**< 配药。 */
+    COMMUNICATION_PROCESS_DISPENSE = 0x02U,             /**< 发药。 */
+    COMMUNICATION_PROCESS_FLUSH = 0x03U,                /**< 单独冲洗。 */
+    COMMUNICATION_PROCESS_TRANSFER_TO_ACTIVITY = 0x04U  /**< 转移药液进活度计。 */
+} CommunicationProcessId_e;
 
 /**
  * @brief 命令 ACK 结果码。
@@ -224,13 +233,19 @@ typedef enum
     COMMUNICATION_STEP_PREPARE_PARAM_READY = 0x10U,   /**< 配药参数已就绪。 */
     COMMUNICATION_STEP_PREPARE_START = 0x11U,         /**< 配药流程启动。 */
     COMMUNICATION_STEP_PREPARE_WATER_FILL = 0x12U,    /**< 配药补水阶段。 */
+    COMMUNICATION_STEP_PREPARE_MIXING = 0x13U,        /**< 配药混匀或等待稳定。 */
     COMMUNICATION_STEP_PREPARE_WAIT_ACTIVITY = 0x14U, /**< 等待活度测量。 */
     COMMUNICATION_STEP_PREPARE_RESULT = 0x15U,        /**< 配药结果已生成。 */
     COMMUNICATION_STEP_PREPARE_DONE = 0x16U,          /**< 配药流程完成。 */
+    COMMUNICATION_STEP_TRANSFER_TO_ACTIVITY = 0x17U,  /**< 药液正在转移至活度计。 */
+    COMMUNICATION_STEP_TRANSFER_DONE = 0x18U,         /**< 药液转移完成，可读取活度并开始配药。 */
     COMMUNICATION_STEP_DISPENSE_PARAM_READY = 0x20U,  /**< 发药参数已就绪。 */
     COMMUNICATION_STEP_DISPENSE_START = 0x21U,        /**< 发药流程启动。 */
     COMMUNICATION_STEP_DISPENSE_RUNNING = 0x22U,      /**< 发药泵送中。 */
     COMMUNICATION_STEP_DISPENSE_DONE = 0x23U,         /**< 发药流程完成。 */
+    COMMUNICATION_STEP_FLUSH_START = 0x30U,           /**< 冲洗流程启动。 */
+    COMMUNICATION_STEP_FLUSH_RUNNING = 0x31U,         /**< 冲洗中。 */
+    COMMUNICATION_STEP_FLUSH_DONE = 0x32U,            /**< 冲洗完成。 */
     COMMUNICATION_STEP_REMOTE_PAUSED = 0x40U,         /**< 远程流程被本地暂停。 */
     COMMUNICATION_STEP_LOCAL_TAKEOVER = 0x41U,        /**< 本地已接管远程流程。 */
     COMMUNICATION_STEP_FAILED = 0x7FU                 /**< 当前流程失败。 */

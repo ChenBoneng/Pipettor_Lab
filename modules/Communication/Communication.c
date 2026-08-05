@@ -116,7 +116,7 @@ static uint8_t Communication_IsRemoteCommandAllowed(uint16_t std_id,
                                                     uint8_t cmd,
                                                     uint8_t *result,
                                                     uint16_t *error);
-static uint8_t Communication_IsKnownCommand(uint8_t cmd);
+static uint8_t Communication_IsValidBusinessFrame(uint16_t std_id, uint8_t cmd);
 static uint8_t Communication_NextControlEventSeq(void);
 static void Communication_RequestSafetyAction(uint8_t action);
 static uint32_t Communication_MakeNonce(void);
@@ -228,16 +228,11 @@ void Communication_Process(void)
     {
         communication_control.pc_connected = 0U;
         /*
-         * 上位机短时间没有继续发帧，只能说明“当前不在线”，不能直接等同于本机接管。
-         * 设备空闲时保持 REMOTE 控制权，等下一帧上位机命令进来后 OnPcFrame() 会重新置位
-         * pc_connected；这样 LCD 不会在空闲远控页和本地页之间来回跳。
-         *
-         * 只有已经处于 RUNNING 的远控动作，才需要因为 PC 掉线转入不可启动恢复的安全暂停。
-         * 这里不设置 remote_resume_allowed，避免 LCD 提示“启动键继续”但启动键又没有恢复条件。
+         * 新版控制调度把“在线状态”和“授权状态”分开处理。
+         * REMOTE 下 3 秒没有任何有效上位机帧时，必须撤销动作权限并进入
+         * REMOTE_PAUSED；即使当前没有输出，也不能继续让上位机按钮显示为可动作。
          */
-        if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) &&
-            ((communication_control.sys_state == COMMUNICATION_SYS_RUNNING) ||
-             (communication_control.local_flow_running != 0U)))
+        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
         {
             communication_control.remote_resume_allowed = 0U;
             communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
@@ -754,6 +749,7 @@ void Communication_OnLocalStartKey(void)
 {
     if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) &&
         (communication_control.remote_resume_allowed != 0U) &&
+        (communication_control.pc_connected != 0U) &&
         (communication_control.pc_authorized != 0U) &&
         (communication_control.alarm_active == 0U) &&
         (communication_control.estop_active == 0U))
@@ -768,9 +764,7 @@ void Communication_OnLocalStartKey(void)
 
 void Communication_OnLocalResetKey(void)
 {
-    if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) ||
-        (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) ||
-        (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING))
+    if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED)
     {
         communication_control.remote_resume_allowed = 0U;
         communication_control.local_flow_running = 0U;
@@ -887,15 +881,32 @@ uint8_t Communication_CommandRequiresAuth(uint8_t cmd, uint16_t std_id)
     }
 }
 
-static uint8_t Communication_IsKnownCommand(uint8_t cmd)
+static uint8_t Communication_IsValidBusinessFrame(uint16_t std_id, uint8_t cmd)
 {
-    return (((cmd >= COMMUNICATION_CMD_START_PROCESS) &&
-             (cmd <= COMMUNICATION_CMD_STOP_OBJECT)) ||
-            (cmd == COMMUNICATION_CMD_AUTH_REQUEST) ||
-            (cmd == COMMUNICATION_CMD_AUTH_CHALLENGE) ||
-            (cmd == COMMUNICATION_CMD_AUTH_RESPONSE) ||
-            (cmd == COMMUNICATION_CMD_AUTH_RESULT) ||
-            (cmd == COMMUNICATION_CMD_AUTH_CHALLENGE_EXT)) ? 1U : 0U;
+    switch (std_id)
+    {
+    case COMMUNICATION_CAN_ID_CONTROL:
+        return ((cmd == COMMUNICATION_CMD_START_PROCESS) ||
+                (cmd == COMMUNICATION_CMD_STOP_PROCESS) ||
+                (cmd == COMMUNICATION_CMD_RESET_ERROR) ||
+                (cmd == COMMUNICATION_CMD_MOVE_STEPPER) ||
+                (cmd == COMMUNICATION_CMD_VALVE_CONTROL) ||
+                (cmd == COMMUNICATION_CMD_PUMP_CONTROL) ||
+                (cmd == COMMUNICATION_CMD_MOVE_STEPPER_BOTH) ||
+                (cmd == COMMUNICATION_CMD_STOP_OBJECT)) ? 1U : 0U;
+
+    case COMMUNICATION_CAN_ID_PARAM:
+        return (cmd == COMMUNICATION_CMD_SET_PARAM) ? 1U : 0U;
+
+    case COMMUNICATION_CAN_ID_QUERY:
+        return ((cmd == COMMUNICATION_CMD_READ_ACTIVITY) ||
+                (cmd == COMMUNICATION_CMD_QUERY_STATUS) ||
+                (cmd == COMMUNICATION_CMD_HEARTBEAT) ||
+                (cmd == COMMUNICATION_CMD_QUERY_VERSION)) ? 1U : 0U;
+
+    default:
+        return 0U;
+    }
 }
 
 uint32_t Communication_CalculateLicenseKey(uint32_t board_id, uint8_t license_type)
@@ -1366,24 +1377,14 @@ static void Communication_SyncAuthState(void)
         if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
         {
             /*
-             * 授权失效后不能继续执行动作命令。
-             * 如果正在运行，先进入安全暂停并停输出；如果只是空闲远控页，
-             * 直接回到 LOCAL + 等待授权显示，避免 LCD 出现“启动键继续”但实际未授权无法恢复。
+             * 授权失效只撤销上位机动作资格，不等于本地已经接管。
+             * 按新版调度文档，REMOTE 下授权丢失统一进入不可直接恢复的
+             * REMOTE_PAUSED，等待重新授权或本地复位接管。
              */
-            if ((communication_control.sys_state == COMMUNICATION_SYS_RUNNING) ||
-                (communication_control.local_flow_running != 0U))
-            {
-                communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
-                Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
-                Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
-                                             COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
-            }
-            else
-            {
-                communication_control.sys_state = COMMUNICATION_SYS_IDLE;
-                Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
-                                             COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
-            }
+            communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
+            Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
+            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
+                                         COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
         }
         else if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING)
         {
@@ -1635,7 +1636,7 @@ static void Communication_HandleRxFrame(const CommunicationFrame_s *frame)
         return;
     }
 
-    if (Communication_IsKnownCommand(cmd) == 0U)
+    if (Communication_IsValidBusinessFrame(std_id, cmd) == 0U)
     {
         if ((std_id == COMMUNICATION_CAN_ID_CONTROL) ||
             (std_id == COMMUNICATION_CAN_ID_PARAM))
@@ -1709,10 +1710,16 @@ static void Communication_HandleRxFrame(const CommunicationFrame_s *frame)
         return;
     }
 
-    if ((std_id == COMMUNICATION_CAN_ID_CONTROL) || (std_id == COMMUNICATION_CAN_ID_PARAM))
+    if (((std_id == COMMUNICATION_CAN_ID_CONTROL) ||
+         (std_id == COMMUNICATION_CAN_ID_PARAM)) &&
+        (cmd != COMMUNICATION_CMD_START_PROCESS) &&
+        (cmd != COMMUNICATION_CMD_SET_PARAM))
     {
         /*
          * 这里的 OK 只表示通信层已接收并缓存命令，不代表机械动作已经完成。
+         * START_PROCESS/SET_PARAM 需要业务层按参数完整性和流程顺序返回 ACK，
+         * 避免通信层先回 OK 后业务层又发现缺参数或状态不允许。
+         *
          * 后续如果业务层需要返回更精细的 BUSY/FAILED，可在执行层补充状态帧或报警帧。
          *
          * 查询命令 0x102 不在这里统一 ACK：

@@ -31,6 +31,7 @@
 #define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
 #define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
 #define MACHINE_COMBO_PUMP2_SEGMENT_UL           PUMP_DRIVE_PUMP2_FULL_STROKE_UL
+#define MACHINE_TRANSFER_TO_ACTIVITY_MS           2000U
 
 typedef enum
 {
@@ -91,7 +92,7 @@ static uint16_t machine_combo_dispense_ml_x100 = 0U;
 static uint32_t machine_combo_water_ul = 0U;
 static uint16_t machine_combo_remote_water_ml_x100 = 0U;
 static uint16_t machine_combo_remote_final_ml_x100 = 0U;
-static uint16_t machine_combo_remote_target_activity_x100 = 0U;
+static uint16_t machine_combo_remote_initial_activity_x100 = 0U;
 static uint8_t machine_combo_remote_volume_valid = 0U;
 static uint8_t machine_combo_remote_seq = 0U;
 static uint32_t machine_combo_dispense_ul = 0U;
@@ -113,6 +114,9 @@ static uint32_t machine_direct_dispense_done_ul = 0U;
 static uint8_t machine_direct_dispense_paused = 0U;
 static uint32_t machine_direct_dispense_pause_start_ms = 0U;
 static uint8_t machine_dispense_progress_percent = 0U;
+static uint8_t machine_transfer_running = 0U;
+static uint8_t machine_transfer_done = 0U;
+static uint32_t machine_transfer_start_ms = 0U;
 
 static uint32_t Machine_GetMs(void);
 static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
@@ -140,6 +144,8 @@ static void Machine_ResumeDirectDispense(void);
 static uint8_t Machine_StartDirectDispenseSegment(void);
 static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner);
 static void Machine_UpdateDirectDispense(void);
+static void Machine_AbortTransferToActivity(void);
+static void Machine_UpdateTransferToActivity(void);
 static uint8_t Machine_IsRemoteFlowBlocked(MachineFlowOwner_e owner);
 static uint16_t Machine_GetMeasuredActivityMciX100(void);
 static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner);
@@ -1185,6 +1191,55 @@ static void Machine_UpdateDirectDispense(void)
     }
 }
 
+/**
+ * @brief 终止药液转移到活度计的协议流程。
+ *
+ * @note 当前转移流程只承担新版 CAN 协议的步骤门控，尚未直接驱动泵阀。
+ *       后续如果现场确认需要真实动作，可在这里统一关闭对应输出。
+ */
+static void Machine_AbortTransferToActivity(void)
+{
+    if (machine_transfer_running != 0U)
+    {
+        Communication_SetSystemState(COMMUNICATION_SYS_IDLE);
+    }
+
+    machine_transfer_running = 0U;
+    machine_transfer_done = 0U;
+    machine_transfer_start_ms = 0U;
+}
+
+/**
+ * @brief 推进药液转移到活度计的非阻塞协议流程。
+ *
+ * @note 最新协议要求 processId=4 先上报 0x17，再在完成后上报 0x18。
+ *       当前参考联调工程用 2 秒模拟转移动作，不在任务里阻塞，也不新增未确认的硬件输出。
+ */
+static void Machine_UpdateTransferToActivity(void)
+{
+    uint32_t now_ms;
+
+    if (machine_transfer_running == 0U)
+    {
+        return;
+    }
+
+    if (Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE)
+    {
+        Machine_AbortTransferToActivity();
+        return;
+    }
+
+    now_ms = Machine_GetMs();
+    if ((uint32_t)(now_ms - machine_transfer_start_ms) >= MACHINE_TRANSFER_TO_ACTIVITY_MS)
+    {
+        machine_transfer_running = 0U;
+        machine_transfer_done = 1U;
+        machine_transfer_start_ms = 0U;
+        Communication_SetSystemState(COMMUNICATION_SYS_IDLE);
+    }
+}
+
 void MachineInit(void)
 {
     machine_combo_state = MACHINE_COMBO_STATE_IDLE;
@@ -1197,7 +1252,7 @@ void MachineInit(void)
     machine_combo_water_ul = 0U;
     machine_combo_remote_water_ml_x100 = 0U;
     machine_combo_remote_final_ml_x100 = 0U;
-    machine_combo_remote_target_activity_x100 = 0U;
+    machine_combo_remote_initial_activity_x100 = 0U;
     machine_combo_remote_volume_valid = 0U;
     machine_combo_remote_seq = 0U;
     machine_combo_dispense_ul = 0U;
@@ -1219,6 +1274,9 @@ void MachineInit(void)
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
     machine_dispense_progress_percent = 0U;
+    machine_transfer_running = 0U;
+    machine_transfer_done = 0U;
+    machine_transfer_start_ms = 0U;
 
     Machine_StopComboOutputs();
 }
@@ -1242,6 +1300,14 @@ void MachineControl(void)
             Machine_AbortDirectDispense();
         }
 
+        Machine_AbortTransferToActivity();
+
+        return;
+    }
+
+    if (machine_transfer_running != 0U)
+    {
+        Machine_UpdateTransferToActivity();
         return;
     }
 
@@ -1292,7 +1358,7 @@ uint8_t MachineCombinationTestCanDispense(void)
 
 uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                                    uint16_t final_volume_x100,
-                                   uint16_t target_activity_x100,
+                                   uint16_t initial_activity_x100,
                                    uint16_t target_conc_x1000,
                                    uint8_t seq)
 {
@@ -1301,6 +1367,7 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
         (machine_direct_dispense_running != 0U) ||
+        (machine_transfer_done == 0U) ||
         (final_volume_x100 == 0U) ||
         (target_conc_x1000 == 0U))
     {
@@ -1314,9 +1381,10 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
 
     machine_combo_remote_water_ml_x100 = water_volume_x100;
     machine_combo_remote_final_ml_x100 = final_volume_x100;
-    machine_combo_remote_target_activity_x100 = target_activity_x100;
+    machine_combo_remote_initial_activity_x100 = initial_activity_x100;
     machine_combo_remote_volume_valid = 1U;
     machine_combo_remote_seq = seq;
+    machine_transfer_done = 0U;
 
     /*
      * 远程配药的补水量已经由上位机算好并随 PREPARE_VOLUME_PARAM 下发。
@@ -1327,6 +1395,28 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                        target_conc_x1000,
                        MACHINE_FLOW_OWNER_REMOTE);
     return 1U;
+}
+
+uint8_t Machine_StartRemoteTransferToActivity(void)
+{
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
+        (machine_combo_running != 0U) ||
+        (machine_direct_dispense_running != 0U) ||
+        (machine_transfer_running != 0U))
+    {
+        return 0U;
+    }
+
+    machine_transfer_running = 1U;
+    machine_transfer_done = 0U;
+    machine_transfer_start_ms = Machine_GetMs();
+    Communication_SetSystemState(COMMUNICATION_SYS_RUNNING);
+    return 1U;
+}
+
+uint8_t Machine_IsTransferToActivityDone(void)
+{
+    return (machine_transfer_done != 0U) ? 1U : 0U;
 }
 
 uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100)
@@ -1345,6 +1435,11 @@ uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100)
 
 uint8_t Machine_GetCommunicationStep(void)
 {
+    if (machine_transfer_running != 0U)
+    {
+        return COMMUNICATION_STEP_TRANSFER_TO_ACTIVITY;
+    }
+
     if (machine_direct_dispense_running != 0U)
     {
         if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_ENABLE) ||
@@ -1364,6 +1459,11 @@ uint8_t Machine_GetCommunicationStep(void)
 
     if (machine_combo_running == 0U)
     {
+        if (machine_transfer_done != 0U)
+        {
+            return COMMUNICATION_STEP_TRANSFER_DONE;
+        }
+
         return COMMUNICATION_STEP_IDLE;
     }
 
@@ -1443,5 +1543,6 @@ uint8_t Machine_GetDispenseProgressPercent(void)
 uint8_t Machine_IsFlowRunning(void)
 {
     return ((machine_combo_running != 0U) ||
-            (machine_direct_dispense_running != 0U)) ? 1U : 0U;
+            (machine_direct_dispense_running != 0U) ||
+            (machine_transfer_running != 0U)) ? 1U : 0U;
 }
