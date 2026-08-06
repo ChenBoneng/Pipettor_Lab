@@ -138,8 +138,8 @@ typedef enum
 typedef enum
 {
     COMMUNICATION_OBJ_SYSTEM = 0x00U,              /**< 系统整体对象。 */
-    COMMUNICATION_OBJ_MOTOR_A = 0x01U,             /**< 进罐导轨（电机A）。 */
-    COMMUNICATION_OBJ_MOTOR_B = 0x02U,             /**< 插针导轨（电机B）。 */
+    COMMUNICATION_OBJ_MOTOR_A = 0x01U,             /**< 插针导轨（150mm，电机A）。 */
+    COMMUNICATION_OBJ_MOTOR_B = 0x02U,             /**< 进罐导轨（300mm，电机B）。 */
     COMMUNICATION_OBJ_PUMP_1 = 0x03U,              /**< 泵1：300ul 定量泵。 */
     COMMUNICATION_OBJ_VALVE_1 = 0x04U,             /**< 阀门 1。 */
     COMMUNICATION_OBJ_VALVE_2 = 0x05U,             /**< 阀门 2。 */
@@ -188,8 +188,8 @@ typedef enum
 {
     COMMUNICATION_ERROR_NONE = 0x0000U,              /**< 无错误。 */
     COMMUNICATION_ERROR_ESTOP = 0x0001U,             /**< 急停触发。 */
-    COMMUNICATION_ERROR_MOTOR_A_TIMEOUT = 0x0002U,   /**< 进罐导轨（电机A）运动超时。 */
-    COMMUNICATION_ERROR_MOTOR_B_TIMEOUT = 0x0003U,   /**< 插针导轨（电机B）运动超时。 */
+    COMMUNICATION_ERROR_MOTOR_A_TIMEOUT = 0x0002U,   /**< 插针导轨（150mm，电机A）运动超时。 */
+    COMMUNICATION_ERROR_MOTOR_B_TIMEOUT = 0x0003U,   /**< 进罐导轨（300mm，电机B）运动超时。 */
     COMMUNICATION_ERROR_ACTIVITY_TIMEOUT = 0x0004U,  /**< 活度计通信超时。 */
     COMMUNICATION_ERROR_CAN_TIMEOUT = 0x0005U,       /**< CAN 通信超时。 */
     COMMUNICATION_ERROR_BAD_PARAM = 0x0006U,         /**< 参数非法。 */

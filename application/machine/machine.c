@@ -12,13 +12,13 @@
 /*
  * 配药/发药整机测试流程：
  * 1. 配药页确认“当前活度浓度、当前体积、目标活度浓度”后启动；
- * 2. 进罐导轨（电机A）推 3cm，插针导轨（电机B）推 5cm；
+ * 2. 进罐导轨（300mm，电机B）推 3cm，插针导轨（150mm，电机A）推 5cm；
  * 3. 抽水泵打开 5s，把铅罐中当前溶液抽入活度计；
  * 4. 等待活度计读数稳定；
  * 5. 按当前浓度、当前体积和目标浓度计算需要补入的纯净水体积；
  * 6. 打开电磁阀 1，通过泵1抽取所需纯净水；
  * 7. 抽水泵再次打开 5s，把铅罐中的纯净水抽到活度计；
- * 8. 等待读数稳定后认为配药完成，先回退插针导轨（电机B），再回退进罐导轨（电机A）；
+ * 8. 等待读数稳定后认为配药完成，先回退插针导轨（150mm，电机A），再回退进罐导轨（300mm，电机B）；
  * 9. 等待用户按发药键并确认发药量；
  * 10. 泵2吸入本次发药体积，流程结束。
  *
@@ -29,18 +29,18 @@
 #define MACHINE_COMBO_WATER_PUMP_MS              5000U
 #define MACHINE_COMBO_ACTIVITY_STABLE_MS         1000U
 #define MACHINE_COMBO_STEP_SPEED_MM_S_X100       2000U
-#define MACHINE_COMBO_STEP_A_POSITION_MM_X100    3000U
-#define MACHINE_COMBO_STEP_B_POSITION_MM_X100    5000U
+#define MACHINE_COMBO_TANK_POSITION_MM_X100      3000U
+#define MACHINE_COMBO_NEEDLE_POSITION_MM_X100    5000U
 #define MACHINE_DISPENSE_PUMP_SEGMENT_UL         PUMP_DRIVE_PUMP2_FULL_STROKE_UL
 #define MACHINE_REMOTE_DISPENSE_DONE_HOLD_MS     (COMMUNICATION_STATUS_PERIOD_MS * 2U)
 
 typedef enum
 {
     MACHINE_COMBO_STATE_IDLE = 0,              // 空闲，等待配药参数确认
-    MACHINE_COMBO_STATE_STEP_A_PUSH,           // 进罐导轨（电机A）推 3cm
-    MACHINE_COMBO_STATE_GAP_AFTER_A,           // 进罐导轨动作完成后的间隔
-    MACHINE_COMBO_STATE_STEP_B_PUSH,           // 插针导轨（电机B）推 5cm
-    MACHINE_COMBO_STATE_GAP_AFTER_B,           // 插针导轨动作完成后的间隔
+    MACHINE_COMBO_STATE_TANK_PUSH,             // 进罐导轨（300mm，电机B）推 3cm
+    MACHINE_COMBO_STATE_GAP_AFTER_TANK,        // 进罐导轨动作完成后的间隔
+    MACHINE_COMBO_STATE_NEEDLE_PUSH,           // 插针导轨（150mm，电机A）推 5cm
+    MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE,      // 插针导轨动作完成后的间隔
     MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵抽当前溶液进入活度计
     MACHINE_COMBO_STATE_RAW_PUMP_OFF,          // 关闭抽水泵并等待流路稳定
     MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY,     // 等待当前溶液活度读数稳定
@@ -55,10 +55,10 @@ typedef enum
     MACHINE_COMBO_STATE_WATER_PUMP_ON,         // 抽水泵抽纯净水进入活度计
     MACHINE_COMBO_STATE_WATER_PUMP_OFF,        // 关闭抽水泵并等待流路稳定
     MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY,   // 等待最终活度读数稳定
-    MACHINE_COMBO_STATE_STEP_A_HOME,           // 进罐导轨（电机A）回原点
-    MACHINE_COMBO_STATE_GAP_AFTER_A_HOME,      // 进罐导轨回原点后的间隔
-    MACHINE_COMBO_STATE_STEP_B_HOME,           // 插针导轨（电机B）回原点
-    MACHINE_COMBO_STATE_GAP_AFTER_B_HOME,      // 插针导轨回原点后的间隔
+    MACHINE_COMBO_STATE_TANK_HOME,             // 进罐导轨（300mm，电机B）回原点
+    MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME,   // 进罐导轨回原点后的间隔
+    MACHINE_COMBO_STATE_NEEDLE_HOME,           // 插针导轨（150mm，电机A）回原点
+    MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME, // 插针导轨回原点后的间隔
     MACHINE_COMBO_STATE_WAIT_DISPENSE,         // 等待发药量确认
     MACHINE_COMBO_STATE_PUMP2_ENABLE,          // 发送泵2使能命令
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE, // 泵2使能后等待总线和驱动响应
@@ -738,18 +738,18 @@ static void Machine_ExecuteComboState(void)
 
     switch (machine_combo_state)
     {
-    case MACHINE_COMBO_STATE_STEP_A_PUSH:
-        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_A,
-                                          MACHINE_COMBO_STEP_A_POSITION_MM_X100,
+    case MACHINE_COMBO_STATE_TANK_PUSH:
+        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_TANK_RAIL,
+                                          MACHINE_COMBO_TANK_POSITION_MM_X100,
                                           MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
         {
             Machine_AbortCombo();
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_B_PUSH:
-        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_B,
-                                          MACHINE_COMBO_STEP_B_POSITION_MM_X100,
+    case MACHINE_COMBO_STATE_NEEDLE_PUSH:
+        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_NEEDLE_RAIL,
+                                          MACHINE_COMBO_NEEDLE_POSITION_MM_X100,
                                           MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
         {
             Machine_AbortCombo();
@@ -816,8 +816,8 @@ static void Machine_ExecuteComboState(void)
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_A_HOME:
-        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_A,
+    case MACHINE_COMBO_STATE_TANK_HOME:
+        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_TANK_RAIL,
                                           0U,
                                           MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
         {
@@ -825,8 +825,8 @@ static void Machine_ExecuteComboState(void)
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_B_HOME:
-        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_B,
+    case MACHINE_COMBO_STATE_NEEDLE_HOME:
+        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_NEEDLE_RAIL,
                                           0U,
                                           MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
         {
@@ -890,13 +890,13 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_IDLE:
     case MACHINE_COMBO_STATE_WAIT_REMOTE_PREPARE:
-    case MACHINE_COMBO_STATE_GAP_AFTER_A:
-    case MACHINE_COMBO_STATE_GAP_AFTER_B:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
-    case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
-    case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME:
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2:
@@ -937,7 +937,7 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
 
     Machine_StopComboOutputs();
     Machine_NotifyFlowStarted(owner);
-    Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_A_PUSH);
+    Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
 }
 
 /**
@@ -975,28 +975,28 @@ static void Machine_UpdateCombo(void)
 
     switch (machine_combo_state)
     {
-    case MACHINE_COMBO_STATE_STEP_A_PUSH:
-        if (StepMotor_IsBusy(STEP_MOTOR_ID_A) == 0U)
+    case MACHINE_COMBO_STATE_TANK_PUSH:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) == 0U)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_A);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_TANK);
         }
         break;
 
-    case MACHINE_COMBO_STATE_GAP_AFTER_A:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_B_PUSH);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_NEEDLE_PUSH);
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_B_PUSH:
-        if (StepMotor_IsBusy(STEP_MOTOR_ID_B) == 0U)
+    case MACHINE_COMBO_STATE_NEEDLE_PUSH:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) == 0U)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_B);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE);
         }
         break;
 
-    case MACHINE_COMBO_STATE_GAP_AFTER_B:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_RAW_PUMP_ON);
@@ -1115,10 +1115,10 @@ static void Machine_UpdateCombo(void)
             }
 
             /*
-             * 回退导轨时先收插针导轨（电机B），再收进罐导轨（电机A）。
+             * 回退导轨时先收插针导轨（150mm，电机A），再收进罐导轨（300mm，电机B）。
              * 插针先退出可以先解除针头和瓶口/管路的机械约束，再移动进罐方向。
              */
-            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_B_HOME);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_NEEDLE_HOME);
         }
         else if ((activity_wait == MACHINE_ACTIVITY_WAIT_ERROR) &&
                  (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL))
@@ -1127,14 +1127,14 @@ static void Machine_UpdateCombo(void)
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_A_HOME:
-        if (StepMotor_IsBusy(STEP_MOTOR_ID_A) == 0U)
+    case MACHINE_COMBO_STATE_TANK_HOME:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) == 0U)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_A_HOME);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME);
         }
         break;
 
-    case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
             if (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE)
@@ -1148,17 +1148,17 @@ static void Machine_UpdateCombo(void)
         }
         break;
 
-    case MACHINE_COMBO_STATE_STEP_B_HOME:
-        if (StepMotor_IsBusy(STEP_MOTOR_ID_B) == 0U)
+    case MACHINE_COMBO_STATE_NEEDLE_HOME:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) == 0U)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_B_HOME);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME);
         }
         break;
 
-    case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_STEP_A_HOME);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_HOME);
         }
         break;
 
@@ -1750,10 +1750,10 @@ uint8_t Machine_GetCommunicationStep(void)
     case MACHINE_COMBO_STATE_WAIT_REMOTE_PREPARE:
         return COMMUNICATION_STEP_TRANSFER_DONE;
 
-    case MACHINE_COMBO_STATE_STEP_A_PUSH:
-    case MACHINE_COMBO_STATE_GAP_AFTER_A:
-    case MACHINE_COMBO_STATE_STEP_B_PUSH:
-    case MACHINE_COMBO_STATE_GAP_AFTER_B:
+    case MACHINE_COMBO_STATE_TANK_PUSH:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK:
+    case MACHINE_COMBO_STATE_NEEDLE_PUSH:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE:
     case MACHINE_COMBO_STATE_RAW_PUMP_ON:
     case MACHINE_COMBO_STATE_RAW_PUMP_OFF:
         return (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) ?
@@ -1779,10 +1779,10 @@ uint8_t Machine_GetCommunicationStep(void)
     case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
         return COMMUNICATION_STEP_PREPARE_WAIT_ACTIVITY;
 
-    case MACHINE_COMBO_STATE_STEP_A_HOME:
-    case MACHINE_COMBO_STATE_GAP_AFTER_A_HOME:
-    case MACHINE_COMBO_STATE_STEP_B_HOME:
-    case MACHINE_COMBO_STATE_GAP_AFTER_B_HOME:
+    case MACHINE_COMBO_STATE_TANK_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME:
+    case MACHINE_COMBO_STATE_NEEDLE_HOME:
+    case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME:
         return COMMUNICATION_STEP_PREPARE_RESULT;
 
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:

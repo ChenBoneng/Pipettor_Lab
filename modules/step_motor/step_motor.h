@@ -11,8 +11,8 @@
  * 转换成 DM542 可以识别的 PUL/DIR 时序。
  *
  * 当前硬件连接：
- * - 进罐导轨（电机A）：PA0/TIM2_CH1 输出 PUL，PA7/PA6 输出 DIR+/DIR-；
- * - 插针导轨（电机B）：PA1/TIM2_CH2 输出 PUL，PA5/PA4 输出 DIR+/DIR-；
+ * - 插针导轨（150mm，电机A）：PA0/TIM2_CH1 输出 PUL，PA7/PA6 输出 DIR+/DIR-；
+ * - 进罐导轨（300mm，电机B）：PA1/TIM2_CH2 输出 PUL，PA5/PA4 输出 DIR+/DIR-；
  * - ENA 未看到独立 MCU 控制网络，按 DM542 默认悬空使能处理。
  *
  * @note TIM2_CH1 和 TIM2_CH2 共用同一个计数周期，因此理论上两路同时运行时
@@ -27,10 +27,16 @@
  */
 typedef enum
 {
-    STEP_MOTOR_ID_A = 0, /**< 进罐导轨（电机A），对应 CN6 接口，PUL 使用 TIM2_CH1/PA0。 */
-    STEP_MOTOR_ID_B,     /**< 插针导轨（电机B），对应 CN5 接口，PUL 使用 TIM2_CH2/PA1。 */
+    STEP_MOTOR_ID_A = 0, /**< 插针导轨（150mm，电机A），对应 CN6 接口，PUL 使用 TIM2_CH1/PA0。 */
+    STEP_MOTOR_ID_B,     /**< 进罐导轨（300mm，电机B），对应 CN5 接口，PUL 使用 TIM2_CH2/PA1。 */
     STEP_MOTOR_ID_MAX    /**< 电机数量边界值，仅用于数组长度和参数检查。 */
 } StepMotorId_e;
+
+/*
+ * 业务层优先使用导轨语义别名，避免后续阅读代码时再把 A/B 和机械功能互相翻译。
+ */
+#define STEP_MOTOR_ID_NEEDLE_RAIL  STEP_MOTOR_ID_A
+#define STEP_MOTOR_ID_TANK_RAIL    STEP_MOTOR_ID_B
 
 /**
  * @brief 步进电机方向。
@@ -128,7 +134,7 @@ uint8_t StepMotor_RunContinuous(StepMotorId_e motor,
  *
  * @note 本函数非阻塞。启动成功后立即返回，步数统计在 TIM2 PWM 中断中完成，
  *       达到 steps 后自动停止 PWM。当前位置按“推为正、拉为负”记录，
- *       A 轴有效范围为 0~150mm，B 轴有效范围为 0~300mm。
+ *       A 轴为 150mm 插针导轨，B 轴为 300mm 进罐导轨。
  */
 uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            StepMotorDirection_e direction,
@@ -168,7 +174,7 @@ uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
  *
  * @note 本函数非阻塞。内部会把距离换算成 steps，把速度换算成 pps，
  *       再按当前位置和方向计算目标位置。当前位置采用“推为正、拉为负”，
- *       A 轴有效范围为 0~150mm，B 轴有效范围为 0~300mm。
+ *       A 轴为 150mm 插针导轨，B 轴为 300mm 进罐导轨。
  */
 uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
@@ -185,7 +191,7 @@ uint8_t StepMotor_RunDistanceMmX100(StepMotorId_e motor,
  * @return 1 表示启动成功；0 表示参数错误、目标位置越界、换算结果为 0 或电机启动失败。
  *
  * @note 该接口便于应用层直接写“几厘米、几厘米每秒”。内部仍然按当前位置
- *       做累计位置保护，A 轴有效范围为 0~15cm，B 轴有效范围为 0~30cm。
+ *       做累计位置保护，A 轴为 15cm 插针导轨，B 轴为 30cm 进罐导轨。
  */
 uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
                                     StepMotorDirection_e direction,
@@ -201,7 +207,7 @@ uint8_t StepMotor_RunDistanceCmX100(StepMotorId_e motor,
  * @return 1 表示启动成功或已经在目标位置；0 表示目标越界、速度非法或电机启动失败。
  *
  * @note 坐标范围采用方案 A：上电默认当前位置为 0，推方向为正。
- *       因此 A 轴目标范围为 0~15000，B 轴目标范围为 0~30000。
+ *       因此插针导轨目标范围为 0~15000，进罐导轨目标范围为 0~30000。
  */
 uint8_t StepMotor_RunToPositionMmX100(StepMotorId_e motor,
                                       uint32_t target_mm_x100,
