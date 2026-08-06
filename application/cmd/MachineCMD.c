@@ -37,6 +37,7 @@
 #define MACHINE_CMD_REMOTE_MED_VALVE_ON   (1U << 1)
 #define MACHINE_CMD_REMOTE_WATER_PUMP_ON  (1U << 2)
 #define MACHINE_CMD_ACTIVITY_PUSH_SEQ      0U
+#define MACHINE_CMD_PREP_MAX_BOTTLE_COUNT 2U
 
 typedef enum
 {
@@ -78,6 +79,17 @@ typedef struct
     uint16_t standby_conc_x1000;                         // 待机页当前浓度，单位 0.001mCi/ml
     uint16_t standby_activity_x100;                      // 待机页活度计实时活度，单位 0.01mCi
     uint16_t standby_volume_ml_x100;                     // 待机页当前剩余体积，单位 0.01ml
+    uint8_t prep_bottle_count;                           // 本机 UI 选择的药瓶数量，当前最多 2 瓶
+    uint8_t prep_bottle_index;                           // 本机 UI 当前正在输入的药瓶序号，取值 1~2
+    uint16_t prep_bottle_ml_x100[MACHINE_CMD_PREP_MAX_BOTTLE_COUNT]; // 1/2 号药瓶量，单位 0.01ml
+    uint8_t prep_start_requested;                        // 本机 UI 配药启动请求，后续由业务层消费
+    uint8_t prep_switch_requested;                       // 本机 UI 换罐继续请求，后续由业务层消费
+    uint8_t prep_switch_next_bottle;                     // 本机 UI 换罐后需要放入的药瓶序号
+    uint8_t dispense_start_requested;                    // 本机 UI 发药启动请求，后续由业务层消费
+    MachineCmdPrepRunStage_e prep_run_stage;             // 本机配药 UI 当前显示阶段
+    uint16_t prep_stage_done_ml_x100;                    // 阶段进度已完成量，单位 0.01ml
+    uint16_t prep_stage_total_ml_x100;                   // 阶段进度总量，单位 0.01ml
+    uint16_t prep_final_conc_x1000;                      // 配药完成页显示浓度，单位 0.001mCi/ml
     uint8_t prep_confirmed;                              // 配药量确认事件，machine 层读取后清零
     uint8_t dispense_confirmed;                          // 发药量确认事件，machine 层读取后清零
     uint8_t dispense_input_error;                         // 发药输入超余量提示标志
@@ -111,21 +123,18 @@ static uint32_t MachineCMD_GetMs(void);
 static void MachineCMD_EnterPage(MachineCmdPage_e page);
 static void MachineCMD_TryEnterDispSettingPage(uint8_t allow_direct_dispense);
 static void MachineCMD_ClearInput(void);
+static void MachineCMD_ResetPrepUi(void);
+static uint8_t MachineCMD_ShouldShowAbortOnReset(void);
 static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit);
 static uint8_t MachineCMD_IsNumberKey(KeypadState_e key);
 static void MachineCMD_AppendDigit(uint8_t digit);
 static void MachineCMD_AppendDot(void);
 static uint16_t MachineCMD_InputToScaledValue(uint16_t scale);
 static uint16_t MachineCMD_InputToMlX100(void);
-static uint16_t MachineCMD_InputToConcX1000(void);
-static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
-                                                  uint16_t current_ml_x100,
-                                                  uint16_t target_conc_x1000);
 static uint16_t MachineCMD_ActivityToMciX100(const ActivityMeterData_s *activity_data);
 static void MachineCMD_UpdateStandbyActivityFromMeter(void);
 static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10);
 static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100);
-static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000);
 static void MachineCMD_HandleStandbyKey(KeypadState_e key);
 static void MachineCMD_HandlePrepSettingKey(KeypadState_e key);
 static void MachineCMD_HandlePrepRunningKey(KeypadState_e key);
@@ -170,11 +179,6 @@ static void MachineCMD_WriteBytes(DisplayLcdRow_e row, const uint8_t *data, uint
 static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *text);
 static void MachineCMD_FormatActivityAscii(char *buffer, uint8_t size, float value, const char *unit);
 static const MachineCmdText_s *MachineCMD_GetManualActionText(void);
-static const MachineCmdText_s *MachineCMD_GetPrepStepTitle(void);
-static const MachineCmdText_s *MachineCMD_GetPrepStepLabel(void);
-static const MachineCmdText_s *MachineCMD_GetPrepStepHint(void);
-static void MachineCMD_FormatPrepFocusValue(char *buffer, uint8_t size);
-static void MachineCMD_MovePrepFocusBack(void);
 static void MachineCMD_ShowBootPage(void);
 static void MachineCMD_ShowReadyPage(void);
 static void MachineCMD_ShowStandbyPage(void);
@@ -188,6 +192,10 @@ static void MachineCMD_ShowManualPage(void);
 static void MachineCMD_ShowCleanPage(void);
 static void MachineCMD_ShowPausedPage(void);
 static void MachineCMD_ShowAlarmPage(void);
+static void MachineCMD_ShowPrepReadyPage(void);
+static void MachineCMD_ShowPrepSwitchPage(void);
+static void MachineCMD_ShowPrepDonePage(void);
+static void MachineCMD_ShowAbortPage(void);
 
 /**
  * @brief 初始化 LCD/按键命令层。
@@ -206,6 +214,7 @@ void MachineCMD_Init(void)
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
     machine_cmd.remote_enabled = 0U;
     machine_cmd.remote_paused = 0U;
+    MachineCMD_ResetPrepUi();
     MachineCMD_ClearManualSwitches();
 }
 
@@ -246,7 +255,7 @@ void MachineCMD_Process(void)
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) &&
         ((now_ms - machine_cmd.measure_start_ms) >= MACHINE_CMD_MEASURE_HOLD_MS))
     {
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+        MachineCMD_SetPrepFinished(machine_cmd.standby_conc_x1000);
     }
 
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) &&
@@ -300,6 +309,7 @@ void MachineCMD_Process(void)
     if (key == KEYPAD_STATE_RESET)
     {
         uint8_t mode = Communication_GetControlMode();
+        uint8_t show_abort = MachineCMD_ShouldShowAbortOnReset();
 
         if ((mode == COMMUNICATION_CONTROL_REMOTE) ||
             (mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING))
@@ -323,12 +333,24 @@ void MachineCMD_Process(void)
         MachineCMD_StopRemoteOutputs();
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.prep_start_requested = 0U;
+        machine_cmd.prep_switch_requested = 0U;
+        machine_cmd.dispense_start_requested = 0U;
         machine_cmd.dispense_input_error = 0U;
         machine_cmd.reset_requested = 1U;
         machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
         machine_cmd.remote_enabled = 0U;
         machine_cmd.remote_paused = 0U;
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+        if (show_abort != 0U)
+        {
+            MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_ABORTING, 0U, 0U);
+            MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
+        }
+        else
+        {
+            MachineCMD_ResetPrepUi();
+            MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+        }
         MachineCMD_SyncRemoteState();
         return;
     }
@@ -552,6 +574,109 @@ uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100)
     return 1U;
 }
 
+uint8_t MachineCMD_ConsumeLocalPrepStartRequested(uint8_t *bottle_count,
+                                                  uint16_t *bottle1_ml_x100,
+                                                  uint16_t *bottle2_ml_x100)
+{
+    if (machine_cmd.prep_start_requested == 0U)
+    {
+        return 0U;
+    }
+
+    if (bottle_count != NULL)
+    {
+        *bottle_count = machine_cmd.prep_bottle_count;
+    }
+    if (bottle1_ml_x100 != NULL)
+    {
+        *bottle1_ml_x100 = machine_cmd.prep_bottle_ml_x100[0];
+    }
+    if (bottle2_ml_x100 != NULL)
+    {
+        *bottle2_ml_x100 = machine_cmd.prep_bottle_ml_x100[1];
+    }
+
+    machine_cmd.prep_start_requested = 0U;
+    return 1U;
+}
+
+uint8_t MachineCMD_ConsumeLocalPrepSwitchRequested(uint8_t *next_bottle_index)
+{
+    if (machine_cmd.prep_switch_requested == 0U)
+    {
+        return 0U;
+    }
+
+    if (next_bottle_index != NULL)
+    {
+        *next_bottle_index = machine_cmd.prep_switch_next_bottle;
+    }
+
+    machine_cmd.prep_switch_requested = 0U;
+    return 1U;
+}
+
+uint8_t MachineCMD_ConsumeLocalDispenseStartRequested(uint16_t *volume_ml_x100)
+{
+    if (machine_cmd.dispense_start_requested == 0U)
+    {
+        return 0U;
+    }
+
+    if (volume_ml_x100 != NULL)
+    {
+        *volume_ml_x100 = machine_cmd.dispense_ml_x100;
+    }
+
+    machine_cmd.dispense_start_requested = 0U;
+    return 1U;
+}
+
+void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
+                                uint16_t done_ml_x100,
+                                uint16_t total_ml_x100)
+{
+    MachineCmdPage_e target_page;
+
+    machine_cmd.prep_run_stage = stage;
+    machine_cmd.prep_stage_done_ml_x100 = done_ml_x100;
+    machine_cmd.prep_stage_total_ml_x100 = total_ml_x100;
+
+    if (stage == MACHINE_CMD_PREP_RUN_STAGE_ACTIVITY_CHECK)
+    {
+        target_page = MACHINE_CMD_PAGE_PREP_MEASURE;
+    }
+    else if (stage == MACHINE_CMD_PREP_RUN_STAGE_FLUSH)
+    {
+        target_page = MACHINE_CMD_PAGE_CLEAN;
+    }
+    else
+    {
+        target_page = MACHINE_CMD_PAGE_PREP_RUNNING;
+    }
+
+    if (machine_cmd.page != target_page)
+    {
+        MachineCMD_EnterPage(target_page);
+    }
+}
+
+void MachineCMD_SetPrepSwitchTank(uint8_t done_bottle_index, uint8_t next_bottle_index)
+{
+    machine_cmd.prep_switch_next_bottle = next_bottle_index;
+    machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK;
+    machine_cmd.prep_stage_done_ml_x100 = (uint16_t)done_bottle_index;
+    machine_cmd.prep_stage_total_ml_x100 = (uint16_t)next_bottle_index;
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
+}
+
+void MachineCMD_SetPrepFinished(uint16_t final_conc_x1000)
+{
+    machine_cmd.prep_final_conc_x1000 = final_conc_x1000;
+    machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_DONE;
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
+}
+
 void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
                                     uint16_t activity_x100,
                                     uint16_t volume_ml_x100)
@@ -620,11 +745,13 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page)
         machine_cmd.prep_target_conc_x1000 = 0U;
         machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
         machine_cmd.prep_confirmed = 0U;
+        MachineCMD_ResetPrepUi();
     }
 
     if (page == MACHINE_CMD_PAGE_DISP_SETTING)
     {
         machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.dispense_start_requested = 0U;
         machine_cmd.dispense_input_error = 0U;
     }
 
@@ -678,6 +805,45 @@ static void MachineCMD_TryEnterDispSettingPage(uint8_t allow_direct_dispense)
 static void MachineCMD_ClearInput(void)
 {
     memset(machine_cmd.input, 0, sizeof(machine_cmd.input));
+}
+
+/**
+ * @brief 清空本机配药 UI 输入和预留请求。
+ *
+ * @note 本函数只维护 MachineCMD 内部页面状态，不触发 machine 层流程，
+ *       也不直接操作泵、电机或阀门。
+ */
+static void MachineCMD_ResetPrepUi(void)
+{
+    machine_cmd.prep_bottle_count = 0U;
+    machine_cmd.prep_bottle_index = 1U;
+    memset(machine_cmd.prep_bottle_ml_x100, 0, sizeof(machine_cmd.prep_bottle_ml_x100));
+    machine_cmd.prep_start_requested = 0U;
+    machine_cmd.prep_switch_requested = 0U;
+    machine_cmd.prep_switch_next_bottle = 0U;
+    machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_READY;
+    machine_cmd.prep_stage_done_ml_x100 = 0U;
+    machine_cmd.prep_stage_total_ml_x100 = 0U;
+    machine_cmd.prep_final_conc_x1000 = 0U;
+}
+
+/**
+ * @brief 判断复位键是否应先显示“正在中止”。
+ *
+ * @note 运行、测量、清洗和发药提示页代表操作员认为流程正在执行，
+ *       因此复位后先留在 UI 中止提示，后续由 machine 层接真实收尾动作。
+ */
+static uint8_t MachineCMD_ShouldShowAbortOnReset(void)
+{
+    if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) ||
+        (machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) ||
+        (machine_cmd.page == MACHINE_CMD_PAGE_DISP_RUNNING) ||
+        (machine_cmd.page == MACHINE_CMD_PAGE_CLEAN))
+    {
+        return 1U;
+    }
+
+    return 0U;
 }
 
 /**
@@ -862,14 +1028,6 @@ static uint16_t MachineCMD_InputToMlX100(void)
 }
 
 /**
- * @brief 将当前输入字符串转换成 0.001mCi/ml 单位的整数值。
- */
-static uint16_t MachineCMD_InputToConcX1000(void)
-{
-    return MachineCMD_InputToScaledValue(1000U);
-}
-
-/**
  * @brief 格式化 1 位小数的 ASCII 数字。
  *
  * @param value_x10 已放大 10 倍的值，例如 1205 表示 120.5。
@@ -894,55 +1052,6 @@ static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t va
 static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100)
 {
     MachineCMD_FormatFixed1Ascii(buffer, size, ((uint32_t)value_x100 + 5U) / 10U);
-}
-
-/**
- * @brief 把 0.001mCi/ml 单位的值格式化成 1 位小数 ASCII。
- */
-static void MachineCMD_FormatConcX1000Ascii(char *buffer, uint8_t size, uint16_t value_x1000)
-{
-    MachineCMD_FormatFixed1Ascii(buffer, size, ((uint32_t)value_x1000 + 50U) / 100U);
-}
-
-/**
- * @brief 计算配药完成后可发药余量。
- *
- * @param current_conc_x1000 当前活度浓度，单位 0.001mCi/ml。
- * @param current_ml_x100 当前溶液体积，单位 0.01ml。
- * @param target_conc_x1000 目标活度浓度，单位 0.001mCi/ml。
- * @return 配药完成后的理论总体积，单位 0.01ml。
- *
- * @note 这里和 machine 层补水计算保持同一套稀释公式：
- *       当前总活度不变，目标浓度更低时，最终体积 = 当前浓度 * 当前体积 / 目标浓度。
- *       如果目标浓度大于等于当前浓度，则不补水，余量就是当前体积。
- */
-static uint16_t MachineCMD_CalcPreparedLeftMlX100(uint16_t current_conc_x1000,
-                                                  uint16_t current_ml_x100,
-                                                  uint16_t target_conc_x1000)
-{
-    uint32_t final_ml_x100;
-
-    if (current_ml_x100 == 0U)
-    {
-        return 0U;
-    }
-
-    if ((current_conc_x1000 == 0U) ||
-        (target_conc_x1000 == 0U) ||
-        (target_conc_x1000 >= current_conc_x1000))
-    {
-        return current_ml_x100;
-    }
-
-    final_ml_x100 = (((uint32_t)current_conc_x1000 * (uint32_t)current_ml_x100) +
-                     (target_conc_x1000 / 2U)) /
-                    target_conc_x1000;
-    if (final_ml_x100 > 0xFFFFU)
-    {
-        final_ml_x100 = 0xFFFFU;
-    }
-
-    return (uint16_t)final_ml_x100;
 }
 
 /**
@@ -1058,7 +1167,13 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
 
     case KEYPAD_STATE_CLEAR_ALL:
         MachineCMD_ClearManualSwitches();
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH, 0U, 0U);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_CLEAN);
+        break;
+
+    case KEYPAD_STATE_EXHAUST_FIXED:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_EXHAUST, 0U, 0U);
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
         break;
 
     case KEYPAD_STATE_FAULT:
@@ -1083,7 +1198,6 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
     case KEYPAD_STATE_INSERT_NEEDLE:
     case KEYPAD_STATE_RETRACT_NEEDLE:
     case KEYPAD_STATE_DRAW_MEDICINE:
-    case KEYPAD_STATE_EXHAUST_FIXED:
         MachineCMD_SetManualAction(key);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_MANUAL);
         break;
@@ -1110,6 +1224,27 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
 {
     uint8_t digit;
 
+    if (machine_cmd.prep_bottle_count == 0U)
+    {
+        if (key == KEYPAD_STATE_NUM_1)
+        {
+            machine_cmd.prep_bottle_count = 1U;
+            machine_cmd.prep_bottle_index = 1U;
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        if (key == KEYPAD_STATE_NUM_2)
+        {
+            machine_cmd.prep_bottle_count = 2U;
+            machine_cmd.prep_bottle_index = 1U;
+            MachineCMD_ClearInput();
+            return;
+        }
+
+        return;
+    }
+
     if (MachineCMD_KeyToDigit(key, &digit) != 0U)
     {
         MachineCMD_AppendDigit(digit);
@@ -1130,43 +1265,37 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
             return;
         }
 
-        MachineCMD_MovePrepFocusBack();
+        if (machine_cmd.prep_bottle_index > 1U)
+        {
+            machine_cmd.prep_bottle_index--;
+        }
+        else
+        {
+            machine_cmd.prep_bottle_count = 0U;
+        }
         return;
     }
 
     if (key == KEYPAD_STATE_START)
     {
-        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_CONC)
+        uint8_t index = machine_cmd.prep_bottle_index;
+
+        if ((index == 0U) || (index > MACHINE_CMD_PREP_MAX_BOTTLE_COUNT))
         {
-            if (machine_cmd.input[0] != '\0')
-            {
-                machine_cmd.prep_current_conc_x1000 = MachineCMD_InputToConcX1000();
-            }
-            machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME;
-            MachineCMD_ClearInput();
             return;
         }
 
-        if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
-        {
-            if (machine_cmd.input[0] != '\0')
-            {
-                machine_cmd.prep_current_ml_x100 = MachineCMD_InputToMlX100();
-            }
-            machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_TARGET_CONC;
-            MachineCMD_ClearInput();
-            return;
-        }
-
-        if (machine_cmd.input[0] != '\0')
-        {
-            machine_cmd.prep_target_conc_x1000 = MachineCMD_InputToConcX1000();
-        }
-        machine_cmd.left_ml_x100 = MachineCMD_CalcPreparedLeftMlX100(machine_cmd.prep_current_conc_x1000,
-                                                                     machine_cmd.prep_current_ml_x100,
-                                                                     machine_cmd.prep_target_conc_x1000);
-        machine_cmd.prep_confirmed = 1U;
+        machine_cmd.prep_bottle_ml_x100[index - 1U] =
+            (machine_cmd.input[0] != '\0') ? MachineCMD_InputToMlX100() : 0U;
         MachineCMD_ClearInput();
+
+        if (index < machine_cmd.prep_bottle_count)
+        {
+            machine_cmd.prep_bottle_index++;
+            return;
+        }
+
+        machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_READY;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
     }
 }
@@ -1181,9 +1310,33 @@ static void MachineCMD_HandlePrepSettingKey(KeypadState_e key)
  */
 static void MachineCMD_HandlePrepRunningKey(KeypadState_e key)
 {
+    if ((machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_READY) &&
+        (key == KEYPAD_STATE_START))
+    {
+        machine_cmd.prep_start_requested = 1U;
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_IN_TANK, 0U, 0U);
+        return;
+    }
+
+    if ((machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK) &&
+        (key == KEYPAD_STATE_START))
+    {
+        machine_cmd.prep_switch_requested = 1U;
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_IN_TANK, 0U, 0U);
+        return;
+    }
+
+    if ((machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_DONE) &&
+        (key == KEYPAD_STATE_START))
+    {
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+        return;
+    }
+
     if (key == KEYPAD_STATE_SEND_MEDICINE)
     {
-        MachineCMD_TryEnterDispSettingPage(0U);
+        MachineCMD_TryEnterDispSettingPage(
+            (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_DONE) ? 1U : 0U);
         return;
     }
 
@@ -1260,7 +1413,8 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key)
         }
 
         machine_cmd.dispense_input_error = 0U;
-        machine_cmd.dispense_confirmed = 1U;
+        machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.dispense_start_requested = 1U;
         MachineCMD_ClearInput();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_DISP_RUNNING);
     }
@@ -2636,122 +2790,6 @@ static const MachineCmdText_s *MachineCMD_GetManualActionText(void)
 }
 
 /**
- * @brief 获取配药向导当前步骤标题。
- *
- * @return 当前步骤对应的 LCD 文案。
- */
-static const MachineCmdText_s *MachineCMD_GetPrepStepTitle(void)
-{
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
-    {
-        return &machine_cmd_text_prep_step2;
-    }
-
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
-    {
-        return &machine_cmd_text_prep_step3;
-    }
-
-    return &machine_cmd_text_prep_step1;
-}
-
-/**
- * @brief 获取配药向导当前输入项说明。
- *
- * @return 当前输入项对应的 LCD 文案。
- */
-static const MachineCmdText_s *MachineCMD_GetPrepStepLabel(void)
-{
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
-    {
-        return &machine_cmd_text_current_volume_unit;
-    }
-
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
-    {
-        return &machine_cmd_text_target_conc_unit;
-    }
-
-    return &machine_cmd_text_current_conc_unit;
-}
-
-/**
- * @brief 获取配药向导当前启动键提示。
- *
- * @return 当前步骤对应的 LCD 文案。
- */
-static const MachineCmdText_s *MachineCMD_GetPrepStepHint(void)
-{
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
-    {
-        return &machine_cmd_text_start_prep;
-    }
-
-    return &machine_cmd_text_start_next_step;
-}
-
-/**
- * @brief 格式化配药向导当前步骤已经保存的数值。
- *
- * @param buffer 输出 ASCII 缓冲。
- * @param size 缓冲区长度。
- *
- * @note 用户按【清除】退回上一项时，已保存的值仍然显示出来。
- *       如果继续直接按【启动】，该值会被保留；如果重新输入数字，则用新输入覆盖。
- */
-static void MachineCMD_FormatPrepFocusValue(char *buffer, uint8_t size)
-{
-    if ((buffer == NULL) || (size == 0U))
-    {
-        return;
-    }
-
-    buffer[0] = '\0';
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_CONC)
-    {
-        if (machine_cmd.prep_current_conc_x1000 != 0U)
-        {
-            MachineCMD_FormatConcX1000Ascii(buffer, size, machine_cmd.prep_current_conc_x1000);
-        }
-        return;
-    }
-
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
-    {
-        if (machine_cmd.prep_current_ml_x100 != 0U)
-        {
-            MachineCMD_FormatMlX100Ascii(buffer, size, machine_cmd.prep_current_ml_x100);
-        }
-        return;
-    }
-
-    if (machine_cmd.prep_target_conc_x1000 != 0U)
-    {
-        MachineCMD_FormatConcX1000Ascii(buffer, size, machine_cmd.prep_target_conc_x1000);
-    }
-}
-
-/**
- * @brief 配药向导退回上一项。
- *
- * @note 面板没有上下方向键，所以复用【清除】键：
- *       当前输入框为空时，再按【清除】就回到上一个输入步骤。
- */
-static void MachineCMD_MovePrepFocusBack(void)
-{
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_TARGET_CONC)
-    {
-        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME;
-        return;
-    }
-
-    if (machine_cmd.prep_focus == MACHINE_CMD_PREP_FOCUS_CURRENT_VOLUME)
-    {
-        machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
-    }
-}
-
-/**
  * @brief 显示开机初始化页。
  */
 static void MachineCMD_ShowBootPage(void)
@@ -2788,30 +2826,25 @@ static void MachineCMD_ShowStandbyPage(void)
 
     MachineCMD_UpdateStandbyActivityFromMeter();
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_standby);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_device_standby);
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_concentration);
-    MachineCMD_FormatConcX1000Ascii(ascii, sizeof(ascii), machine_cmd.standby_conc_x1000);
-    offset = MachineCMD_LineAppendString(line, offset, ascii);
-    (void)MachineCMD_LineAppendString(line, offset, "mCi/ml");
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
-
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_activity);
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_activity_label);
     MachineCMD_FormatFixed1Ascii(ascii,
                                  sizeof(ascii),
                                  ((uint32_t)machine_cmd.standby_activity_x100 + 5U) / 10U);
     offset = MachineCMD_LineAppendString(line, offset, ascii);
     (void)MachineCMD_LineAppendString(line, offset, "mCi");
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_volume_prefix);
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_volume_label);
     MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.standby_volume_ml_x100);
     offset = MachineCMD_LineAppendString(line, offset, ascii);
     (void)MachineCMD_LineAppendString(line, offset, "ml");
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_4, line, sizeof(line));
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_prep_disp);
 }
 
 /**
@@ -2825,28 +2858,47 @@ static void MachineCMD_ShowPrepSettingPage(void)
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
     char ascii[8];
+    uint8_t index;
+    uint16_t volume_ml_x100;
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, MachineCMD_GetPrepStepTitle());
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, MachineCMD_GetPrepStepLabel());
+    if (machine_cmd.prep_bottle_count == 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_select_bottle_count);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_one_bottle);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_two_bottle);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_press_1_or_2);
+        return;
+    }
 
-    /*
-     * 第 3 行：> ____
-     * 当前步骤只显示一个输入框。若用户从后续步骤退回来，优先显示已经保存的值；
-     * 一旦重新输入数字，则显示新的输入缓冲。
-     */
+    index = machine_cmd.prep_bottle_index;
+    if ((index == 0U) || (index > MACHINE_CMD_PREP_MAX_BOTTLE_COUNT))
+    {
+        index = 1U;
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_input_med_volume);
+
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendString(line, 0U, "> ");
+    offset = MachineCMD_LineAppendText(line,
+                                       0U,
+                                       (index == 1U) ?
+                                       &machine_cmd_text_ui_bottle1_label :
+                                       &machine_cmd_text_ui_bottle2_label);
     if (machine_cmd.input[0] != '\0')
     {
-        offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input);
+        volume_ml_x100 = MachineCMD_InputToMlX100();
     }
     else
     {
-        MachineCMD_FormatPrepFocusValue(ascii, sizeof(ascii));
-        offset = MachineCMD_LineAppendString(line, offset, ascii[0] != '\0' ? ascii : "____");
+        volume_ml_x100 = machine_cmd.prep_bottle_ml_x100[index - 1U];
     }
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, MachineCMD_GetPrepStepHint());
+
+    MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), volume_ml_x100);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
+    (void)MachineCMD_LineAppendString(line, offset, "ml");
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, NULL);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_start_confirm);
 }
 
 /**
@@ -2856,10 +2908,157 @@ static void MachineCMD_ShowPrepSettingPage(void)
  */
 static void MachineCMD_ShowPrepRunningPage(void)
 {
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_current_measure);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_activity);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    char ascii[12];
+    uint8_t step = 1U;
+    const MachineCmdText_s *action_text = &machine_cmd_text_ui_in_tank_run;
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_READY)
+    {
+        MachineCMD_ShowPrepReadyPage();
+        return;
+    }
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK)
+    {
+        MachineCMD_ShowPrepSwitchPage();
+        return;
+    }
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_DONE)
+    {
+        MachineCMD_ShowPrepDonePage();
+        return;
+    }
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_ABORTING)
+    {
+        MachineCMD_ShowAbortPage();
+        return;
+    }
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_EXHAUST)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_auto_exhaust);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_pump2_run);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_wait);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, NULL);
+        return;
+    }
+
+    if (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_FLUSH)
+    {
+        MachineCMD_ShowCleanPage();
+        return;
+    }
+
+    switch (machine_cmd.prep_run_stage)
+    {
+    case MACHINE_CMD_PREP_RUN_STAGE_INSERT_NEEDLE:
+        step = 2U;
+        action_text = &machine_cmd_text_ui_insert_needle_run;
+        break;
+
+    case MACHINE_CMD_PREP_RUN_STAGE_DRAW_WATER:
+        step = 3U;
+        action_text = &machine_cmd_text_ui_draw_water;
+        break;
+
+    case MACHINE_CMD_PREP_RUN_STAGE_WATER_FILL:
+        step = 4U;
+        action_text = &machine_cmd_text_ui_water_fill;
+        break;
+
+    case MACHINE_CMD_PREP_RUN_STAGE_ACTIVITY_CHECK:
+        step = 5U;
+        action_text = &machine_cmd_text_ui_activity_check;
+        break;
+
+    case MACHINE_CMD_PREP_RUN_STAGE_IN_TANK:
+    default:
+        step = 1U;
+        action_text = &machine_cmd_text_ui_in_tank_run;
+        break;
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_auto_prepare);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_step);
+    (void)snprintf(ascii, sizeof(ascii), "%u", (unsigned int)step);
+    (void)MachineCMD_LineAppendString(line, offset, ascii);
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, action_text);
+
+    if ((machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_WATER_FILL) &&
+        (machine_cmd.prep_stage_total_ml_x100 != 0U))
+    {
+        memset(line, ' ', sizeof(line));
+        MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.prep_stage_done_ml_x100);
+        offset = MachineCMD_LineAppendString(line, 0U, ascii);
+        offset = MachineCMD_LineAppendString(line, offset, "/");
+        MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.prep_stage_total_ml_x100);
+        offset = MachineCMD_LineAppendString(line, offset, ascii);
+        (void)MachineCMD_LineAppendString(line, offset, "ml");
+        MachineCMD_WriteBytes(DISPLAY_LCD_ROW_4, line, sizeof(line));
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_wait);
+    }
+}
+
+static void MachineCMD_ShowPrepReadyPage(void)
+{
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_prepare_ready_title);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_put_tank_1);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_water_cup_ready);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_start_continue);
+}
+
+static void MachineCMD_ShowPrepSwitchPage(void)
+{
+    uint8_t done_bottle = (uint8_t)machine_cmd.prep_stage_done_ml_x100;
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1,
+                         (done_bottle == 2U) ?
+                         &machine_cmd_text_ui_bottle_2_done :
+                         &machine_cmd_text_ui_bottle_1_done);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_change_tank);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_put_tank_2);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_start_reset_short);
+}
+
+static void MachineCMD_ShowPrepDonePage(void)
+{
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    char ascii[12];
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_prepare_done);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_concentration);
+    (void)snprintf(ascii,
+                   sizeof(ascii),
+                   "%lu.%03lumCi",
+                   (unsigned long)(machine_cmd.prep_final_conc_x1000 / 1000U),
+                   (unsigned long)(machine_cmd.prep_final_conc_x1000 % 1000U));
+    (void)MachineCMD_LineAppendString(line, offset, ascii);
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_wait_dispense);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, NULL);
+}
+
+static void MachineCMD_ShowAbortPage(void)
+{
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_aborting);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_pipe_flush);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_rail_home);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_wait);
 }
 
 /**
@@ -2884,9 +3083,24 @@ static void MachineCMD_ShowPrepMeasurePage(void)
         left_sec = (MACHINE_CMD_MEASURE_HOLD_MS - elapsed_ms + 999U) / 1000U;
     }
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_prep_run);
+    if (left_sec != 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_activity_check);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_stable_read);
 
-    /* 轮询进入 WAITING 时继续显示最近一次有效值，避免数值和“检测中”来回闪烁。 */
+        memset(line, ' ', sizeof(line));
+        offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_remaining);
+        (void)snprintf(ascii, sizeof(ascii), "%2u", (unsigned int)left_sec);
+        offset = MachineCMD_LineAppendString(line, offset, ascii);
+        (void)MachineCMD_LineAppendString(line, offset, "s");
+        MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_wait);
+        return;
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_check_done);
+
     if ((ActivityMeter_GetData(&activity_data) != 0U) &&
         (activity_data.update_count != 0U))
     {
@@ -2899,23 +3113,13 @@ static void MachineCMD_ShowPrepMeasurePage(void)
         (void)MachineCMD_LineAppendString(line, offset, ascii);
         MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
     }
-    else if (ActivityMeter_GetState() == ACTIVITY_METER_STATE_TIMEOUT)
+    else
     {
         MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_activity_timeout);
     }
-    else
-    {
-        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_activity);
-    }
 
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_countdown);
-    (void)snprintf(ascii, sizeof(ascii), "%2u", (unsigned int)left_sec);
-    offset = MachineCMD_LineAppendString(line, offset, ascii);
-    (void)MachineCMD_LineAppendString(line, offset, "s");
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
-
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_calculating);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, NULL);
 }
 
 /**
@@ -2927,29 +3131,24 @@ static void MachineCMD_ShowDispSettingPage(void)
     uint8_t offset;
     char ascii[8];
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_disp_title);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_disp_setting);
 
-    /*
-     * 第 2 行：目标:____ml
-     * 目标输入只使用 ASCII 数字和小数点，避免和中文 GB2312 字节混写后出现错位。
-     */
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_target);
-    offset = MachineCMD_LineAppendString(line, offset, machine_cmd.input[0] != '\0' ? machine_cmd.input : "____");
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_remaining);
+    MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.left_ml_x100);
+    offset = MachineCMD_LineAppendString(line, offset, ascii);
     (void)MachineCMD_LineAppendString(line, offset, "ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
 
-    /*
-     * 第 3 行： （余量：xxx.xml)
-     * 配药确认后，left_ml_x100 保存“当前原药体积 + 计算出的补水体积”。
-     * 未配药直接进入发药页时保持 0.0ml，用于拦截超余量输入。
-     */
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_remaining_prefix);
-    MachineCMD_FormatMlX100Ascii(ascii, sizeof(ascii), machine_cmd.left_ml_x100);
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_input);
+    MachineCMD_FormatMlX100Ascii(ascii,
+                                 sizeof(ascii),
+                                 (machine_cmd.input[0] != '\0') ?
+                                 MachineCMD_InputToMlX100() :
+                                 0U);
     offset = MachineCMD_LineAppendString(line, offset, ascii);
-    offset = MachineCMD_LineAppendString(line, offset, "ml");
-    (void)MachineCMD_LineAppendString(line, offset, ")");
+    (void)MachineCMD_LineAppendString(line, offset, "ml");
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
 
     if (machine_cmd.dispense_input_error != 0U)
@@ -2958,7 +3157,7 @@ static void MachineCMD_ShowDispSettingPage(void)
     }
     else
     {
-        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_disp_start);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_start_begin);
     }
 }
 
@@ -2973,16 +3172,16 @@ static void MachineCMD_ShowDispRunningPage(void)
     uint8_t offset;
     char ascii[8];
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_disp_run);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_pump2);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_disp_running);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_pump2_run);
 
     memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_progress_prefix);
-    (void)snprintf(ascii, sizeof(ascii), "%03u%%", (unsigned int)Machine_GetDispenseProgressPercent());
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_done);
+    (void)snprintf(ascii, sizeof(ascii), "%u%%", (unsigned int)Machine_GetDispenseProgressPercent());
     (void)MachineCMD_LineAppendString(line, offset, ascii);
     MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
 
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_pause_reset_hint);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, NULL);
 }
 
 /**
@@ -3101,10 +3300,32 @@ static void MachineCMD_ShowManualPage(void)
  */
 static void MachineCMD_ShowCleanPage(void)
 {
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_clean_title);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_clean_pipe);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_pump1_run);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_waste_cup);
+    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
+    uint8_t offset;
+    char ascii[8];
+    uint8_t percent = 0U;
+
+    if (machine_cmd.prep_stage_total_ml_x100 != 0U)
+    {
+        percent = (uint8_t)((((uint32_t)machine_cmd.prep_stage_done_ml_x100 * 100U) +
+                             (machine_cmd.prep_stage_total_ml_x100 / 2U)) /
+                            machine_cmd.prep_stage_total_ml_x100);
+        if (percent > 100U)
+        {
+            percent = 100U;
+        }
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_pipe_flush);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_ui_pump1_run);
+
+    memset(line, ' ', sizeof(line));
+    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_ui_progress);
+    (void)snprintf(ascii, sizeof(ascii), "%u%%", (unsigned int)percent);
+    (void)MachineCMD_LineAppendString(line, offset, ascii);
+    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_wait);
 }
 
 /**

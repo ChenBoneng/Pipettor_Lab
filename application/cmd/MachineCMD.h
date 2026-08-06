@@ -31,6 +31,27 @@ typedef enum
 } MachineCmdPage_e;
 
 /**
+ * @brief 本机配药 UI 运行阶段。
+ *
+ * @note 本枚举只描述 LCD 应显示的阶段，不直接驱动电机、泵或阀。
+ *       后续 machine 层接入真实流程时，可按状态机阶段调用 MachineCMD_SetPrepRunStage()。
+ */
+typedef enum
+{
+    MACHINE_CMD_PREP_RUN_STAGE_READY = 0U,         /**< 操作员确认 1 号罐、水和接药杯。 */
+    MACHINE_CMD_PREP_RUN_STAGE_IN_TANK,           /**< 进罐导轨运行。 */
+    MACHINE_CMD_PREP_RUN_STAGE_INSERT_NEEDLE,      /**< 插针导轨运行。 */
+    MACHINE_CMD_PREP_RUN_STAGE_DRAW_WATER,         /**< 抽水泵抽液到活度计。 */
+    MACHINE_CMD_PREP_RUN_STAGE_WATER_FILL,         /**< 泵1补水，done/total 显示补水量。 */
+    MACHINE_CMD_PREP_RUN_STAGE_ACTIVITY_CHECK,     /**< 活度计稳定读数。 */
+    MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK,        /**< 当前药罐完成，等待换下一罐。 */
+    MACHINE_CMD_PREP_RUN_STAGE_EXHAUST,            /**< 泵2排气。 */
+    MACHINE_CMD_PREP_RUN_STAGE_FLUSH,              /**< 泵1冲洗。 */
+    MACHINE_CMD_PREP_RUN_STAGE_DONE,               /**< 配药完成，等待发药。 */
+    MACHINE_CMD_PREP_RUN_STAGE_ABORTING            /**< 正在中止并等待收尾动作。 */
+} MachineCmdPrepRunStage_e;
+
+/**
  * @brief 手动调试开关位。
  *
  * 数字键在手动调试页不再作为数值输入，而是作为独立动作开关：
@@ -72,6 +93,20 @@ uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *current_conc_x1000,
 
 // 读取并清除“发药量已经确认”事件，volume_ml_x100 单位为 0.01ml。
 uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100);
+
+/* 本机 UI 预留事件接口：当前只记录用户意图，不直接启动泵、电机或阀。 */
+uint8_t MachineCMD_ConsumeLocalPrepStartRequested(uint8_t *bottle_count,
+                                                  uint16_t *bottle1_ml_x100,
+                                                  uint16_t *bottle2_ml_x100);
+uint8_t MachineCMD_ConsumeLocalPrepSwitchRequested(uint8_t *next_bottle_index);
+uint8_t MachineCMD_ConsumeLocalDispenseStartRequested(uint16_t *volume_ml_x100);
+
+/* 本机 UI 阶段显示接口：后续 machine 状态机接入时只需更新阶段和进度。 */
+void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
+                                uint16_t done_ml_x100,
+                                uint16_t total_ml_x100);
+void MachineCMD_SetPrepSwitchTank(uint8_t done_bottle_index, uint8_t next_bottle_index);
+void MachineCMD_SetPrepFinished(uint16_t final_conc_x1000);
 
 /* 待机页库存状态接口，供 machine 层在流程完成时同步真实数据。 */
 void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
