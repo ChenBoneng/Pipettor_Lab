@@ -20,6 +20,7 @@
  * 所有动作均为非阻塞状态机推进，MachineTask 里不做长时间阻塞等待。
  */
 #define MACHINE_COMBO_STEP_GAP_MS                1000U
+#define MACHINE_DISPENSE_PUMP_GAP_MS             100U
 #define MACHINE_COMBO_WATER_PUMP_MS              10000U
 #define MACHINE_COMBO_FINAL_WATER_PUMP_MS        15000U
 #define MACHINE_COMBO_ACTIVITY_STABLE_MS         15000U
@@ -116,6 +117,13 @@ typedef enum
 
 typedef enum
 {
+    MACHINE_COMBO_UTILITY_NONE = 0U,      // 正常配药/远控组合流程
+    MACHINE_COMBO_UTILITY_EXHAUST_ONLY,  // 本机单独排气：只走泵2排气段
+    MACHINE_COMBO_UTILITY_EMPTY_ONLY     // 本机单独排空：只走泵1冲洗/排空段
+} MachineComboUtilityMode_e;
+
+typedef enum
+{
     MACHINE_ACTIVITY_WAIT_PENDING = 0, // 活度计读数仍在等待中
     MACHINE_ACTIVITY_WAIT_OK,          // 已收到进入等待状态后的新读数
     MACHINE_ACTIVITY_WAIT_ERROR        // 活度计通信超时、CRC 错误或响应格式错误
@@ -147,6 +155,7 @@ static uint32_t machine_combo_water_per_bottle_ul = 0U;
 static uint32_t machine_combo_pump1_remaining_ul = 0U;
 static uint32_t machine_combo_pump1_segment_ul = 0U;
 static uint32_t machine_combo_post_volume_ul = 0U;
+static MachineComboUtilityMode_e machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
 static uint8_t machine_combo_prepare_finished = 0U;
 static uint16_t machine_combo_final_conc_x1000 = 0U;
 static uint8_t machine_combo_paused = 0U;
@@ -184,6 +193,9 @@ static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
                                                     uint16_t residual_ml_x100);
 static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100);
 static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul);
+static uint16_t Machine_VolumeUlToMlX100(uint32_t volume_ul);
+static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul);
+static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100);
 static void Machine_SetPrepareWaterFlow(void);
 static void Machine_SetDispenseFlow(void);
 static void Machine_SetFlushFlow(void);
@@ -206,6 +218,10 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
 static void Machine_StartLocalPrepare(uint8_t bottle_count,
                                       uint16_t bottle1_ml_x100,
                                       uint16_t bottle2_ml_x100);
+static void Machine_StartLocalUtility(MachineComboUtilityMode_e utility_mode,
+                                      MachineComboState_e first_state);
+static void Machine_StartLocalExhaust(void);
+static void Machine_StartLocalEmpty(void);
 static void Machine_UpdateCombo(void);
 static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_state);
 static void Machine_ExecuteDirectDispenseState(void);
@@ -365,6 +381,60 @@ static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t ta
     return (uint8_t)percent;
 }
 
+static uint16_t Machine_VolumeUlToMlX100(uint32_t volume_ul)
+{
+    return (uint16_t)((volume_ul + 5U) / 10U);
+}
+
+static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul)
+{
+    uint32_t elapsed_ms;
+    uint32_t done_ul;
+
+    if ((pump == NULL) || (total_ul == 0U))
+    {
+        return 0U;
+    }
+
+    if (pump->move_state == PUMP_DRIVE_MOVE_DONE)
+    {
+        return Machine_VolumeUlToMlX100(total_ul);
+    }
+
+    if ((pump->move_state == PUMP_DRIVE_MOVE_IDLE) ||
+        (pump->move_start_ms == 0U) ||
+        (pump->move_timeout_ms == 0U))
+    {
+        return 0U;
+    }
+
+    elapsed_ms = Machine_GetMs() - pump->move_start_ms;
+    if (elapsed_ms >= pump->move_timeout_ms)
+    {
+        done_ul = total_ul;
+    }
+    else
+    {
+        done_ul = (uint32_t)(((uint64_t)total_ul * elapsed_ms) / pump->move_timeout_ms);
+    }
+
+    return Machine_VolumeUlToMlX100(done_ul);
+}
+
+static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100)
+{
+    uint16_t total_ml_x100 = Machine_VolumeUlToMlX100(MACHINE_FLUSH_VOLUME_UL);
+
+    if (done_ml_x100 > total_ml_x100)
+    {
+        done_ml_x100 = total_ml_x100;
+    }
+
+    MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH,
+                               done_ml_x100,
+                               total_ml_x100);
+}
+
 /**
  * @brief 设置泵1补水到铅罐的流路。
  *
@@ -470,11 +540,15 @@ static void Machine_UpdatePrepUiForState(MachineComboState_e state)
     case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
     case MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE:
+        Machine_UpdateFlushUiProgress(0U);
+        break;
+
     case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+        Machine_UpdateFlushUiProgress(0U);
+        break;
+
     case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
-        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH,
-                                   0U,
-                                   (uint16_t)((MACHINE_FLUSH_VOLUME_UL + 5U) / 10U));
+        Machine_UpdateFlushUiProgress(Machine_VolumeUlToMlX100(MACHINE_FLUSH_VOLUME_UL));
         break;
 
     default:
@@ -766,6 +840,7 @@ static void Machine_AbortCombo(void)
     Machine_NotifyFlowStopped(machine_combo_owner, COMMUNICATION_STEP_FAILED);
     Machine_StopComboOutputs();
     machine_combo_running = 0U;
+    machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
     machine_transfer_done = 0U;
     machine_combo_state = MACHINE_COMBO_STATE_ERROR;
     machine_combo_paused = 0U;
@@ -1220,10 +1295,16 @@ static void Machine_ExecuteComboState(void)
         }
         if ((machine_combo_state == MACHINE_COMBO_STATE_FINISHED) &&
             (machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL) &&
-            (machine_combo_prepare_finished != 0U) &&
             (machine_combo_dispense_ul == 0U))
         {
-            MachineCMD_SetPrepFinished(machine_combo_final_conc_x1000);
+            if (machine_combo_utility_mode != MACHINE_COMBO_UTILITY_NONE)
+            {
+                MachineCMD_ReturnToStandby();
+            }
+            else if (machine_combo_prepare_finished != 0U)
+            {
+                MachineCMD_SetPrepFinished(machine_combo_final_conc_x1000);
+            }
         }
         Machine_StopComboOutputs();
         Machine_NotifyFlowStopped(machine_combo_owner,
@@ -1233,6 +1314,7 @@ static void Machine_ExecuteComboState(void)
                                    COMMUNICATION_STEP_PREPARE_DONE) :
                                   COMMUNICATION_STEP_FAILED);
         machine_combo_running = 0U;
+        machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
         break;
 
     case MACHINE_COMBO_STATE_IDLE:
@@ -1291,6 +1373,7 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
     machine_combo_pump1_remaining_ul = 0U;
     machine_combo_pump1_segment_ul = 0U;
     machine_combo_post_volume_ul = 0U;
+    machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
     machine_combo_prepare_finished = 0U;
     machine_combo_final_conc_x1000 = 0U;
     machine_dispense_progress_percent = 0U;
@@ -1304,6 +1387,71 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
     Machine_StopComboOutputs();
     Machine_NotifyFlowStarted(owner);
     Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
+}
+
+/**
+ * @brief 启动本机独立维护动作。
+ *
+ * @param utility_mode 独立动作类型，用于决定排气后是否继续冲洗。
+ * @param first_state 进入的第一段组合状态。
+ *
+ * @note 单独排气/排空不重新造流程，复用配药末尾已经验证过的泵和阀状态段，
+ *       只清空与配药、发药相关的计量状态，避免把本机维护动作误当成配药完成。
+ */
+static void Machine_StartLocalUtility(MachineComboUtilityMode_e utility_mode,
+                                      MachineComboState_e first_state)
+{
+    machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
+    machine_combo_current_conc_x1000 = 0U;
+    machine_combo_current_ml_x100 = 0U;
+    machine_combo_target_conc_x1000 = 0U;
+    machine_combo_dispense_ml_x100 = 0U;
+    machine_combo_water_ul = 0U;
+    machine_combo_dispense_ul = 0U;
+    machine_combo_dispense_remaining_ul = 0U;
+    machine_combo_dispense_segment_ul = 0U;
+    machine_combo_dispense_done_ul = 0U;
+    machine_combo_bottle_count = 0U;
+    machine_combo_bottle_index = 0U;
+    machine_combo_bottle_ml_x100[0] = 0U;
+    machine_combo_bottle_ml_x100[1] = 0U;
+    machine_combo_residual_ml_x100 = 0U;
+    machine_combo_water_per_bottle_ul = 0U;
+    machine_combo_pump1_remaining_ul = 0U;
+    machine_combo_pump1_segment_ul = 0U;
+    machine_combo_post_volume_ul = 0U;
+    machine_combo_utility_mode = utility_mode;
+    machine_combo_prepare_finished = 0U;
+    machine_combo_final_conc_x1000 = 0U;
+    machine_dispense_progress_percent = 0U;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
+    machine_combo_final_activity_ready = 0U;
+    machine_combo_running = 1U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
+
+    Machine_StopComboOutputs();
+    Machine_NotifyFlowStarted(MACHINE_FLOW_OWNER_LOCAL);
+    Machine_EnterComboState(first_state);
+}
+
+/**
+ * @brief 启动本机单独排气动作。
+ */
+static void Machine_StartLocalExhaust(void)
+{
+    Machine_StartLocalUtility(MACHINE_COMBO_UTILITY_EXHAUST_ONLY,
+                              MACHINE_COMBO_STATE_EXHAUST_VALVE_ON);
+}
+
+/**
+ * @brief 启动本机单独排空动作。
+ */
+static void Machine_StartLocalEmpty(void)
+{
+    Machine_StartLocalUtility(MACHINE_COMBO_UTILITY_EMPTY_ONLY,
+                              MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
 }
 
 /**
@@ -1349,6 +1497,7 @@ static void Machine_StartLocalPrepare(uint8_t bottle_count,
     machine_combo_pump1_remaining_ul = 0U;
     machine_combo_pump1_segment_ul = 0U;
     machine_combo_post_volume_ul = 0U;
+    machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
     machine_combo_prepare_finished = 0U;
     machine_combo_final_conc_x1000 = 0U;
     machine_dispense_progress_percent = 0U;
@@ -1684,7 +1833,14 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
+            if (machine_combo_utility_mode == MACHINE_COMBO_UTILITY_EXHAUST_ONLY)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
+            }
         }
         break;
 
@@ -1718,6 +1874,8 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+        Machine_UpdateFlushUiProgress(Machine_EstimatePumpProgressMlX100(PumpDrive_GetPump1(),
+                                                                         MACHINE_FLUSH_VOLUME_UL));
         if ((MACHINE_FLUSH_VOLUME_UL == 0U) ||
             (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
         {
@@ -1783,7 +1941,7 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2:
-        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        if (elapsed_ms >= MACHINE_DISPENSE_PUMP_GAP_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_DISPENSE_IN);
         }
@@ -2136,7 +2294,7 @@ static void Machine_UpdateDirectDispense(void)
         break;
 
     case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2:
-        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        if (elapsed_ms >= MACHINE_DISPENSE_PUMP_GAP_MS)
         {
             Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN);
         }
@@ -2178,6 +2336,7 @@ void MachineInit(void)
     machine_combo_pump1_remaining_ul = 0U;
     machine_combo_pump1_segment_ul = 0U;
     machine_combo_post_volume_ul = 0U;
+    machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
     machine_combo_prepare_finished = 0U;
     machine_combo_final_conc_x1000 = 0U;
     machine_combo_paused = 0U;
@@ -2235,6 +2394,20 @@ void MachineControl(void)
     if (machine_direct_dispense_running != 0U)
     {
         Machine_UpdateDirectDispense();
+        return;
+    }
+
+    if ((machine_combo_running == 0U) &&
+        (MachineCMD_ConsumeLocalExhaustRequested() != 0U))
+    {
+        Machine_StartLocalExhaust();
+        return;
+    }
+
+    if ((machine_combo_running == 0U) &&
+        (MachineCMD_ConsumeLocalEmptyRequested() != 0U))
+    {
+        Machine_StartLocalEmpty();
         return;
     }
 

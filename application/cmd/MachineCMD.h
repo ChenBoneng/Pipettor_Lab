@@ -100,6 +100,8 @@ uint8_t MachineCMD_ConsumeLocalPrepStartRequested(uint8_t *bottle_count,
                                                   uint16_t *bottle2_ml_x100);
 uint8_t MachineCMD_ConsumeLocalPrepSwitchRequested(uint8_t *next_bottle_index);
 uint8_t MachineCMD_ConsumeLocalDispenseStartRequested(uint16_t *volume_ml_x100);
+uint8_t MachineCMD_ConsumeLocalExhaustRequested(void);
+uint8_t MachineCMD_ConsumeLocalEmptyRequested(void);
 
 /* 本机 UI 阶段显示接口：后续 machine 状态机接入时只需更新阶段和进度。 */
 void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
@@ -107,6 +109,7 @@ void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
                                 uint16_t total_ml_x100);
 void MachineCMD_SetPrepSwitchTank(uint8_t done_bottle_index, uint8_t next_bottle_index);
 void MachineCMD_SetPrepFinished(uint16_t final_conc_x1000);
+void MachineCMD_ReturnToStandby(void);
 
 /* 待机页库存状态接口，供 machine 层在流程完成时同步真实数据。 */
 void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,

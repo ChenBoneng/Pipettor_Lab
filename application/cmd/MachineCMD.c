@@ -86,6 +86,8 @@ typedef struct
     uint8_t prep_switch_requested;                       // 本机 UI 换罐继续请求，后续由业务层消费
     uint8_t prep_switch_next_bottle;                     // 本机 UI 换罐后需要放入的药瓶序号
     uint8_t dispense_start_requested;                    // 本机 UI 发药启动请求，后续由业务层消费
+    uint8_t exhaust_requested;                           // 本机 UI 单独排气请求，后续由业务层消费
+    uint8_t empty_requested;                             // 本机 UI 单独排空请求，后续由业务层消费
     MachineCmdPrepRunStage_e prep_run_stage;             // 本机配药 UI 当前显示阶段
     uint16_t prep_stage_done_ml_x100;                    // 阶段进度已完成量，单位 0.01ml
     uint16_t prep_stage_total_ml_x100;                   // 阶段进度总量，单位 0.01ml
@@ -329,6 +331,8 @@ void MachineCMD_Process(void)
         machine_cmd.prep_start_requested = 0U;
         machine_cmd.prep_switch_requested = 0U;
         machine_cmd.dispense_start_requested = 0U;
+        machine_cmd.exhaust_requested = 0U;
+        machine_cmd.empty_requested = 0U;
         machine_cmd.dispense_input_error = 0U;
         machine_cmd.reset_requested = 1U;
         machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
@@ -625,6 +629,28 @@ uint8_t MachineCMD_ConsumeLocalDispenseStartRequested(uint16_t *volume_ml_x100)
     return 1U;
 }
 
+uint8_t MachineCMD_ConsumeLocalExhaustRequested(void)
+{
+    if (machine_cmd.exhaust_requested == 0U)
+    {
+        return 0U;
+    }
+
+    machine_cmd.exhaust_requested = 0U;
+    return 1U;
+}
+
+uint8_t MachineCMD_ConsumeLocalEmptyRequested(void)
+{
+    if (machine_cmd.empty_requested == 0U)
+    {
+        return 0U;
+    }
+
+    machine_cmd.empty_requested = 0U;
+    return 1U;
+}
+
 void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
                                 uint16_t done_ml_x100,
                                 uint16_t total_ml_x100)
@@ -668,6 +694,17 @@ void MachineCMD_SetPrepFinished(uint16_t final_conc_x1000)
     machine_cmd.prep_final_conc_x1000 = final_conc_x1000;
     machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_DONE;
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
+}
+
+void MachineCMD_ReturnToStandby(void)
+{
+    machine_cmd.prep_confirmed = 0U;
+    machine_cmd.dispense_confirmed = 0U;
+    machine_cmd.dispense_start_requested = 0U;
+    machine_cmd.dispense_input_error = 0U;
+    MachineCMD_ClearInput();
+    MachineCMD_ResetPrepUi();
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
 }
 
 void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
@@ -821,6 +858,8 @@ static void MachineCMD_ResetPrepUi(void)
     machine_cmd.prep_start_requested = 0U;
     machine_cmd.prep_switch_requested = 0U;
     machine_cmd.prep_switch_next_bottle = 0U;
+    machine_cmd.exhaust_requested = 0U;
+    machine_cmd.empty_requested = 0U;
     machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_READY;
     machine_cmd.prep_stage_done_ml_x100 = 0U;
     machine_cmd.prep_stage_total_ml_x100 = 0U;
@@ -1097,11 +1136,13 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
 
     case KEYPAD_STATE_CLEAR_ALL:
         MachineCMD_ClearManualSwitches();
+        machine_cmd.empty_requested = 1U;
         MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH, 0U, 0U);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_CLEAN);
         break;
 
     case KEYPAD_STATE_EXHAUST_FIXED:
+        machine_cmd.exhaust_requested = 1U;
         MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_EXHAUST, 0U, 0U);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
         break;
@@ -3224,7 +3265,7 @@ static void MachineCMD_ShowManualPage(void)
 /**
  * @brief 显示自动清洗页。
  *
- * @note 当前页只完成 UI 入口提示，泵 1 的实际冲洗动作应由后续 machine 层接管。
+ * @note 本页只负责显示冲洗进度，泵 1 实际动作由 machine 层状态机接管。
  */
 static void MachineCMD_ShowCleanPage(void)
 {
