@@ -131,8 +131,7 @@ static void MachineCMD_AppendDigit(uint8_t digit);
 static void MachineCMD_AppendDot(void);
 static uint16_t MachineCMD_InputToScaledValue(uint16_t scale);
 static uint16_t MachineCMD_InputToMlX100(void);
-static uint16_t MachineCMD_ActivityToMciX100(const ActivityMeterData_s *activity_data);
-static void MachineCMD_UpdateStandbyActivityFromMeter(void);
+static uint16_t MachineCMD_CalcInventoryActivityX100(uint16_t conc_x1000, uint16_t volume_ml_x100);
 static void MachineCMD_FormatFixed1Ascii(char *buffer, uint8_t size, uint32_t value_x10);
 static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t value_x100);
 static void MachineCMD_HandleStandbyKey(KeypadState_e key);
@@ -250,12 +249,6 @@ void MachineCMD_Process(void)
         ((now_ms - machine_cmd.boot_start_ms) >= MACHINE_CMD_BOOT_HOLD_MS))
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
-    }
-
-    if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) &&
-        ((now_ms - machine_cmd.measure_start_ms) >= MACHINE_CMD_MEASURE_HOLD_MS))
-    {
-        MachineCMD_SetPrepFinished(machine_cmd.standby_conc_x1000);
     }
 
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) &&
@@ -681,8 +674,10 @@ void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
                                     uint16_t activity_x100,
                                     uint16_t volume_ml_x100)
 {
+    (void)activity_x100;
+
     machine_cmd.standby_conc_x1000 = conc_x1000;
-    machine_cmd.standby_activity_x100 = activity_x100;
+    machine_cmd.standby_activity_x100 = MachineCMD_CalcInventoryActivityX100(conc_x1000, volume_ml_x100);
     machine_cmd.standby_volume_ml_x100 = volume_ml_x100;
 
     /* 发药设置页的超余量判断仍然按“剩余可发体积”拦截。 */
@@ -705,8 +700,13 @@ void MachineCMD_ConsumeStandbyInventory(uint16_t volume_ml_x100)
 
     next_volume_ml_x100 = machine_cmd.standby_volume_ml_x100 - volume_ml_x100;
     MachineCMD_SetStandbyInventory(machine_cmd.standby_conc_x1000,
-                                   machine_cmd.standby_activity_x100,
+                                   0U,
                                    next_volume_ml_x100);
+}
+
+uint16_t MachineCMD_GetStandbyVolumeMlX100(void)
+{
+    return machine_cmd.standby_volume_ml_x100;
 }
 
 /**
@@ -1055,92 +1055,22 @@ static void MachineCMD_FormatMlX100Ascii(char *buffer, uint8_t size, uint16_t va
 }
 
 /**
- * @brief 将 RAM-100 活度读数统一换算为 mCi * 100。
+ * @brief 按库存浓度和剩余体积计算待机页剩余活度。
  *
- * @param activity_data 活度计最近一次有效数据。
- * @return 活度，单位 0.01mCi；没有有效读数时返回 0。
- *
- * @note 待机页“活度”只反映活度计实时读数，不再由目标浓度和体积反算。
+ * @note 文档要求软件显示“剩余药量 = 剩余体积 * 当前浓度”。
+ *       浓度单位为 0.001mCi/ml，体积单位为 0.01ml，返回值单位为 0.01mCi。
  */
-static uint16_t MachineCMD_ActivityToMciX100(const ActivityMeterData_s *activity_data)
+static uint16_t MachineCMD_CalcInventoryActivityX100(uint16_t conc_x1000, uint16_t volume_ml_x100)
 {
-    float activity_mci;
+    uint32_t activity_x100;
 
-    if ((activity_data == NULL) ||
-        (activity_data->state != ACTIVITY_METER_STATE_OK) ||
-        (activity_data->update_count == 0U))
+    activity_x100 = (((uint32_t)conc_x1000 * (uint32_t)volume_ml_x100) + 500U) / 1000U;
+    if (activity_x100 > 0xFFFFU)
     {
-        return 0U;
+        activity_x100 = 0xFFFFU;
     }
 
-    switch (activity_data->activity_unit)
-    {
-    case ACTIVITY_METER_UNIT_UCI:
-        activity_mci = activity_data->activity / 1000.0f;
-        break;
-
-    case ACTIVITY_METER_UNIT_MCI:
-        activity_mci = activity_data->activity;
-        break;
-
-    case ACTIVITY_METER_UNIT_CI:
-        activity_mci = activity_data->activity * 1000.0f;
-        break;
-
-    case ACTIVITY_METER_UNIT_BQ:
-        activity_mci = activity_data->activity / 37000000.0f;
-        break;
-
-    case ACTIVITY_METER_UNIT_KBQ:
-        activity_mci = activity_data->activity / 37000.0f;
-        break;
-
-    case ACTIVITY_METER_UNIT_MBQ:
-        activity_mci = activity_data->activity / 37.0f;
-        break;
-
-    case ACTIVITY_METER_UNIT_GBQ:
-        activity_mci = activity_data->activity * 27.027027f;
-        break;
-
-    default:
-        return 0U;
-    }
-
-    if (activity_mci <= 0.0f)
-    {
-        return 0U;
-    }
-    if (activity_mci >= 655.35f)
-    {
-        return 0xFFFFU;
-    }
-
-    return (uint16_t)((activity_mci * 100.0f) + 0.5f);
-}
-
-/**
- * @brief 用活度计最新成功读数刷新待机页活度。
- *
- * @note 只在有 OK 读数时覆盖，通信异常时保留上一笔有效活度，避免待机页闪成 0。
- */
-static void MachineCMD_UpdateStandbyActivityFromMeter(void)
-{
-    ActivityMeterData_s activity_data;
-    uint16_t activity_x100;
-
-    memset(&activity_data, 0, sizeof(activity_data));
-    if (ActivityMeter_GetData(&activity_data) == 0U)
-    {
-        return;
-    }
-
-    if ((activity_data.state == ACTIVITY_METER_STATE_OK) &&
-        (activity_data.update_count != 0U))
-    {
-        activity_x100 = MachineCMD_ActivityToMciX100(&activity_data);
-        machine_cmd.standby_activity_x100 = activity_x100;
-    }
+    return (uint16_t)activity_x100;
 }
 
 /**
@@ -2816,15 +2746,13 @@ static void MachineCMD_ShowReadyPage(void)
 /**
  * @brief 显示待机看板页。
  *
- * @note 浓度显示配药后的目标浓度；活度来自 RAM-100 最新有效读数；体积仍表示当前可发药体积。
+ * @note 活度按“当前浓度 * 剩余体积”显示，体积表示当前可发药体积。
  */
 static void MachineCMD_ShowStandbyPage(void)
 {
     uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
     uint8_t offset;
     char ascii[12];
-
-    MachineCMD_UpdateStandbyActivityFromMeter();
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_ui_device_standby);
 

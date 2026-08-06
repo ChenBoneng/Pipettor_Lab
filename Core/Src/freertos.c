@@ -93,14 +93,6 @@ const osThreadAttr_t StartModuleTask_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-static void CAN_TestStart(void);
-static void CAN_SendTestFrame(void);
-static void RS485_Send(const uint8_t *data, uint16_t length);
-static void RS485_SendTestFrame(void);
-#if 0
-static void Buzzer_PlayNote(uint32_t freqHz, uint32_t durationMs);
-#endif
-static void Buzzer_Off(void);
 
 /* USER CODE END FunctionPrototypes */
 

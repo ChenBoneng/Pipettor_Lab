@@ -113,5 +113,6 @@ void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
                                     uint16_t activity_x100,
                                     uint16_t volume_ml_x100);
 void MachineCMD_ConsumeStandbyInventory(uint16_t volume_ml_x100);
+uint16_t MachineCMD_GetStandbyVolumeMlX100(void);
 
 #endif //MACHINECMD_H

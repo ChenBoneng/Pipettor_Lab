@@ -10,27 +10,34 @@
 #include <string.h>
 
 /*
- * 配药/发药整机测试流程：
- * 1. 配药页确认“当前活度浓度、当前体积、目标活度浓度”后启动；
- * 2. 进罐导轨（300mm，电机B）推 3cm，插针导轨（150mm，电机A）推 5cm；
- * 3. 抽水泵打开 5s，把铅罐中当前溶液抽入活度计；
- * 4. 等待活度计读数稳定；
- * 5. 按当前浓度、当前体积和目标浓度计算需要补入的纯净水体积；
- * 6. 打开电磁阀 1，通过泵1抽取所需纯净水；
- * 7. 抽水泵再次打开 5s，把铅罐中的纯净水抽到活度计；
- * 8. 等待读数稳定后认为配药完成，先回退插针导轨（150mm，电机A），再回退进罐导轨（300mm，电机B）；
- * 9. 等待用户按发药键并确认发药量；
- * 10. 泵2吸入本次发药体积，流程结束。
+ * 配药/发药整机流程按《分药仪各部件运行流程》实现：
+ * - 本机配药最多 2 个铅罐，每罐流程为进罐 220mm、插针 120mm、抽水泵转移、
+ *   泵1按 6ml 分段补水并由抽水泵送入活度计；
+ * - 两罐完成后活度计稳定读数 15s，测试阶段暂按固定容量 20ml 计算单位浓度；
+ * - 配药末尾预留排气和冲洗定量，数值由装机调试给出，默认 0 表示不动作；
+ * - 发药由泵2定量完成，完成后同样执行一次泵1定量冲洗。
  *
- * 每一步之间保留 500ms 间隔，定量泵由 pump_drive 周期轮询 Busy 位确认完成，
- * 所有等待都由状态机推进，不在 MachineTask 里阻塞。
+ * 所有动作均为非阻塞状态机推进，MachineTask 里不做长时间阻塞等待。
  */
-#define MACHINE_COMBO_STEP_GAP_MS                500U
-#define MACHINE_COMBO_WATER_PUMP_MS              5000U
-#define MACHINE_COMBO_ACTIVITY_STABLE_MS         1000U
+#define MACHINE_COMBO_STEP_GAP_MS                1000U
+#define MACHINE_COMBO_WATER_PUMP_MS              10000U
+#define MACHINE_COMBO_FINAL_WATER_PUMP_MS        15000U
+#define MACHINE_COMBO_ACTIVITY_STABLE_MS         15000U
 #define MACHINE_COMBO_STEP_SPEED_MM_S_X100       2000U
-#define MACHINE_COMBO_TANK_POSITION_MM_X100      3000U
-#define MACHINE_COMBO_NEEDLE_POSITION_MM_X100    5000U
+#define MACHINE_COMBO_TANK_POSITION_MM_X100      22000U
+#define MACHINE_COMBO_NEEDLE_POSITION_MM_X100    12000U
+#define MACHINE_PREP_ACTIVITY_CAPACITY_ML_X100   2000U
+#define MACHINE_PREP_ACTIVITY_CAPACITY_UL        20000UL
+#define MACHINE_PREP_DEAD_VOLUME_UL              1500UL
+#define MACHINE_PREP_MAX_BOTTLE_COUNT            2U
+#define MACHINE_PUMP1_WATER_SEGMENT_UL           6000UL
+
+/* 自动排气/冲洗体积为装机标定参数。当前测试暂定 3.00ml，后续只改这里。 */
+#define MACHINE_EXHAUST_VOLUME_ML_X100           300U
+#define MACHINE_FLUSH_VOLUME_ML_X100             300U
+#define MACHINE_EXHAUST_VOLUME_UL                ((uint32_t)MACHINE_EXHAUST_VOLUME_ML_X100 * 10UL)
+#define MACHINE_FLUSH_VOLUME_UL                  ((uint32_t)MACHINE_FLUSH_VOLUME_ML_X100 * 10UL)
+#define MACHINE_RETURN_PIPE_VOLUME_UL            0UL
 #define MACHINE_DISPENSE_PUMP_SEGMENT_UL         PUMP_DRIVE_PUMP2_FULL_STROKE_UL
 #define MACHINE_REMOTE_DISPENSE_DONE_HOLD_MS     (COMMUNICATION_STATUS_PERIOD_MS * 2U)
 
@@ -41,24 +48,40 @@ typedef enum
     MACHINE_COMBO_STATE_GAP_AFTER_TANK,        // 进罐导轨动作完成后的间隔
     MACHINE_COMBO_STATE_NEEDLE_PUSH,           // 插针导轨（150mm，电机A）推 5cm
     MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE,      // 插针导轨动作完成后的间隔
-    MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵抽当前溶液进入活度计
-    MACHINE_COMBO_STATE_RAW_PUMP_OFF,          // 关闭抽水泵并等待流路稳定
+    MACHINE_COMBO_STATE_RAW_PUMP_ON,           // 抽水泵把当前铅罐药液抽入活度计
+    MACHINE_COMBO_STATE_RAW_PUMP_OFF,          // 关闭抽水泵
     MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY,     // 等待当前溶液活度读数稳定
     MACHINE_COMBO_STATE_WAIT_REMOTE_PREPARE,   // 远控转移完成，等待上位机开始配药
-    MACHINE_COMBO_STATE_CALC_WATER,            // 根据当前浓度和目标浓度计算补水量
-    MACHINE_COMBO_STATE_WATER_VALVE_ON,        // 打开电磁阀 1（水路阀）
+    MACHINE_COMBO_STATE_CALC_WATER,            // 按药瓶量和余量计算本罐补水量
+    MACHINE_COMBO_STATE_WATER_VALVE_ON,        // 阀1切到 C1-A1，纯净水进入铅罐
     MACHINE_COMBO_STATE_GAP_AFTER_VALVE,       // 阀门动作后的间隔
     MACHINE_COMBO_STATE_PUMP1_ENABLE,          // 使能泵1，避免未使能时体积命令不动作
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE, // 泵1使能后的 RS485 间隔
-    MACHINE_COMBO_STATE_PUMP1_WATER_IN,        // 泵1抽取纯净水
+    MACHINE_COMBO_STATE_PUMP1_WATER_IN,        // 泵1按分段体积抽取纯净水
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP1,       // 泵1动作后的间隔
-    MACHINE_COMBO_STATE_WATER_PUMP_ON,         // 抽水泵抽纯净水进入活度计
-    MACHINE_COMBO_STATE_WATER_PUMP_OFF,        // 关闭抽水泵并等待流路稳定
-    MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY,   // 等待最终活度读数稳定
+    MACHINE_COMBO_STATE_WATER_PUMP_ON,         // 抽水泵运行 10s，把本段液体送入活度计
+    MACHINE_COMBO_STATE_WATER_PUMP_OFF,        // 关闭抽水泵
+    MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP,  // 抽水泵关闭后的间隔
+    MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON,   // 本罐补水完成后抽水泵持续运行 15s
+    MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF,  // 关闭最终转移抽水泵
     MACHINE_COMBO_STATE_TANK_HOME,             // 进罐导轨（300mm，电机B）回原点
     MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME,   // 进罐导轨回原点后的间隔
     MACHINE_COMBO_STATE_NEEDLE_HOME,           // 插针导轨（150mm，电机A）回原点
     MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME, // 插针导轨回原点后的间隔
+    MACHINE_COMBO_STATE_WAIT_SWITCH_TANK,      // 等待用户换下一个铅罐并确认
+    MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY,   // 两罐完成后等待活度计稳定读数
+    MACHINE_COMBO_STATE_EXHAUST_VALVE_ON,      // 阀2切到 A2-C2，准备自动排气
+    MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE, // 排气流路稳定等待
+    MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE,  // 使能泵2准备排气
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE, // 泵2排气使能后的间隔
+    MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN,      // 泵2按装机设定体积排气
+    MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST,     // 排气完成后的间隔
+    MACHINE_COMBO_STATE_FLUSH_VALVE_ON,        // 阀1/阀2切到 C1-B1-B2-C2 冲洗流路
+    MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE, // 冲洗流路稳定等待
+    MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE,    // 使能泵1准备冲洗
+    MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE, // 泵1冲洗使能后的间隔
+    MACHINE_COMBO_STATE_PUMP1_FLUSH_IN,        // 泵1按装机设定体积冲洗
+    MACHINE_COMBO_STATE_GAP_AFTER_FLUSH,       // 冲洗完成后的间隔
     MACHINE_COMBO_STATE_WAIT_DISPENSE,         // 等待发药量确认
     MACHINE_COMBO_STATE_PUMP2_ENABLE,          // 发送泵2使能命令
     MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE, // 泵2使能后等待总线和驱动响应
@@ -75,6 +98,12 @@ typedef enum
     MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE, // 使能后等待总线和驱动响应
     MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN,    // 泵2吸入本次发药体积
     MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2, // 泵2分段吸液后的间隔
+    MACHINE_DIRECT_DISPENSE_STATE_FLUSH_VALVE_ON, // 发药完成后切到冲洗流路
+    MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH_VALVE, // 冲洗流路稳定等待
+    MACHINE_DIRECT_DISPENSE_STATE_PUMP1_ENABLE, // 使能泵1准备自动冲洗
+    MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP1_ENABLE, // 泵1使能后的间隔
+    MACHINE_DIRECT_DISPENSE_STATE_PUMP1_FLUSH_IN, // 泵1执行发药后定量冲洗
+    MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH, // 冲洗完成后的间隔
     MACHINE_DIRECT_DISPENSE_STATE_FINISHED,    // 独立发药结束
     MACHINE_DIRECT_DISPENSE_STATE_ERROR        // 泵2动作启动失败
 } MachineDirectDispenseState_e;
@@ -110,6 +139,16 @@ static uint32_t machine_combo_dispense_ul = 0U;
 static uint32_t machine_combo_dispense_remaining_ul = 0U;
 static uint32_t machine_combo_dispense_segment_ul = 0U;
 static uint32_t machine_combo_dispense_done_ul = 0U;
+static uint8_t machine_combo_bottle_count = 0U;
+static uint8_t machine_combo_bottle_index = 0U;
+static uint16_t machine_combo_bottle_ml_x100[MACHINE_PREP_MAX_BOTTLE_COUNT] = {0U};
+static uint16_t machine_combo_residual_ml_x100 = 0U;
+static uint32_t machine_combo_water_per_bottle_ul = 0U;
+static uint32_t machine_combo_pump1_remaining_ul = 0U;
+static uint32_t machine_combo_pump1_segment_ul = 0U;
+static uint32_t machine_combo_post_volume_ul = 0U;
+static uint8_t machine_combo_prepare_finished = 0U;
+static uint16_t machine_combo_final_conc_x1000 = 0U;
 static uint8_t machine_combo_paused = 0U;
 static uint32_t machine_combo_pause_start_ms = 0U;
 static uint8_t machine_combo_final_activity_ready = 0U;
@@ -123,6 +162,7 @@ static uint32_t machine_direct_dispense_ul = 0U;
 static uint32_t machine_direct_dispense_remaining_ul = 0U;
 static uint32_t machine_direct_dispense_segment_ul = 0U;
 static uint32_t machine_direct_dispense_done_ul = 0U;
+static uint32_t machine_direct_flush_ul = 0U;
 static uint8_t machine_direct_dispense_paused = 0U;
 static uint32_t machine_direct_dispense_pause_start_ms = 0U;
 static uint8_t machine_direct_dispense_seq = 0U;
@@ -136,10 +176,18 @@ static uint32_t machine_activity_wait_start_ms = 0U;
 static uint32_t machine_activity_wait_update_count = 0U;
 
 static uint32_t Machine_GetMs(void);
-static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
-                                              uint16_t current_ml_x100,
-                                              uint16_t target_conc_x1000);
+static uint8_t Machine_GetEffectiveBottleCount(uint8_t requested_count,
+                                               uint16_t bottle1_ml_x100,
+                                               uint16_t bottle2_ml_x100);
+static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
+                                                    const uint16_t bottle_ml_x100[],
+                                                    uint16_t residual_ml_x100);
+static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100);
 static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul);
+static void Machine_SetPrepareWaterFlow(void);
+static void Machine_SetDispenseFlow(void);
+static void Machine_SetFlushFlow(void);
+static void Machine_UpdatePrepUiForState(MachineComboState_e state);
 static void Machine_EnterComboState(MachineComboState_e next_state);
 static void Machine_ExecuteComboState(void);
 static void Machine_StopComboOutputs(void);
@@ -149,10 +197,15 @@ static void Machine_ResumeCombo(void);
 static PumpDrive_s *Machine_GetDispensePump(void);
 static void Machine_StopDispensePumpOutput(void);
 static uint8_t Machine_StartDispensePumpSegment(void);
+static uint8_t Machine_StartPump1WaterSegment(void);
+static uint8_t Machine_StartComboPostPumpVolume(PumpDrive_s *pump, uint32_t volume_ul, uint8_t move_out);
 static void Machine_StartCombo(uint16_t current_conc_x1000,
                                uint16_t current_ml_x100,
                                uint16_t target_conc_x1000,
                                MachineFlowOwner_e owner);
+static void Machine_StartLocalPrepare(uint8_t bottle_count,
+                                      uint16_t bottle1_ml_x100,
+                                      uint16_t bottle2_ml_x100);
 static void Machine_UpdateCombo(void);
 static void Machine_EnterDirectDispenseState(MachineDirectDispenseState_e next_state);
 static void Machine_ExecuteDirectDispenseState(void);
@@ -160,6 +213,7 @@ static void Machine_AbortDirectDispense(void);
 static void Machine_PauseDirectDispense(void);
 static void Machine_ResumeDirectDispense(void);
 static uint8_t Machine_StartDirectDispenseSegment(void);
+static uint8_t Machine_StartDirectFlush(void);
 static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner);
 static void Machine_UpdateDirectDispense(void);
 static void Machine_BeginActivityWait(void);
@@ -185,46 +239,106 @@ static uint32_t Machine_GetMs(void)
 }
 
 /**
- * @brief 根据当前浓度、当前体积和目标浓度计算需要补入的纯净水体积。
+ * @brief 根据本机 UI 输入判断本次实际参与配药的药瓶数量。
  *
- * @param current_conc_x1000 当前活度浓度，单位 0.001mCi/ml。
- * @param current_ml_x100 当前溶液体积，单位 0.01ml。
- * @param target_conc_x1000 目标活度浓度，单位 0.001mCi/ml。
- * @return 需要泵1抽取的纯净水体积，单位 ul。
+ * @param requested_count UI 选择的药瓶数量，最大 2。
+ * @param bottle1_ml_x100 1 号药瓶量，单位 0.01ml。
+ * @param bottle2_ml_x100 2 号药瓶量，单位 0.01ml。
+ * @return 1/2 表示有效瓶数；0 表示没有有效药瓶量。
  *
- * @note 稀释计算的本质是：
- *       当前总活度 = 当前浓度 * 当前体积；
- *       最终总体积 = 当前总活度 / 目标浓度；
- *       补水体积 = 最终总体积 - 当前体积。
- *
- *       只加纯净水时，浓度只能下降，不能上升。
- *       如果目标浓度大于等于当前浓度，则这里直接返回 0，不让泵1补水。
+ * @note 流程文档明确“药瓶量2为0”时按单瓶公式处理，所以这里以体积是否
+ *       大于 0 判断有效数据，而不是盲目相信 UI 选择数量。
  */
-static uint32_t Machine_CalcPureWaterVolumeUl(uint16_t current_conc_x1000,
-                                              uint16_t current_ml_x100,
-                                              uint16_t target_conc_x1000)
+static uint8_t Machine_GetEffectiveBottleCount(uint8_t requested_count,
+                                               uint16_t bottle1_ml_x100,
+                                               uint16_t bottle2_ml_x100)
 {
-    uint32_t final_ml_x100;
-    uint32_t water_ml_x100;
-
-    if ((current_conc_x1000 == 0U) ||
-        (current_ml_x100 == 0U) ||
-        (target_conc_x1000 == 0U) ||
-        (target_conc_x1000 >= current_conc_x1000))
+    if ((requested_count == 0U) || (bottle1_ml_x100 == 0U))
     {
         return 0U;
     }
 
-    final_ml_x100 = (((uint32_t)current_conc_x1000 * (uint32_t)current_ml_x100) +
-                     (target_conc_x1000 / 2U)) /
-                    target_conc_x1000;
-    if (final_ml_x100 <= current_ml_x100)
+    if ((requested_count >= 2U) && (bottle2_ml_x100 != 0U))
+    {
+        return 2U;
+    }
+
+    return 1U;
+}
+
+/**
+ * @brief 按文档公式计算每个药罐需要泵1补入的纯净水体积。
+ *
+ * @param bottle_count 实际有效药瓶数量，1 或 2。
+ * @param bottle_ml_x100 药瓶量数组，单位 0.01ml。
+ * @param residual_ml_x100 活度计当前余量，单位 0.01ml。
+ * @return 每罐泵1补水体积，单位 ul。
+ *
+ * @note 文档公式：
+ *       - 两瓶：纯净水总量 = 活度计容量 - 药瓶1 + 1.5ml - 药瓶2 + 1.5ml；
+ *       - 一瓶：纯净水总量 = 活度计容量 - 药瓶1 + 1.5ml；
+ *       - 有余量时，先从总补水量里扣除余量。
+ */
+static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
+                                                    const uint16_t bottle_ml_x100[],
+                                                    uint16_t residual_ml_x100)
+{
+    uint32_t bottle_total_ul = 0U;
+    uint32_t dead_total_ul;
+    uint32_t residual_ul;
+    uint32_t water_total_ul;
+
+    if ((bottle_count == 0U) ||
+        (bottle_count > MACHINE_PREP_MAX_BOTTLE_COUNT) ||
+        (bottle_ml_x100 == NULL))
     {
         return 0U;
     }
 
-    water_ml_x100 = final_ml_x100 - current_ml_x100;
-    return water_ml_x100 * 10U;
+    for (uint8_t i = 0U; i < bottle_count; i++)
+    {
+        bottle_total_ul += (uint32_t)bottle_ml_x100[i] * 10U;
+    }
+
+    dead_total_ul = (uint32_t)bottle_count * MACHINE_PREP_DEAD_VOLUME_UL;
+    if ((bottle_total_ul >= (MACHINE_PREP_ACTIVITY_CAPACITY_UL + dead_total_ul)))
+    {
+        return 0U;
+    }
+
+    water_total_ul = MACHINE_PREP_ACTIVITY_CAPACITY_UL + dead_total_ul - bottle_total_ul;
+    residual_ul = (uint32_t)residual_ml_x100 * 10U;
+    if (residual_ul >= water_total_ul)
+    {
+        water_total_ul = 0U;
+    }
+    else
+    {
+        water_total_ul -= residual_ul;
+    }
+
+    return (water_total_ul + ((uint32_t)bottle_count / 2U)) / (uint32_t)bottle_count;
+}
+
+/**
+ * @brief 按当前配置的活度计容量计算单位浓度。
+ *
+ * @param activity_x100 活度，单位 0.01mCi。
+ * @return 单位浓度，单位 0.001mCi/ml。
+ */
+static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100)
+{
+    uint32_t conc_x1000;
+
+    conc_x1000 = (((uint32_t)activity_x100 * 1000U) +
+                  (MACHINE_PREP_ACTIVITY_CAPACITY_ML_X100 / 2U)) /
+                 MACHINE_PREP_ACTIVITY_CAPACITY_ML_X100;
+    if (conc_x1000 > 0xFFFFU)
+    {
+        conc_x1000 = 0xFFFFU;
+    }
+
+    return (uint16_t)conc_x1000;
 }
 
 /**
@@ -249,6 +363,123 @@ static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t ta
     }
 
     return (uint8_t)percent;
+}
+
+/**
+ * @brief 设置泵1补水到铅罐的流路。
+ *
+ * @note 当前按既有代码约定，阀1上电表示 C1-A1 连通，用于“纯净水->泵1->铅罐”。
+ */
+static void Machine_SetPrepareWaterFlow(void)
+{
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
+                                 SOLENOID_VALVE_STATE_ON_NC_OPEN);
+}
+
+/**
+ * @brief 设置泵2发药/排气流路。
+ *
+ * @note 阀2掉电保持既有默认 A2-C2 通路，对应“活度计->泵2->出口”。
+ */
+static void Machine_SetDispenseFlow(void)
+{
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
+                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+}
+
+/**
+ * @brief 设置泵1定量冲洗流路。
+ *
+ * @note 按文档冲洗流向为“纯净水->泵1->C1->B1->B2->C2”。
+ *       这里保持阀1掉电走 C1-B1，并将阀2上电切到 B2-C2。
+ */
+static void Machine_SetFlushFlow(void)
+{
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
+                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
+                                 SOLENOID_VALVE_STATE_ON_NC_OPEN);
+}
+
+/**
+ * @brief 按当前整机状态同步 LCD 配药运行阶段。
+ */
+static void Machine_UpdatePrepUiForState(MachineComboState_e state)
+{
+    uint32_t done_ul;
+    uint16_t done_ml_x100;
+    uint16_t total_ml_x100;
+
+    if (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL)
+    {
+        return;
+    }
+
+    switch (state)
+    {
+    case MACHINE_COMBO_STATE_TANK_PUSH:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_IN_TANK, 0U, 0U);
+        break;
+
+    case MACHINE_COMBO_STATE_NEEDLE_PUSH:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_INSERT_NEEDLE, 0U, 0U);
+        break;
+
+    case MACHINE_COMBO_STATE_RAW_PUMP_ON:
+    case MACHINE_COMBO_STATE_RAW_PUMP_OFF:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_DRAW_WATER, 0U, 0U);
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
+    case MACHINE_COMBO_STATE_WATER_PUMP_ON:
+    case MACHINE_COMBO_STATE_WATER_PUMP_OFF:
+    case MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF:
+        done_ul = machine_combo_water_per_bottle_ul;
+        if (machine_combo_pump1_remaining_ul < done_ul)
+        {
+            done_ul -= machine_combo_pump1_remaining_ul;
+        }
+        else
+        {
+            done_ul = 0U;
+        }
+        done_ml_x100 = (uint16_t)((done_ul + 5U) / 10U);
+        total_ml_x100 = (uint16_t)((machine_combo_water_per_bottle_ul + 5U) / 10U);
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_WATER_FILL,
+                                   done_ml_x100,
+                                   total_ml_x100);
+        break;
+
+    case MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_ACTIVITY_CHECK, 0U, 0U);
+        break;
+
+    case MACHINE_COMBO_STATE_EXHAUST_VALVE_ON:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE:
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE:
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_EXHAUST, 0U, 0U);
+        break;
+
+    case MACHINE_COMBO_STATE_FLUSH_VALVE_ON:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE:
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
+        MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH,
+                                   0U,
+                                   (uint16_t)((MACHINE_FLUSH_VOLUME_UL + 5U) / 10U));
+        break;
+
+    default:
+        break;
+    }
 }
 
 /**
@@ -334,48 +565,42 @@ static uint16_t Machine_GetMeasuredActivityMciX100(void)
  *
  * @return 体积，单位 0.01ml。
  *
- * @note 本地配药的补水量由下位机计算，单位是 ul，需要换算回 0.01ml；
- *       远程配药的最终体积由上位机随 PREPARE_VOLUME_PARAM 下发，优先使用该值。
+ * @note 本机配药按当前活度计容量配置作为完成体积；
+ *       远程配药仍优先使用上位机随 PREPARE_VOLUME_PARAM 下发的最终体积。
  */
 static uint16_t Machine_GetPreparedVolumeMlX100(void)
 {
-    uint32_t volume_ml_x100;
-
     if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
         (machine_combo_remote_volume_valid != 0U))
     {
         return machine_combo_remote_final_ml_x100;
     }
 
-    volume_ml_x100 = (uint32_t)machine_combo_current_ml_x100 +
-                     (machine_combo_water_ul / 10U);
-    if (volume_ml_x100 > 0xFFFFU)
-    {
-        volume_ml_x100 = 0xFFFFU;
-    }
-
-    return (uint16_t)volume_ml_x100;
+    return MACHINE_PREP_ACTIVITY_CAPACITY_ML_X100;
 }
 
 /**
  * @brief 配药完成后同步待机页浓度、活度和体积。
  *
- * @note 浓度显示本次输入的目标浓度；活度只来自 RAM-100 当前有效读数，不再用
- *       “目标浓度 * 体积”反算；体积继续使用本次配药后的理论最终体积。
+ * @note 本机流程按“活度计读数 / 当前容量配置”得到单位浓度，并同步待机页
+ *       的活度和体积。若读数不可用，则浓度和活度保留为 0，避免显示伪数据。
  */
 static void Machine_UpdateStandbyInventoryAfterPrepare(uint8_t use_measured_activity)
 {
     uint16_t volume_ml_x100 = Machine_GetPreparedVolumeMlX100();
     uint16_t activity_x100 = 0U;
+    uint16_t conc_x1000 = machine_combo_target_conc_x1000;
 
     if (use_measured_activity != 0U)
     {
         activity_x100 = Machine_GetMeasuredActivityMciX100();
+        conc_x1000 = Machine_CalcConcentrationFromActivity(activity_x100);
     }
 
-    MachineCMD_SetStandbyInventory(machine_combo_target_conc_x1000,
+    MachineCMD_SetStandbyInventory(conc_x1000,
                                    activity_x100,
                                    volume_ml_x100);
+    machine_combo_final_conc_x1000 = conc_x1000;
 }
 
 /**
@@ -510,14 +735,23 @@ static PumpDrive_s *Machine_GetDispensePump(void)
 }
 
 /**
- * @brief 只停止发药定量泵输出。
+ * @brief 停止待机直接发药流程相关输出。
  *
- * @note 待机直接发药流程只涉及发药泵，不应该顺手改动导杆、阀门或抽水泵。
+ * @note 新流程在泵2发药后会接泵1定量冲洗，因此复位、暂停和异常退出时需要同时停泵1/泵2并释放阀门。
  */
 static void Machine_StopDispensePumpOutput(void)
 {
-    PumpDrive_s *pump = Machine_GetDispensePump();
+    PumpDrive_s *pump;
 
+    SolenoidValve_AllOff();
+
+    pump = Machine_GetDispensePump();
+    if (pump != NULL)
+    {
+        (void)PumpDrive_Stop(pump, 1U);
+    }
+
+    pump = PumpDrive_GetPump1();
     if (pump != NULL)
     {
         (void)PumpDrive_Stop(pump, 1U);
@@ -614,6 +848,68 @@ static uint8_t Machine_StartDispensePumpSegment(void)
 
     machine_combo_dispense_segment_ul = segment_ul;
     return 1U;
+}
+
+/**
+ * @brief 启动泵1当前 6ml 分段补水。
+ *
+ * @return 1 表示本段命令已经下发；0 表示泵1不可用或命令失败。
+ */
+static uint8_t Machine_StartPump1WaterSegment(void)
+{
+    PumpDrive_s *pump = PumpDrive_GetPump1();
+    uint32_t segment_ul;
+
+    if ((pump == NULL) || (machine_combo_pump1_remaining_ul == 0U))
+    {
+        return 0U;
+    }
+
+    segment_ul = machine_combo_pump1_segment_ul;
+    if (segment_ul == 0U)
+    {
+        segment_ul = machine_combo_pump1_remaining_ul;
+        if (segment_ul > MACHINE_PUMP1_WATER_SEGMENT_UL)
+        {
+            segment_ul = MACHINE_PUMP1_WATER_SEGMENT_UL;
+        }
+    }
+
+    if (PumpDrive_MoveInVolumeUl(pump, segment_ul) == 0U)
+    {
+        return 0U;
+    }
+
+    machine_combo_pump1_segment_ul = segment_ul;
+    return 1U;
+}
+
+/**
+ * @brief 启动组合流程末尾的泵体定量动作。
+ *
+ * @param pump 目标定量泵。
+ * @param volume_ul 目标体积，单位 ul。
+ * @param move_out 非 0 表示执行 out；0 表示执行 in。
+ * @return 1 表示不需要动作或命令已下发；0 表示泵不可用或命令失败。
+ */
+static uint8_t Machine_StartComboPostPumpVolume(PumpDrive_s *pump, uint32_t volume_ul, uint8_t move_out)
+{
+    if (volume_ul == 0U)
+    {
+        return 1U;
+    }
+
+    if (pump == NULL)
+    {
+        return 0U;
+    }
+
+    if (move_out != 0U)
+    {
+        return PumpDrive_MoveOutVolumeUl(pump, volume_ul);
+    }
+
+    return PumpDrive_MoveInVolumeUl(pump, volume_ul);
 }
 
 /**
@@ -726,6 +1022,7 @@ static void Machine_EnterComboState(MachineComboState_e next_state)
 {
     machine_combo_state = next_state;
     machine_combo_state_start_ms = Machine_GetMs();
+    Machine_UpdatePrepUiForState(next_state);
     Machine_ExecuteComboState();
 }
 
@@ -734,8 +1031,6 @@ static void Machine_EnterComboState(MachineComboState_e next_state)
  */
 static void Machine_ExecuteComboState(void)
 {
-    PumpDrive_s *pump;
-
     switch (machine_combo_state)
     {
     case MACHINE_COMBO_STATE_TANK_PUSH:
@@ -758,6 +1053,7 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_RAW_PUMP_ON:
     case MACHINE_COMBO_STATE_WATER_PUMP_ON:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON:
         if (WaterPump_Start(WATER_PUMP_ID_MAIN) == 0U)
         {
             Machine_AbortCombo();
@@ -766,30 +1062,32 @@ static void Machine_ExecuteComboState(void)
 
     case MACHINE_COMBO_STATE_RAW_PUMP_OFF:
     case MACHINE_COMBO_STATE_WATER_PUMP_OFF:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF:
         WaterPump_Stop(WATER_PUMP_ID_MAIN);
         break;
 
     case MACHINE_COMBO_STATE_CALC_WATER:
         /*
-         * 本地配药使用 LCD 输入的当前浓度和当前体积计算补水量；远程配药必须使用上位机随
-         * PREPARE_VOLUME_PARAM 下发的理论补水量，避免下位机缺参数硬算。
+         * 本机配药的单罐补水量在启动时按药瓶量统一算好；远程配药仍使用上位机
+         * 下发的体积参数，避免下位机缺少远程业务参数时硬算。
          */
         if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
             (machine_combo_remote_volume_valid != 0U))
         {
             machine_combo_water_ul = (uint32_t)machine_combo_remote_water_ml_x100 * 10U;
+            machine_combo_water_per_bottle_ul = machine_combo_water_ul;
+            machine_combo_pump1_remaining_ul = machine_combo_water_ul;
         }
         else
         {
-            machine_combo_water_ul = Machine_CalcPureWaterVolumeUl(machine_combo_current_conc_x1000,
-                                                                   machine_combo_current_ml_x100,
-                                                                   machine_combo_target_conc_x1000);
+            machine_combo_water_ul = machine_combo_water_per_bottle_ul;
+            machine_combo_pump1_remaining_ul = machine_combo_water_per_bottle_ul;
         }
+        machine_combo_pump1_segment_ul = 0U;
         break;
 
     case MACHINE_COMBO_STATE_WATER_VALVE_ON:
-        (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
-                                     SOLENOID_VALVE_STATE_ON_NC_OPEN);
+        Machine_SetPrepareWaterFlow();
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_ENABLE:
@@ -804,13 +1102,12 @@ static void Machine_ExecuteComboState(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
-        if (machine_combo_water_ul == 0U)
+        if (machine_combo_pump1_remaining_ul == 0U)
         {
             break;
         }
 
-        pump = PumpDrive_GetPump1();
-        if ((pump == NULL) || (PumpDrive_MoveInVolumeUl(pump, machine_combo_water_ul) == 0U))
+        if (Machine_StartPump1WaterSegment() == 0U)
         {
             Machine_AbortCombo();
         }
@@ -835,6 +1132,7 @@ static void Machine_ExecuteComboState(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_ENABLE:
+        Machine_SetDispenseFlow();
         /*
          * 泵2发药前先显式使能，并等待一个状态间隔后再发 in 命令。
          * 这样避免上一条 stop / set / sta 命令后的 RS485 一问一答保护挡住吸液命令。
@@ -842,6 +1140,48 @@ static void Machine_ExecuteComboState(void)
         if (PumpDrive_Enable(Machine_GetDispensePump()) != 0U)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_ENABLE);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_EXHAUST_VALVE_ON:
+        Machine_SetDispenseFlow();
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE:
+        if (PumpDrive_Enable(Machine_GetDispensePump()) != 0U)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
+        machine_combo_post_volume_ul = MACHINE_EXHAUST_VOLUME_UL;
+        if (Machine_StartComboPostPumpVolume(Machine_GetDispensePump(),
+                                             machine_combo_post_volume_ul,
+                                             0U) == 0U)
+        {
+            Machine_AbortCombo();
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_FLUSH_VALVE_ON:
+        Machine_SetFlushFlow();
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE:
+        if (PumpDrive_Enable(PumpDrive_GetPump1()) != 0U)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+        machine_combo_post_volume_ul = MACHINE_FLUSH_VOLUME_UL;
+        if (Machine_StartComboPostPumpVolume(PumpDrive_GetPump1(),
+                                             machine_combo_post_volume_ul,
+                                             0U) == 0U)
+        {
+            Machine_AbortCombo();
         }
         break;
 
@@ -878,12 +1218,19 @@ static void Machine_ExecuteComboState(void)
         {
             machine_dispense_progress_percent = 100U;
         }
+        if ((machine_combo_state == MACHINE_COMBO_STATE_FINISHED) &&
+            (machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL) &&
+            (machine_combo_prepare_finished != 0U) &&
+            (machine_combo_dispense_ul == 0U))
+        {
+            MachineCMD_SetPrepFinished(machine_combo_final_conc_x1000);
+        }
         Machine_StopComboOutputs();
         Machine_NotifyFlowStopped(machine_combo_owner,
                                   (machine_combo_state == MACHINE_COMBO_STATE_FINISHED) ?
-                                  ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) ?
-                                   COMMUNICATION_STEP_PREPARE_DONE :
-                                   COMMUNICATION_STEP_DISPENSE_DONE) :
+                                  ((machine_combo_dispense_ul != 0U) ?
+                                   COMMUNICATION_STEP_DISPENSE_DONE :
+                                   COMMUNICATION_STEP_PREPARE_DONE) :
                                   COMMUNICATION_STEP_FAILED);
         machine_combo_running = 0U;
         break;
@@ -895,6 +1242,14 @@ static void Machine_ExecuteComboState(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_ENABLE:
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
+    case MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP:
+    case MACHINE_COMBO_STATE_WAIT_SWITCH_TANK:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
     case MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME:
     case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME:
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
@@ -927,6 +1282,17 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
     machine_combo_dispense_remaining_ul = 0U;
     machine_combo_dispense_segment_ul = 0U;
     machine_combo_dispense_done_ul = 0U;
+    machine_combo_bottle_count = 0U;
+    machine_combo_bottle_index = 0U;
+    machine_combo_bottle_ml_x100[0] = 0U;
+    machine_combo_bottle_ml_x100[1] = 0U;
+    machine_combo_residual_ml_x100 = current_ml_x100;
+    machine_combo_water_per_bottle_ul = 0U;
+    machine_combo_pump1_remaining_ul = 0U;
+    machine_combo_pump1_segment_ul = 0U;
+    machine_combo_post_volume_ul = 0U;
+    machine_combo_prepare_finished = 0U;
+    machine_combo_final_conc_x1000 = 0U;
     machine_dispense_progress_percent = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
@@ -937,6 +1303,73 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
 
     Machine_StopComboOutputs();
     Machine_NotifyFlowStarted(owner);
+    Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
+}
+
+/**
+ * @brief 启动本机两罐配药流程。
+ *
+ * @param bottle_count UI 选择药瓶数，最大 2。
+ * @param bottle1_ml_x100 1 号药瓶量，单位 0.01ml。
+ * @param bottle2_ml_x100 2 号药瓶量，单位 0.01ml。
+ */
+static void Machine_StartLocalPrepare(uint8_t bottle_count,
+                                      uint16_t bottle1_ml_x100,
+                                      uint16_t bottle2_ml_x100)
+{
+    uint8_t effective_count;
+
+    effective_count = Machine_GetEffectiveBottleCount(bottle_count,
+                                                      bottle1_ml_x100,
+                                                      bottle2_ml_x100);
+    if (effective_count == 0U)
+    {
+        return;
+    }
+
+    machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
+    machine_combo_current_conc_x1000 = 0U;
+    machine_combo_current_ml_x100 = 0U;
+    machine_combo_target_conc_x1000 = 0U;
+    machine_combo_dispense_ml_x100 = 0U;
+    machine_combo_water_ul = 0U;
+    machine_combo_dispense_ul = 0U;
+    machine_combo_dispense_remaining_ul = 0U;
+    machine_combo_dispense_segment_ul = 0U;
+    machine_combo_dispense_done_ul = 0U;
+    machine_combo_bottle_count = effective_count;
+    machine_combo_bottle_index = 1U;
+    machine_combo_bottle_ml_x100[0] = bottle1_ml_x100;
+    machine_combo_bottle_ml_x100[1] = (effective_count >= 2U) ? bottle2_ml_x100 : 0U;
+    machine_combo_residual_ml_x100 = MachineCMD_GetStandbyVolumeMlX100();
+    machine_combo_water_per_bottle_ul =
+        Machine_CalcPrepareWaterPerBottleUl(machine_combo_bottle_count,
+                                            machine_combo_bottle_ml_x100,
+                                            machine_combo_residual_ml_x100);
+    machine_combo_pump1_remaining_ul = 0U;
+    machine_combo_pump1_segment_ul = 0U;
+    machine_combo_post_volume_ul = 0U;
+    machine_combo_prepare_finished = 0U;
+    machine_combo_final_conc_x1000 = 0U;
+    machine_dispense_progress_percent = 0U;
+    machine_combo_paused = 0U;
+    machine_combo_pause_start_ms = 0U;
+    machine_combo_final_activity_ready = 0U;
+    machine_combo_running = 1U;
+    machine_activity_wait_active = 0U;
+    machine_activity_wait_started = 0U;
+
+    Machine_StopComboOutputs();
+    Machine_NotifyFlowStarted(MACHINE_FLOW_OWNER_LOCAL);
+
+    if ((machine_combo_residual_ml_x100 != 0U) &&
+        (MACHINE_RETURN_PIPE_VOLUME_UL != 0U))
+    {
+        Machine_SetDispenseFlow();
+        machine_combo_post_volume_ul = MACHINE_RETURN_PIPE_VOLUME_UL;
+        /* 当前管路回推体积未开放配置，默认 0；后续装机标定后可接入独立状态。 */
+    }
+
     Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
 }
 
@@ -1013,7 +1446,14 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_RAW_PUMP_OFF:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY);
+            if (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_CALC_WATER);
+            }
         }
         break;
 
@@ -1053,9 +1493,9 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_VALVE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            if (machine_combo_water_ul == 0U)
+            if (machine_combo_pump1_remaining_ul == 0U)
             {
-                Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1);
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON);
             }
             else
             {
@@ -1076,9 +1516,18 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_WATER_IN:
-        if ((machine_combo_water_ul == 0U) ||
+        if ((machine_combo_pump1_remaining_ul == 0U) ||
             (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
         {
+            if (machine_combo_pump1_remaining_ul >= machine_combo_pump1_segment_ul)
+            {
+                machine_combo_pump1_remaining_ul -= machine_combo_pump1_segment_ul;
+            }
+            else
+            {
+                machine_combo_pump1_remaining_ul = 0U;
+            }
+            machine_combo_pump1_segment_ul = 0U;
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PUMP1);
         }
         break;
@@ -1100,7 +1549,35 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_WATER_PUMP_OFF:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY);
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            if (machine_combo_pump1_remaining_ul != 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_WATER_IN);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON);
+            }
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON:
+        if (elapsed_ms >= MACHINE_COMBO_FINAL_WATER_PUMP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_NEEDLE_HOME);
         }
         break;
 
@@ -1109,16 +1586,8 @@ static void Machine_UpdateCombo(void)
         if (Machine_IsActivityWaitReadyForCombo(activity_wait, elapsed_ms) != 0U)
         {
             Machine_UpdateStandbyInventoryAfterPrepare((activity_wait == MACHINE_ACTIVITY_WAIT_OK) ? 1U : 0U);
-            if (machine_combo_owner == MACHINE_FLOW_OWNER_LOCAL)
-            {
-                machine_combo_final_activity_ready = 1U;
-            }
-
-            /*
-             * 回退导轨时先收插针导轨（150mm，电机A），再收进罐导轨（300mm，电机B）。
-             * 插针先退出可以先解除针头和瓶口/管路的机械约束，再移动进罐方向。
-             */
-            Machine_EnterComboState(MACHINE_COMBO_STATE_NEEDLE_HOME);
+            machine_combo_prepare_finished = 1U;
+            Machine_EnterComboState(MACHINE_COMBO_STATE_EXHAUST_VALVE_ON);
         }
         else if ((activity_wait == MACHINE_ACTIVITY_WAIT_ERROR) &&
                  (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL))
@@ -1141,9 +1610,14 @@ static void Machine_UpdateCombo(void)
             {
                 Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
             }
+            else if (machine_combo_bottle_index < machine_combo_bottle_count)
+            {
+                MachineCMD_SetPrepSwitchTank(machine_combo_bottle_index, machine_combo_bottle_index + 1U);
+                Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_SWITCH_TANK);
+            }
             else
             {
-                Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_DISPENSE);
+                Machine_EnterComboState(MACHINE_COMBO_STATE_WAIT_FINAL_ACTIVITY);
             }
         }
         break;
@@ -1159,6 +1633,102 @@ static void Machine_UpdateCombo(void)
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_HOME);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_WAIT_SWITCH_TANK:
+        if (MachineCMD_ConsumeLocalPrepSwitchRequested(NULL) != 0U)
+        {
+            machine_combo_bottle_index++;
+            Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_EXHAUST_VALVE_ON:
+        Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE);
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            if (MACHINE_EXHAUST_VOLUME_UL == 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE);
+            }
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE:
+        Machine_ExecuteComboState();
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
+        if ((MACHINE_EXHAUST_VOLUME_UL == 0U) ||
+            (PumpDrive_IsMoveDone(Machine_GetDispensePump()) != 0U))
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_FLUSH_VALVE_ON:
+        Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE);
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            if (MACHINE_FLUSH_VOLUME_UL == 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_FLUSH);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE);
+            }
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE:
+        Machine_ExecuteComboState();
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_PUMP1_FLUSH_IN);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+        if ((MACHINE_FLUSH_VOLUME_UL == 0U) ||
+            (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_FLUSH);
+        }
+        break;
+
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
         }
         break;
 
@@ -1274,6 +1844,21 @@ static uint8_t Machine_StartDirectDispenseSegment(void)
 }
 
 /**
+ * @brief 启动待机发药后的泵1定量冲洗。
+ *
+ * @return 1 表示不需要冲洗或冲洗命令已经下发；0 表示泵1不可用或命令失败。
+ */
+static uint8_t Machine_StartDirectFlush(void)
+{
+    if (machine_direct_flush_ul == 0U)
+    {
+        return 1U;
+    }
+
+    return Machine_StartComboPostPumpVolume(PumpDrive_GetPump1(), machine_direct_flush_ul, 0U);
+}
+
+/**
  * @brief 执行待机直接发药状态的一次性动作。
  */
 static void Machine_ExecuteDirectDispenseState(void)
@@ -1281,6 +1866,7 @@ static void Machine_ExecuteDirectDispenseState(void)
     switch (machine_direct_dispense_state)
     {
     case MACHINE_DIRECT_DISPENSE_STATE_ENABLE:
+        Machine_SetDispenseFlow();
         if (PumpDrive_Enable(Machine_GetDispensePump()) != 0U)
         {
             Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE);
@@ -1308,6 +1894,24 @@ static void Machine_ExecuteDirectDispenseState(void)
         }
         break;
 
+    case MACHINE_DIRECT_DISPENSE_STATE_FLUSH_VALVE_ON:
+        Machine_SetFlushFlow();
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP1_ENABLE:
+        if (PumpDrive_Enable(PumpDrive_GetPump1()) != 0U)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP1_ENABLE);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP1_FLUSH_IN:
+        if (Machine_StartDirectFlush() == 0U)
+        {
+            Machine_AbortDirectDispense();
+        }
+        break;
+
     case MACHINE_DIRECT_DISPENSE_STATE_FINISHED:
     case MACHINE_DIRECT_DISPENSE_STATE_ERROR:
         if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FINISHED) &&
@@ -1326,6 +1930,9 @@ static void Machine_ExecuteDirectDispenseState(void)
     case MACHINE_DIRECT_DISPENSE_STATE_IDLE:
     case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_ENABLE:
     case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2:
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH_VALVE:
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP1_ENABLE:
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH:
     default:
         break;
     }
@@ -1393,6 +2000,7 @@ static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOw
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
     machine_direct_dispense_done_ul = 0U;
+    machine_direct_flush_ul = MACHINE_FLUSH_VOLUME_UL;
     machine_dispense_progress_percent = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
@@ -1474,12 +2082,56 @@ static void Machine_UpdateDirectDispense(void)
 
             if (machine_direct_dispense_remaining_ul == 0U)
             {
-                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FINISHED);
+                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FLUSH_VALVE_ON);
             }
             else
             {
                 Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2);
             }
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_FLUSH_VALVE_ON:
+        Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH_VALVE);
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH_VALVE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            if (machine_direct_flush_ul == 0U)
+            {
+                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH);
+            }
+            else
+            {
+                Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_PUMP1_ENABLE);
+            }
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP1_ENABLE:
+        Machine_ExecuteDirectDispenseState();
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP1_ENABLE:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_PUMP1_FLUSH_IN);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_PUMP1_FLUSH_IN:
+        if ((machine_direct_flush_ul == 0U) ||
+            (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH);
+        }
+        break;
+
+    case MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH:
+        if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
+        {
+            Machine_EnterDirectDispenseState(MACHINE_DIRECT_DISPENSE_STATE_FINISHED);
         }
         break;
 
@@ -1517,6 +2169,17 @@ void MachineInit(void)
     machine_combo_dispense_remaining_ul = 0U;
     machine_combo_dispense_segment_ul = 0U;
     machine_combo_dispense_done_ul = 0U;
+    machine_combo_bottle_count = 0U;
+    machine_combo_bottle_index = 0U;
+    machine_combo_bottle_ml_x100[0] = 0U;
+    machine_combo_bottle_ml_x100[1] = 0U;
+    machine_combo_residual_ml_x100 = 0U;
+    machine_combo_water_per_bottle_ul = 0U;
+    machine_combo_pump1_remaining_ul = 0U;
+    machine_combo_pump1_segment_ul = 0U;
+    machine_combo_post_volume_ul = 0U;
+    machine_combo_prepare_finished = 0U;
+    machine_combo_final_conc_x1000 = 0U;
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_final_activity_ready = 0U;
@@ -1530,6 +2193,7 @@ void MachineInit(void)
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
     machine_direct_dispense_done_ul = 0U;
+    machine_direct_flush_ul = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
     machine_direct_dispense_seq = 0U;
@@ -1545,6 +2209,9 @@ void MachineInit(void)
 
 void MachineControl(void)
 {
+    uint8_t bottle_count;
+    uint16_t bottle1_ml_x100;
+    uint16_t bottle2_ml_x100;
     uint16_t current_conc_x1000;
     uint16_t current_ml_x100;
     uint16_t target_conc_x1000;
@@ -1572,6 +2239,18 @@ void MachineControl(void)
     }
 
     if ((machine_combo_running == 0U) &&
+        (MachineCMD_ConsumeLocalPrepStartRequested(&bottle_count,
+                                                   &bottle1_ml_x100,
+                                                   &bottle2_ml_x100) != 0U))
+    {
+        machine_combo_remote_volume_valid = 0U;
+        Machine_StartLocalPrepare(bottle_count,
+                                  bottle1_ml_x100,
+                                  bottle2_ml_x100);
+        return;
+    }
+
+    if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumePrepConfirmed(&current_conc_x1000,
                                          &current_ml_x100,
                                          &target_conc_x1000) != 0U))
@@ -1581,6 +2260,13 @@ void MachineControl(void)
                            current_ml_x100,
                            target_conc_x1000,
                            MACHINE_FLOW_OWNER_LOCAL);
+        return;
+    }
+
+    if ((machine_combo_running == 0U) &&
+        (MachineCMD_ConsumeLocalDispenseStartRequested(&dispense_ml_x100) != 0U))
+    {
+        Machine_StartDirectDispense(dispense_ml_x100, MACHINE_FLOW_OWNER_LOCAL);
         return;
     }
 
@@ -1719,7 +2405,13 @@ uint8_t Machine_GetCommunicationStep(void)
         }
 
         if ((machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_PUMP2_IN) ||
-            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2))
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP2) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_FLUSH_VALVE_ON) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH_VALVE) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_PUMP1_ENABLE) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_PUMP1_ENABLE) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_PUMP1_FLUSH_IN) ||
+            (machine_direct_dispense_state == MACHINE_DIRECT_DISPENSE_STATE_GAP_AFTER_FLUSH))
         {
             return COMMUNICATION_STEP_DISPENSE_RUNNING;
         }
@@ -1769,6 +2461,10 @@ uint8_t Machine_GetCommunicationStep(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1:
     case MACHINE_COMBO_STATE_WATER_PUMP_ON:
     case MACHINE_COMBO_STATE_WATER_PUMP_OFF:
+    case MACHINE_COMBO_STATE_GAP_AFTER_WATER_PUMP:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_ON:
+    case MACHINE_COMBO_STATE_FINAL_WATER_PUMP_OFF:
+    case MACHINE_COMBO_STATE_WAIT_SWITCH_TANK:
         return COMMUNICATION_STEP_PREPARE_WATER_FILL;
 
     case MACHINE_COMBO_STATE_WAIT_RAW_ACTIVITY:
@@ -1783,6 +2479,18 @@ uint8_t Machine_GetCommunicationStep(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_TANK_HOME:
     case MACHINE_COMBO_STATE_NEEDLE_HOME:
     case MACHINE_COMBO_STATE_GAP_AFTER_NEEDLE_HOME:
+    case MACHINE_COMBO_STATE_EXHAUST_VALVE_ON:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE:
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP2_EXHAUST_ENABLE:
+    case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
+    case MACHINE_COMBO_STATE_FLUSH_VALVE_ON:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_ENABLE:
+    case MACHINE_COMBO_STATE_GAP_AFTER_PUMP1_FLUSH_ENABLE:
+    case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
+    case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
         return COMMUNICATION_STEP_PREPARE_RESULT;
 
     case MACHINE_COMBO_STATE_WAIT_DISPENSE:
@@ -1797,9 +2505,9 @@ uint8_t Machine_GetCommunicationStep(void)
         return COMMUNICATION_STEP_DISPENSE_RUNNING;
 
     case MACHINE_COMBO_STATE_FINISHED:
-        return (machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) ?
-               COMMUNICATION_STEP_PREPARE_DONE :
-               COMMUNICATION_STEP_DISPENSE_DONE;
+        return (machine_combo_dispense_ul != 0U) ?
+               COMMUNICATION_STEP_DISPENSE_DONE :
+               COMMUNICATION_STEP_PREPARE_DONE;
 
     case MACHINE_COMBO_STATE_ERROR:
         return COMMUNICATION_STEP_FAILED;
