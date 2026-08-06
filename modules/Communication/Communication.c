@@ -559,6 +559,42 @@ uint8_t Communication_SendPrepareResult(uint16_t actual_total_volume_x100,
     return Communication_SendFrame(COMMUNICATION_CAN_ID_DATA, data);
 }
 
+uint8_t Communication_SendRemainResult(uint16_t remain_volume_x100,
+                                       uint16_t remain_activity_x100,
+                                       uint8_t flags,
+                                       uint8_t seq)
+{
+    uint8_t data[COMMUNICATION_CAN_FRAME_LEN] = {0};
+
+    data[0] = COMMUNICATION_CMD_SET_PARAM;
+    data[1] = COMMUNICATION_OBJ_REMAIN_RESULT;
+    Communication_WriteU16LE(&data[2], remain_volume_x100);
+    Communication_WriteU16LE(&data[4], remain_activity_x100);
+    data[6] = seq;
+    data[7] = flags;
+
+    return Communication_SendFrame(COMMUNICATION_CAN_ID_DATA, data);
+}
+
+uint8_t Communication_SendProcessResult(uint8_t process_id,
+                                        uint8_t result,
+                                        uint16_t detail,
+                                        uint8_t final_step,
+                                        uint8_t seq)
+{
+    uint8_t data[COMMUNICATION_CAN_FRAME_LEN] = {0};
+
+    data[0] = COMMUNICATION_CMD_START_PROCESS;
+    data[1] = COMMUNICATION_OBJ_PROCESS_RESULT;
+    data[2] = process_id;
+    data[3] = result;
+    Communication_WriteU16LE(&data[4], detail);
+    data[6] = seq;
+    data[7] = final_step;
+
+    return Communication_SendFrame(COMMUNICATION_CAN_ID_DATA, data);
+}
+
 uint8_t Communication_SendVersion(uint8_t hw_major,
                                   uint8_t hw_minor,
                                   uint8_t fw_major,
@@ -725,6 +761,34 @@ void Communication_OnEStopChanged(uint8_t active)
             Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
                                          COMMUNICATION_CONTROL_REASON_ESTOP);
         }
+    }
+}
+
+void Communication_OnRemoteResetError(void)
+{
+    /*
+     * 上位机急停后的复位不是“本地启动键恢复远控”。
+     * 它需要明确清掉急停/报警锁存，并让 0x181 重新回到 IDLE + REMOTE + alarm=0，
+     * 否则后续动作帧会继续被 IsRemoteCommandAllowed() 当作非远控或报警状态拒绝。
+     */
+    communication_control.alarm_active = 0U;
+    communication_control.estop_active = 0U;
+    communication_control.remote_resume_allowed = 0U;
+    communication_control.local_flow_running = 0U;
+    communication_control.local_takeover_latched = 0U;
+    communication_control.pending_safety_action = COMMUNICATION_SAFETY_ACTION_NONE;
+    communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+
+    if ((communication_control.pc_connected != 0U) &&
+        (communication_control.pc_authorized != 0U))
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
+                                     COMMUNICATION_CONTROL_REASON_KEY_RESET);
+    }
+    else
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                     COMMUNICATION_CONTROL_REASON_KEY_RESET);
     }
 }
 

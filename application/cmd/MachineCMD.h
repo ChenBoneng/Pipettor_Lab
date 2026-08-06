@@ -94,7 +94,7 @@ uint8_t MachineCMD_ConsumePrepConfirmed(uint16_t *current_conc_x1000,
 // 读取并清除“发药量已经确认”事件，volume_ml_x100 单位为 0.01ml。
 uint8_t MachineCMD_ConsumeDispenseConfirmed(uint16_t *volume_ml_x100);
 
-/* 本机 UI 预留事件接口：当前只记录用户意图，不直接启动泵、电机或阀。 */
+/* 本机 UI 事件接口：MachineControl() 周期消费后启动对应 machine 流程。 */
 uint8_t MachineCMD_ConsumeLocalPrepStartRequested(uint8_t *bottle_count,
                                                   uint16_t *bottle1_ml_x100,
                                                   uint16_t *bottle2_ml_x100);
@@ -103,7 +103,7 @@ uint8_t MachineCMD_ConsumeLocalDispenseStartRequested(uint16_t *volume_ml_x100);
 uint8_t MachineCMD_ConsumeLocalExhaustRequested(void);
 uint8_t MachineCMD_ConsumeLocalEmptyRequested(void);
 
-/* 本机 UI 阶段显示接口：后续 machine 状态机接入时只需更新阶段和进度。 */
+/* 本机 UI 阶段显示接口：machine 状态机按真实流程阶段更新页面和进度。 */
 void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
                                 uint16_t done_ml_x100,
                                 uint16_t total_ml_x100);

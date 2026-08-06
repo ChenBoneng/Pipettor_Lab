@@ -101,6 +101,18 @@
 /** 授权标志位，当前未使用。 */
 #define COMMUNICATION_AUTH_FLAGS_NONE            0x00U
 
+/** 0x101 / PIPE_PARAM Byte7 标志位。 */
+#define COMMUNICATION_PIPE_FLAG_SAVE              0x01U
+#define COMMUNICATION_PIPE_FLAG_APPLY_NOW         0x02U
+
+/** 0x101 / REMAIN_PARAM Byte7 标志位。 */
+#define COMMUNICATION_REMAIN_FLAG_PRESENT         0x01U
+#define COMMUNICATION_REMAIN_FLAG_RETURN_REQUIRED 0x02U
+
+/** 0x183 / REMAIN_RESULT Byte7 标志位。 */
+#define COMMUNICATION_REMAIN_RESULT_FLAG_PRESENT  0x01U
+#define COMMUNICATION_REMAIN_RESULT_FLAG_RETURNED 0x02U
+
 /**
  * @brief CAN 协议功能码。
  *
@@ -148,8 +160,13 @@ typedef enum
     COMMUNICATION_OBJ_PUMP_2 = 0x08U,              /**< 泵2：100ul 定量泵。 */
     COMMUNICATION_OBJ_PREPARE_PARAM = 0x10U,       /**< 配药参数：初始活度和目标浓度。 */
     COMMUNICATION_OBJ_DISPENSE_PARAM = 0x11U,      /**< 发药参数。 */
-    COMMUNICATION_OBJ_PREPARE_RESULT = 0x12U,      /**< 配药结果返回对象。 */
-    COMMUNICATION_OBJ_PREPARE_VOLUME_PARAM = 0x13U /**< 配药体积参数。 */
+    COMMUNICATION_OBJ_PREPARE_RESULT = 0x12U,       /**< 配药结果返回对象。 */
+    COMMUNICATION_OBJ_PREPARE_VOLUME_PARAM = 0x13U, /**< 配药体积参数。 */
+    COMMUNICATION_OBJ_PREPARE_BOTTLE_PARAM = 0x14U, /**< 连续配药的药瓶量参数。 */
+    COMMUNICATION_OBJ_PIPE_PARAM = 0x15U,           /**< 排气量和冲洗量参数。 */
+    COMMUNICATION_OBJ_REMAIN_PARAM = 0x16U,         /**< 当前余量及回抽要求参数。 */
+    COMMUNICATION_OBJ_REMAIN_RESULT = 0x17U,        /**< 余量处理结果返回对象。 */
+    COMMUNICATION_OBJ_PROCESS_RESULT = 0x18U        /**< 流程最终结果返回对象。 */
 } CommunicationObject_e;
 
 /** START_PROCESS Byte2 的流程编号。 */
@@ -158,7 +175,8 @@ typedef enum
     COMMUNICATION_PROCESS_PREPARE = 0x01U,              /**< 配药。 */
     COMMUNICATION_PROCESS_DISPENSE = 0x02U,             /**< 发药。 */
     COMMUNICATION_PROCESS_FLUSH = 0x03U,                /**< 单独冲洗。 */
-    COMMUNICATION_PROCESS_TRANSFER_TO_ACTIVITY = 0x04U  /**< 转移药液进活度计。 */
+    COMMUNICATION_PROCESS_TRANSFER_TO_ACTIVITY = 0x04U, /**< 转移药液进活度计。 */
+    COMMUNICATION_PROCESS_EXHAUST = 0x05U               /**< 单独排气。 */
 } CommunicationProcessId_e;
 
 /**
@@ -239,6 +257,13 @@ typedef enum
     COMMUNICATION_STEP_PREPARE_DONE = 0x16U,          /**< 配药流程完成。 */
     COMMUNICATION_STEP_TRANSFER_TO_ACTIVITY = 0x17U,  /**< 药液正在转移至活度计。 */
     COMMUNICATION_STEP_TRANSFER_DONE = 0x18U,         /**< 药液转移完成，可读取活度并开始配药。 */
+    COMMUNICATION_STEP_PREPARE_WAIT_CANISTER = 0x19U, /**< 等待放入或更换铅罐。 */
+    COMMUNICATION_STEP_PREPARE_CANISTER_IN = 0x1AU,   /**< 进罐导轨前进中。 */
+    COMMUNICATION_STEP_PREPARE_NEEDLE_IN = 0x1BU,     /**< 插针导轨前进中。 */
+    COMMUNICATION_STEP_PREPARE_WATER_PUMP = 0x1CU,    /**< 抽水泵工作中。 */
+    COMMUNICATION_STEP_PREPARE_PUMP1_FILL = 0x1DU,    /**< 泵1定量补水中。 */
+    COMMUNICATION_STEP_PREPARE_WAIT_CONFIRM = 0x1EU,  /**< 等待用户确认更换下一罐。 */
+    COMMUNICATION_STEP_PREPARE_MEASURING = 0x1FU,     /**< 活度计测量中。 */
     COMMUNICATION_STEP_DISPENSE_PARAM_READY = 0x20U,  /**< 发药参数已就绪。 */
     COMMUNICATION_STEP_DISPENSE_START = 0x21U,        /**< 发药流程启动。 */
     COMMUNICATION_STEP_DISPENSE_RUNNING = 0x22U,      /**< 发药泵送中。 */
@@ -246,6 +271,10 @@ typedef enum
     COMMUNICATION_STEP_FLUSH_START = 0x30U,           /**< 冲洗流程启动。 */
     COMMUNICATION_STEP_FLUSH_RUNNING = 0x31U,         /**< 冲洗中。 */
     COMMUNICATION_STEP_FLUSH_DONE = 0x32U,            /**< 冲洗完成。 */
+    COMMUNICATION_STEP_EXHAUST_RUNNING = 0x33U,       /**< 排气中。 */
+    COMMUNICATION_STEP_EXHAUST_DONE = 0x34U,          /**< 排气完成。 */
+    COMMUNICATION_STEP_REMAIN_RETURN = 0x35U,         /**< 余量回抽中。 */
+    COMMUNICATION_STEP_REMAIN_RETURN_DONE = 0x36U,    /**< 余量回抽完成。 */
     COMMUNICATION_STEP_REMOTE_PAUSED = 0x40U,         /**< 远程流程被本地暂停。 */
     COMMUNICATION_STEP_LOCAL_TAKEOVER = 0x41U,        /**< 本地已接管远程流程。 */
     COMMUNICATION_STEP_FAILED = 0x7FU                 /**< 当前流程失败。 */
@@ -369,6 +398,33 @@ typedef struct
     uint8_t detail1; /**< Byte5：报警附加信息 1。 */
     uint8_t seq;     /**< Byte6：报警序号。 */
 } CommunicationAlarm_s;
+
+/** 0x101 / SET_PARAM / PREPARE_BOTTLE_PARAM 数据模型。 */
+typedef struct
+{
+    uint16_t bottle1_volume_x100; /**< 药瓶量1，单位 0.01ml。 */
+    uint16_t bottle2_volume_x100; /**< 药瓶量2，单位 0.01ml。 */
+    uint16_t bottle3_volume_x100; /**< 药瓶量3，单位 0.01ml；接收时由 Byte7 x10 转换。 */
+    uint8_t seq;                  /**< 上位机参数帧序号。 */
+} CommunicationBottleParam_s;
+
+/** 0x101 / SET_PARAM / PIPE_PARAM 数据模型。 */
+typedef struct
+{
+    uint16_t exhaust_volume_x100; /**< 排气量，单位 0.01ml。 */
+    uint16_t flush_volume_x100;   /**< 冲洗量，单位 0.01ml。 */
+    uint8_t flags;                /**< 保存及立即生效标志。 */
+    uint8_t seq;                  /**< 上位机参数帧序号。 */
+} CommunicationPipeParam_s;
+
+/** 0x101 / SET_PARAM / REMAIN_PARAM 数据模型。 */
+typedef struct
+{
+    uint16_t remain_volume_x100;  /**< 当前余量体积，单位 0.01ml。 */
+    uint16_t concentration_x1000; /**< 当前浓度，单位 0.001mCi/ml。 */
+    uint8_t flags;                /**< 余量存在及是否需要回抽标志。 */
+    uint8_t seq;                  /**< 上位机参数帧序号。 */
+} CommunicationRemainParam_s;
 
 /**
  * @brief 授权模块运行状态。
@@ -543,6 +599,29 @@ uint8_t Communication_SendPrepareResult(uint16_t actual_total_volume_x100,
                                         uint8_t seq);
 
 /**
+ * @brief 发送 0x183 余量处理结果帧。
+ *
+ * 帧格式：Byte0=SET_PARAM，Byte1=REMAIN_RESULT，Byte2~3=剩余体积，Byte4~5=剩余活度，
+ * Byte6=SEQ，Byte7=余量结果标志。
+ */
+uint8_t Communication_SendRemainResult(uint16_t remain_volume_x100,
+                                       uint16_t remain_activity_x100,
+                                       uint8_t flags,
+                                       uint8_t seq);
+
+/**
+ * @brief 发送 0x183 流程最终结果帧。
+ *
+ * 帧格式：Byte0=START_PROCESS，Byte1=PROCESS_RESULT，Byte2=process_id，Byte3=result，
+ * Byte4~5=detail，Byte6=SEQ，Byte7=final_step。
+ */
+uint8_t Communication_SendProcessResult(uint8_t process_id,
+                                        uint8_t result,
+                                        uint16_t detail,
+                                        uint8_t final_step,
+                                        uint8_t seq);
+
+/**
  * @brief 发送 0x183 版本信息帧。
  *
  * 该帧响应上位机 QUERY_VERSION。
@@ -625,6 +704,9 @@ void Communication_OnAlarmChanged(uint8_t active);
 
 /** 同步急停状态。 */
 void Communication_OnEStopChanged(uint8_t active);
+
+/** 上位机 RESET_ERROR：清除安全锁存，并在授权仍有效时恢复 REMOTE/IDLE。 */
+void Communication_OnRemoteResetError(void);
 
 /** 本地暂停键事件。 */
 void Communication_OnLocalPauseKey(void);

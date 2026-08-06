@@ -22,6 +22,8 @@
 #define MACHINE_CMD_BOOT_HOLD_MS          2000U
 #define MACHINE_CMD_MEASURE_HOLD_MS       15000U
 #define MACHINE_CMD_DISPENSE_DONE_HOLD_MS 3000U
+/** 活度计内余量主动上报周期，单位 ms。 */
+#define MACHINE_CMD_REMAIN_REPORT_PERIOD_MS 5000U
 #define MACHINE_CMD_REMOTE_DIR_REVERSE    0U
 #define MACHINE_CMD_REMOTE_DIR_FORWARD    1U
 #define MACHINE_CMD_REMOTE_PUMP_STOP      0U
@@ -29,6 +31,12 @@
 #define MACHINE_CMD_REMOTE_PUMP_OUT       2U
 /** 上位机泵控制未携带体积时，默认按 10 圈点动；角度单位为 0.1 度。 */
 #define MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10 36000U
+/** 远控定量泵先发 `on`，再等总线释放后发 `in/out`。 */
+#define MACHINE_CMD_REMOTE_PUMP_ENABLE_GAP_MS 200U
+#define MACHINE_CMD_REMOTE_PUMP_PENDING_TIMEOUT_MS 2000U
+#define MACHINE_CMD_REMOTE_PUMP_PENDING_NONE   0U
+#define MACHINE_CMD_REMOTE_PUMP_PENDING_ENABLE 1U
+#define MACHINE_CMD_REMOTE_PUMP_PENDING_MOVE   2U
 #define MACHINE_CMD_REMOTE_MOTOR_A_BUSY   (1U << 0)
 #define MACHINE_CMD_REMOTE_MOTOR_B_BUSY   (1U << 1)
 #define MACHINE_CMD_REMOTE_PUMP1_BUSY     (1U << 2)
@@ -38,6 +46,7 @@
 #define MACHINE_CMD_REMOTE_WATER_PUMP_ON  (1U << 2)
 #define MACHINE_CMD_ACTIVITY_PUSH_SEQ      0U
 #define MACHINE_CMD_PREP_MAX_BOTTLE_COUNT 2U
+#define MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT 3U
 
 typedef enum
 {
@@ -102,13 +111,32 @@ typedef struct
     uint16_t remote_prepare_target_conc_x1000;             // 远程配药目标浓度，单位 0.001mCi/ml
     uint16_t remote_prepare_water_volume_x100;             // 远程配药补水量，单位 0.01ml
     uint16_t remote_prepare_final_volume_x100;             // 远程配药理论最终体积，单位 0.01ml
+    uint16_t remote_prepare_bottle_volume_x100[MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT]; // 远程药瓶量1/2/3，单位 0.01ml
+    uint16_t remote_pipe_exhaust_volume_x100;              // 远程配置排气量，单位 0.01ml
+    uint16_t remote_pipe_flush_volume_x100;                // 远程配置冲洗量，单位 0.01ml
+    uint16_t remote_remain_volume_x100;                    // 远程下发当前余量体积，单位 0.01ml
+    uint16_t remote_remain_conc_x1000;                     // 远程下发当前余量浓度，单位 0.001mCi/ml
     uint16_t remote_dispense_volume_x100;                  // 远程发药体积，单位 0.01ml
     uint16_t remote_dispense_target_activity_x100;         // 远程发药目标活度，单位 0.01mCi
     uint8_t remote_prepare_param_ready;                    // 已收到 PREPARE_PARAM
     uint8_t remote_prepare_volume_ready;                   // 已收到 PREPARE_VOLUME_PARAM
+    uint8_t remote_prepare_bottle_ready;                   // 已收到 PREPARE_BOTTLE_PARAM
+    /* 远程排气/冲洗参数标志位。 */
+    uint8_t remote_pipe_flags;
+    uint8_t remote_pipe_param_ready;                       // 已收到 PIPE_PARAM
+    /* 远程余量参数标志位。 */
+    uint8_t remote_remain_flags;
+    uint8_t remote_remain_param_ready;                     // 已收到 REMAIN_PARAM
     uint8_t remote_dispense_param_ready;                   // 已收到 DISPENSE_PARAM
     uint8_t remote_transfer_activity_reported;             // 转移完成后的活度主动上报已经发送
     uint32_t remote_status_last_ms;                         // 0x181 周期状态上报时间
+    uint8_t remote_pump_pending_state;                      // 远控定量泵等待状态：先使能，再延时运动
+    uint8_t remote_pump_pending_obj;                        // 待执行定量泵对象，PUMP_1/PUMP_2
+    uint8_t remote_pump_pending_action;                     // 待执行动作，吸入/排出
+    uint16_t remote_pump_pending_volume_ul;                 // 待执行体积，0 表示按默认角度点动
+    uint32_t remote_pump_pending_start_ms;                  // 当前等待阶段起始时间
+    uint32_t remain_report_last_ms;                         // 0x183 REMAIN_RESULT 主动上报时间
+    uint8_t remain_report_seq;                              // 主动余量上报序号，不要求上位机 ACK
     uint8_t activity_request_pending;                       // READ_ACTIVITY 异步查询正在等待最终读数
     uint8_t activity_request_started;                       // 本次查询已经触发或接上活度计读取
     uint8_t activity_request_seq;                           // 待补发活度结果的上位机 SEQ
@@ -171,7 +199,12 @@ static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *
 static uint8_t MachineCMD_HandleRemoteValve(const CommunicationHostCommand_s *command);
 static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *command);
 static uint8_t MachineCMD_HandleRemoteStopObject(const CommunicationHostCommand_s *command);
+static PumpDrive_s *MachineCMD_GetRemotePump(uint8_t obj);
+static void MachineCMD_ClearRemotePumpPending(void);
+static uint8_t MachineCMD_StartRemotePumpPending(uint8_t obj, uint8_t action, uint16_t volume_ul);
+static void MachineCMD_ProcessRemotePumpPending(void);
 static void MachineCMD_SendRemoteStatus(uint8_t seq);
+static void MachineCMD_ReportRemainIfDue(uint32_t now_ms);
 static uint8_t MachineCMD_LineAppendBytes(uint8_t *line, uint8_t offset, const uint8_t *data, uint8_t len);
 static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const MachineCmdText_s *text);
 static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const char *text);
@@ -243,6 +276,8 @@ void MachineCMD_Process(void)
         MachineCMD_SendRemoteStatus(0U);
     }
 
+    MachineCMD_ReportRemainIfDue(now_ms);
+
     /*
      * 开机页停留 2 秒，用于让用户看到系统已经进入初始化。
      * 当前设备默认交给上位机控制，所以启动结束后直接进入远控页。
@@ -253,7 +288,8 @@ void MachineCMD_Process(void)
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
     }
 
-    if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) &&
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) &&
+        (machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) &&
         (Machine_ConsumeCombinationFinalActivityReady() != 0U))
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_MEASURE);
@@ -279,6 +315,7 @@ void MachineCMD_Process(void)
     if (key == KEYPAD_STATE_NONE)
     {
         MachineCMD_ProcessRemoteCommand();
+        MachineCMD_ProcessRemotePumpPending();
         MachineCMD_CompleteActivityRequest();
         MachineCMD_ReportActivityUpdate();
         MachineCMD_SyncRemoteState();
@@ -661,6 +698,12 @@ void MachineCMD_SetPrepRunStage(MachineCmdPrepRunStage_e stage,
     machine_cmd.prep_stage_done_ml_x100 = done_ml_x100;
     machine_cmd.prep_stage_total_ml_x100 = total_ml_x100;
 
+    /* 上位机接管时 LCD 固定留在远控页，流程进度只通过 0x181/0x183 上报。 */
+    if (Communication_GetControlMode() == COMMUNICATION_CONTROL_REMOTE)
+    {
+        return;
+    }
+
     if (stage == MACHINE_CMD_PREP_RUN_STAGE_ACTIVITY_CHECK)
     {
         target_page = MACHINE_CMD_PAGE_PREP_MEASURE;
@@ -686,6 +729,10 @@ void MachineCMD_SetPrepSwitchTank(uint8_t done_bottle_index, uint8_t next_bottle
     machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK;
     machine_cmd.prep_stage_done_ml_x100 = (uint16_t)done_bottle_index;
     machine_cmd.prep_stage_total_ml_x100 = (uint16_t)next_bottle_index;
+    if (Communication_GetControlMode() == COMMUNICATION_CONTROL_REMOTE)
+    {
+        return;
+    }
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
 }
 
@@ -693,6 +740,10 @@ void MachineCMD_SetPrepFinished(uint16_t final_conc_x1000)
 {
     machine_cmd.prep_final_conc_x1000 = final_conc_x1000;
     machine_cmd.prep_run_stage = MACHINE_CMD_PREP_RUN_STAGE_DONE;
+    if (Communication_GetControlMode() == COMMUNICATION_CONTROL_REMOTE)
+    {
+        return;
+    }
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_PREP_RUNNING);
 }
 
@@ -1602,6 +1653,14 @@ static void MachineCMD_HandleRemoteKey(KeypadState_e key)
     }
     else if (key == KEYPAD_STATE_START)
     {
+        if ((Communication_GetControlMode() == COMMUNICATION_CONTROL_REMOTE) &&
+            (machine_cmd.prep_run_stage == MACHINE_CMD_PREP_RUN_STAGE_SWITCH_TANK))
+        {
+            machine_cmd.prep_switch_requested = 1U;
+            MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_IN_TANK, 0U, 0U);
+            return;
+        }
+
         Communication_OnLocalStartKey();
         MachineCMD_SyncRemoteState();
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
@@ -1641,6 +1700,7 @@ static void MachineCMD_StopRemoteOutputs(void)
 {
     PumpDrive_s *pump;
 
+    MachineCMD_ClearRemotePumpPending();
     StepMotor_StopAll();
     SolenoidValve_AllOff();
     WaterPump_StopAll();
@@ -1751,17 +1811,35 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
     {
         /*
          * 上位机急停按钮当前按 STOP_PROCESS 进入这里。
-         * 本项目暂时不要求 LCD 切到急停页，但物理输出必须立即停止：
-         * 步进电机停 PWM，阀和水泵断开，泵1/泵2发送 stp 1 急停命令。
+         * 急停语义是立即停止并终止整个流程，不能复用复位收尾，否则会继续执行冲洗/导轨回零。
          */
         MachineCMD_StopRemoteOutputs();
+        machine_cmd.prep_confirmed = 0U;
+        machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.prep_start_requested = 0U;
+        machine_cmd.prep_switch_requested = 0U;
+        machine_cmd.dispense_start_requested = 0U;
+        machine_cmd.exhaust_requested = 0U;
+        machine_cmd.empty_requested = 0U;
+        Machine_EmergencyStop();
+        Communication_OnEStopChanged(1U);
+        MachineCMD_SyncRemoteState();
         return;
     }
 
     if (command->cmd == COMMUNICATION_CMD_RESET_ERROR)
     {
         MachineCMD_StopRemoteOutputs();
-        Communication_OnLocalStartKey();
+        Machine_EmergencyStop();
+        Machine_ClearRemoteStepHold();
+        machine_cmd.prep_confirmed = 0U;
+        machine_cmd.dispense_confirmed = 0U;
+        machine_cmd.prep_start_requested = 0U;
+        machine_cmd.prep_switch_requested = 0U;
+        machine_cmd.dispense_start_requested = 0U;
+        machine_cmd.exhaust_requested = 0U;
+        machine_cmd.empty_requested = 0U;
+        Communication_OnRemoteResetError();
         MachineCMD_SyncRemoteState();
         machine_cmd.remote_paused = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
@@ -2115,6 +2193,47 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
         machine_cmd.remote_prepare_volume_ready = 1U;
         break;
 
+    case COMMUNICATION_OBJ_PREPARE_BOTTLE_PARAM:
+        machine_cmd.remote_prepare_bottle_volume_x100[0] =
+            Communication_ReadU16LE(&command->data[2]);
+        machine_cmd.remote_prepare_bottle_volume_x100[1] =
+            Communication_ReadU16LE(&command->data[4]);
+        /*
+         * 0x14 帧为了塞进 8 字节，第三瓶只保留 Byte7 x10 的 0.1ml 精度。
+         * 当前实际设备最多只配两瓶，这里仍按协议缓存，避免上位机联调时收到 BAD_PARAM。
+         */
+        machine_cmd.remote_prepare_bottle_volume_x100[2] = (uint16_t)command->data[7] * 10U;
+        machine_cmd.remote_prepare_bottle_ready = 1U;
+        break;
+
+    case COMMUNICATION_OBJ_PIPE_PARAM:
+        machine_cmd.remote_pipe_exhaust_volume_x100 =
+            Communication_ReadU16LE(&command->data[2]);
+        machine_cmd.remote_pipe_flush_volume_x100 =
+            Communication_ReadU16LE(&command->data[4]);
+        machine_cmd.remote_pipe_flags = command->data[7];
+        machine_cmd.remote_pipe_param_ready = 1U;
+        break;
+
+    case COMMUNICATION_OBJ_REMAIN_PARAM:
+        machine_cmd.remote_remain_volume_x100 =
+            Communication_ReadU16LE(&command->data[2]);
+        machine_cmd.remote_remain_conc_x1000 =
+            Communication_ReadU16LE(&command->data[4]);
+        machine_cmd.remote_remain_flags = command->data[7];
+        machine_cmd.remote_remain_param_ready = 1U;
+        if ((machine_cmd.remote_remain_flags & COMMUNICATION_REMAIN_FLAG_PRESENT) != 0U)
+        {
+            MachineCMD_SetStandbyInventory(machine_cmd.remote_remain_conc_x1000,
+                                           0U,
+                                           machine_cmd.remote_remain_volume_x100);
+        }
+        else
+        {
+            MachineCMD_SetStandbyInventory(0U, 0U, 0U);
+        }
+        break;
+
     case COMMUNICATION_OBJ_DISPENSE_PARAM:
         machine_cmd.remote_dispense_volume_x100 =
             Communication_ReadU16LE(&command->data[2]);
@@ -2163,25 +2282,24 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
     process_id = command->data[2];
     if (process_id == COMMUNICATION_PROCESS_PREPARE)
     {
-        if (Machine_IsTransferToActivityDone() == 0U)
-        {
-            result = COMMUNICATION_RESULT_BUSY;
-            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
-        }
-        else if ((machine_cmd.remote_prepare_param_ready == 0U) ||
+        if ((machine_cmd.remote_prepare_bottle_ready == 0U) ||
             (machine_cmd.remote_prepare_volume_ready == 0U))
         {
             result = COMMUNICATION_RESULT_BAD_PARAM;
             error = COMMUNICATION_ERROR_BAD_PARAM;
         }
-        else if (Machine_StartRemotePrepare(machine_cmd.remote_prepare_water_volume_x100,
-                                            machine_cmd.remote_prepare_final_volume_x100,
-                                            machine_cmd.remote_prepare_initial_activity_x100,
-                                            machine_cmd.remote_prepare_target_conc_x1000,
-                                            command->seq) != 0U)
+        else if (Machine_StartRemotePrepareByBottle(machine_cmd.remote_prepare_bottle_volume_x100[0],
+                                                    machine_cmd.remote_prepare_bottle_volume_x100[1],
+                                                    machine_cmd.remote_prepare_water_volume_x100,
+                                                    machine_cmd.remote_prepare_final_volume_x100,
+                                                    machine_cmd.remote_prepare_initial_activity_x100,
+                                                    machine_cmd.remote_prepare_target_conc_x1000,
+                                                    command->seq) != 0U)
         {
             machine_cmd.remote_prepare_param_ready = 0U;
             machine_cmd.remote_prepare_volume_ready = 0U;
+            machine_cmd.remote_prepare_bottle_ready = 0U;
+            machine_cmd.remote_transfer_activity_reported = 0U;
         }
         else
         {
@@ -2216,6 +2334,22 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
             machine_cmd.remote_transfer_activity_reported = 0U;
         }
         else
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+    }
+    else if (process_id == COMMUNICATION_PROCESS_FLUSH)
+    {
+        if (Machine_StartRemoteFlush(command->seq) == 0U)
+        {
+            result = COMMUNICATION_RESULT_BUSY;
+            error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+    }
+    else if (process_id == COMMUNICATION_PROCESS_EXHAUST)
+    {
+        if (Machine_StartRemoteExhaust(command->seq) == 0U)
         {
             result = COMMUNICATION_RESULT_BUSY;
             error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
@@ -2335,6 +2469,132 @@ static uint8_t MachineCMD_HandleRemoteValve(const CommunicationHostCommand_s *co
 }
 
 /**
+ * @brief 按通信对象获取远控定量泵实例。
+ */
+static PumpDrive_s *MachineCMD_GetRemotePump(uint8_t obj)
+{
+    if (obj == COMMUNICATION_OBJ_PUMP_1)
+    {
+        return PumpDrive_GetPump1();
+    }
+
+    if (obj == COMMUNICATION_OBJ_PUMP_2)
+    {
+        return PumpDrive_GetPump2();
+    }
+
+    return NULL;
+}
+
+/**
+ * @brief 清除远控定量泵待执行动作。
+ */
+static void MachineCMD_ClearRemotePumpPending(void)
+{
+    machine_cmd.remote_pump_pending_state = MACHINE_CMD_REMOTE_PUMP_PENDING_NONE;
+    machine_cmd.remote_pump_pending_obj = COMMUNICATION_OBJ_SYSTEM;
+    machine_cmd.remote_pump_pending_action = MACHINE_CMD_REMOTE_PUMP_STOP;
+    machine_cmd.remote_pump_pending_volume_ul = 0U;
+    machine_cmd.remote_pump_pending_start_ms = 0U;
+}
+
+/**
+ * @brief 记录远控定量泵动作，先使能，再延时下发运动。
+ */
+static uint8_t MachineCMD_StartRemotePumpPending(uint8_t obj, uint8_t action, uint16_t volume_ul)
+{
+    if ((MachineCMD_GetRemotePump(obj) == NULL) ||
+        ((action != MACHINE_CMD_REMOTE_PUMP_IN) &&
+         (action != MACHINE_CMD_REMOTE_PUMP_OUT)))
+    {
+        return 0U;
+    }
+
+    machine_cmd.remote_pump_pending_state = MACHINE_CMD_REMOTE_PUMP_PENDING_ENABLE;
+    machine_cmd.remote_pump_pending_obj = obj;
+    machine_cmd.remote_pump_pending_action = action;
+    machine_cmd.remote_pump_pending_volume_ul = volume_ul;
+    machine_cmd.remote_pump_pending_start_ms = MachineCMD_GetMs();
+    MachineCMD_ProcessRemotePumpPending();
+    return 1U;
+}
+
+/**
+ * @brief 周期推进远控定量泵直控动作。
+ *
+ * @note ISC1000 在 `in/out` 前需要 `on` 使能，且 RS485 总线是一问一答。
+ *       自动流程已有单独使能状态；远控直控也必须用同样节奏，否则上位机发泵1/泵2运动时
+ *       可能只收到 ACK，但实际运动命令被未使能或总线忙挡掉。
+ */
+static void MachineCMD_ProcessRemotePumpPending(void)
+{
+    PumpDrive_s *pump;
+    uint32_t now_ms;
+    uint32_t elapsed_ms;
+    uint8_t moved = 0U;
+
+    if (machine_cmd.remote_pump_pending_state == MACHINE_CMD_REMOTE_PUMP_PENDING_NONE)
+    {
+        return;
+    }
+
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
+        (machine_cmd.remote_paused != 0U))
+    {
+        MachineCMD_ClearRemotePumpPending();
+        return;
+    }
+
+    pump = MachineCMD_GetRemotePump(machine_cmd.remote_pump_pending_obj);
+    if (pump == NULL)
+    {
+        MachineCMD_ClearRemotePumpPending();
+        return;
+    }
+
+    now_ms = MachineCMD_GetMs();
+    elapsed_ms = now_ms - machine_cmd.remote_pump_pending_start_ms;
+    if (elapsed_ms >= MACHINE_CMD_REMOTE_PUMP_PENDING_TIMEOUT_MS)
+    {
+        MachineCMD_ClearRemotePumpPending();
+        return;
+    }
+
+    if (machine_cmd.remote_pump_pending_state == MACHINE_CMD_REMOTE_PUMP_PENDING_ENABLE)
+    {
+        if (PumpDrive_Enable(pump) != 0U)
+        {
+            machine_cmd.remote_pump_pending_state = MACHINE_CMD_REMOTE_PUMP_PENDING_MOVE;
+            machine_cmd.remote_pump_pending_start_ms = now_ms;
+        }
+        return;
+    }
+
+    if (elapsed_ms < MACHINE_CMD_REMOTE_PUMP_ENABLE_GAP_MS)
+    {
+        return;
+    }
+
+    if (machine_cmd.remote_pump_pending_action == MACHINE_CMD_REMOTE_PUMP_IN)
+    {
+        moved = (machine_cmd.remote_pump_pending_volume_ul == 0U) ?
+                PumpDrive_MoveInAngleDegX10(pump, MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10) :
+                PumpDrive_MoveInVolumeUl(pump, machine_cmd.remote_pump_pending_volume_ul);
+    }
+    else if (machine_cmd.remote_pump_pending_action == MACHINE_CMD_REMOTE_PUMP_OUT)
+    {
+        moved = (machine_cmd.remote_pump_pending_volume_ul == 0U) ?
+                PumpDrive_MoveOutAngleDegX10(pump, MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10) :
+                PumpDrive_MoveOutVolumeUl(pump, machine_cmd.remote_pump_pending_volume_ul);
+    }
+
+    if (moved != 0U)
+    {
+        MachineCMD_ClearRemotePumpPending();
+    }
+}
+
+/**
  * @brief 执行上位机泵控制命令。
  *
  * @param command 上位机命令缓存。
@@ -2367,19 +2627,7 @@ static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *com
                                   WATER_PUMP_STATE_ON);
     }
 
-    if (command->obj == COMMUNICATION_OBJ_PUMP_1)
-    {
-        pump = PumpDrive_GetPump1();
-    }
-    else if (command->obj == COMMUNICATION_OBJ_PUMP_2)
-    {
-        pump = PumpDrive_GetPump2();
-    }
-    else
-    {
-        return 0U;
-    }
-
+    pump = MachineCMD_GetRemotePump(command->obj);
     if (pump == NULL)
     {
         return 0U;
@@ -2389,21 +2637,14 @@ static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *com
     switch (action)
     {
     case MACHINE_CMD_REMOTE_PUMP_STOP:
+        MachineCMD_ClearRemotePumpPending();
         return PumpDrive_Stop(pump, 1U);
 
     case MACHINE_CMD_REMOTE_PUMP_IN:
-        if (volume_ul == 0U)
-        {
-            return PumpDrive_MoveInAngleDegX10(pump, MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10);
-        }
-        return PumpDrive_MoveInVolumeUl(pump, volume_ul);
+        return MachineCMD_StartRemotePumpPending(command->obj, action, volume_ul);
 
     case MACHINE_CMD_REMOTE_PUMP_OUT:
-        if (volume_ul == 0U)
-        {
-            return PumpDrive_MoveOutAngleDegX10(pump, MACHINE_CMD_REMOTE_PUMP_DEFAULT_ANGLE_DEG_X10);
-        }
-        return PumpDrive_MoveOutVolumeUl(pump, volume_ul);
+        return MachineCMD_StartRemotePumpPending(command->obj, action, volume_ul);
 
     default:
         return 0U;
@@ -2543,7 +2784,8 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
             status.step = COMMUNICATION_STEP_DISPENSE_PARAM_READY;
         }
         else if (((machine_cmd.remote_prepare_param_ready != 0U) ||
-                  (machine_cmd.remote_prepare_volume_ready != 0U)) &&
+                  (machine_cmd.remote_prepare_volume_ready != 0U) ||
+                  (machine_cmd.remote_prepare_bottle_ready != 0U)) &&
                  (status.step == COMMUNICATION_STEP_IDLE))
         {
             status.step = COMMUNICATION_STEP_PREPARE_PARAM_READY;
@@ -2572,6 +2814,40 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
     }
 
     (void)Communication_SendStatus(&status);
+}
+
+/**
+ * @brief 周期主动上报活度计内剩余液体总体积。
+ *
+ * @note 上位机用 0x183 / REMAIN_RESULT 同步“活度计内剩余液体总量”。
+ *       体积使用下位机当前掌握的库存缓存；活度当前按浓度缓存估算，
+ *       若没有浓度或体积则为 0。该主动帧不要求上位机查询，也不等待 ACK。
+ */
+static void MachineCMD_ReportRemainIfDue(uint32_t now_ms)
+{
+    uint16_t remain_volume_x100;
+    uint16_t remain_activity_x100;
+    uint8_t flags = 0U;
+
+    if ((uint32_t)(now_ms - machine_cmd.remain_report_last_ms) <
+        MACHINE_CMD_REMAIN_REPORT_PERIOD_MS)
+    {
+        return;
+    }
+
+    machine_cmd.remain_report_last_ms = now_ms;
+    remain_volume_x100 = machine_cmd.standby_volume_ml_x100;
+    remain_activity_x100 = (remain_volume_x100 != 0U) ? machine_cmd.standby_activity_x100 : 0U;
+    if (remain_volume_x100 != 0U)
+    {
+        flags |= COMMUNICATION_REMAIN_RESULT_FLAG_PRESENT;
+    }
+
+    machine_cmd.remain_report_seq++;
+    (void)Communication_SendRemainResult(remain_volume_x100,
+                                         remain_activity_x100,
+                                         flags,
+                                         machine_cmd.remain_report_seq);
 }
 
 /**
