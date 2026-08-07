@@ -927,6 +927,13 @@ uint8_t PumpDrive_Stop(PumpDrive_s *pump, uint8_t emergency)
     if (result != 0U)
     {
         PumpDrive_ClearMoveMonitor(pump);
+        if (emergency != 0U)
+        {
+            pump->status.busy = 0U;
+            pump->status.autorun = 0U;
+            pump->status.raw_flags &= (uint16_t)~(PUMP_DRIVE_STATUS_BUSY |
+                                                  PUMP_DRIVE_STATUS_AUTORUN);
+        }
     }
 
     return result;

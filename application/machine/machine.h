@@ -8,6 +8,7 @@ void MachineControl(void);
 
 /* 上位机急停入口：立即停止输出并终止当前整体流程，不执行复位收尾。 */
 void Machine_EmergencyStop(void);
+void Machine_ResetRuntimeState(void);
 
 /* 清除远控流程结束/失败后的短暂步骤保持，用于上位机复位后立即回到 IDLE 步骤。 */
 void Machine_ClearRemoteStepHold(void);

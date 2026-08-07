@@ -920,11 +920,16 @@ static void MachineCMD_ResetPrepUi(void)
 /**
  * @brief 判断复位键是否应先显示“正在中止”。
  *
- * @note 运行、测量、清洗和发药提示页代表操作员认为流程正在执行，
- *       因此复位后先留在 UI 中止提示，后续由 machine 层接真实收尾动作。
+ * @note 复位页必须和真实收尾动作绑定，不能只凭当前页面判断。
+ *       如果 machine 层已经没有流程在跑，复位键只作为退出键回待机，避免卡在“正在中止”页。
  */
 static uint8_t MachineCMD_ShouldShowAbortOnReset(void)
 {
+    if (Machine_IsFlowRunning() == 0U)
+    {
+        return 0U;
+    }
+
     if ((machine_cmd.page == MACHINE_CMD_PAGE_PREP_RUNNING) ||
         (machine_cmd.page == MACHINE_CMD_PAGE_PREP_MEASURE) ||
         (machine_cmd.page == MACHINE_CMD_PAGE_DISP_RUNNING) ||
@@ -1831,7 +1836,7 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
     {
         MachineCMD_StopRemoteOutputs();
         Machine_EmergencyStop();
-        Machine_ClearRemoteStepHold();
+        Machine_ResetRuntimeState();
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
         machine_cmd.prep_start_requested = 0U;
@@ -1839,10 +1844,18 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
         machine_cmd.dispense_start_requested = 0U;
         machine_cmd.exhaust_requested = 0U;
         machine_cmd.empty_requested = 0U;
+        machine_cmd.remote_prepare_param_ready = 0U;
+        machine_cmd.remote_prepare_volume_ready = 0U;
+        machine_cmd.remote_prepare_bottle_ready = 0U;
+        machine_cmd.remote_pipe_param_ready = 0U;
+        machine_cmd.remote_dispense_param_ready = 0U;
+        machine_cmd.activity_request_pending = 0U;
+        machine_cmd.activity_request_started = 0U;
         Communication_OnRemoteResetError();
         MachineCMD_SyncRemoteState();
         machine_cmd.remote_paused = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+        MachineCMD_SendRemoteStatus(command->seq);
         return;
     }
 

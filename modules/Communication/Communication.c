@@ -766,21 +766,28 @@ void Communication_OnEStopChanged(uint8_t active)
 
 void Communication_OnRemoteResetError(void)
 {
+    uint32_t now = HAL_GetTick();
+
     /*
      * 上位机急停后的复位不是“本地启动键恢复远控”。
      * 它需要明确清掉急停/报警锁存，并让 0x181 重新回到 IDLE + REMOTE + alarm=0，
      * 否则后续动作帧会继续被 IsRemoteCommandAllowed() 当作非远控或报警状态拒绝。
      */
+    communication_control.pc_connected = 1U;
+    communication_control.last_remote_frame_tick = now;
+    communication_control.pc_authorized =
+        (communication_auth.state == COMMUNICATION_AUTH_UNLOCKED) ? 1U : 0U;
     communication_control.alarm_active = 0U;
     communication_control.estop_active = 0U;
     communication_control.remote_resume_allowed = 0U;
     communication_control.local_flow_running = 0U;
     communication_control.local_takeover_latched = 0U;
+    communication_control.remote_request_seq = 0U;
+    communication_control.remote_request_tick = 0U;
     communication_control.pending_safety_action = COMMUNICATION_SAFETY_ACTION_NONE;
     communication_control.sys_state = COMMUNICATION_SYS_IDLE;
 
-    if ((communication_control.pc_connected != 0U) &&
-        (communication_control.pc_authorized != 0U))
+    if (communication_control.pc_authorized != 0U)
     {
         Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
                                      COMMUNICATION_CONTROL_REASON_KEY_RESET);
@@ -868,6 +875,21 @@ void Communication_OnLocalRemoteKey(void)
      * 也避免必须先按一次复位、再按远控才能恢复的绕路操作。
      */
     communication_control.local_takeover_latched = 0U;
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_PAUSED) ||
+        (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING))
+    {
+        if ((communication_control.local_flow_running != 0U) ||
+            (communication_control.alarm_active != 0U) ||
+            (communication_control.estop_active != 0U))
+        {
+            return;
+        }
+
+        communication_control.remote_resume_allowed = 0U;
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+        Communication_SetControlMode(COMMUNICATION_CONTROL_LOCAL,
+                                     COMMUNICATION_CONTROL_REASON_KEY_REMOTE);
+    }
 
     if (Communication_CanLocalRequestRemote() == 0U)
     {
@@ -1487,7 +1509,6 @@ static uint8_t Communication_CanAutoEnterRemote(void)
 static uint8_t Communication_CanLocalRequestRemote(void)
 {
     return ((communication_control.control_mode == COMMUNICATION_CONTROL_LOCAL) &&
-            (communication_control.pc_connected != 0U) &&
             (communication_control.pc_authorized != 0U) &&
             (communication_control.local_flow_running == 0U) &&
             (communication_control.alarm_active == 0U) &&
@@ -1732,6 +1753,18 @@ static void Communication_HandleRxFrame(const CommunicationFrame_s *frame)
                                     0U,
                                     seq);
         return;
+    }
+
+    /*
+     * 上位机断开重连后，第一帧业务命令本身就证明 PC 已在线。
+     * 如果仍等到 Communication_Process() 末尾才自动进入 REMOTE，
+     * 同一批连续发送的参数帧和 START_PROCESS 会先被 LOCAL 状态拒掉。
+     */
+    if ((communication_control.control_mode == COMMUNICATION_CONTROL_LOCAL) &&
+        (Communication_CanAutoEnterRemote() != 0U))
+    {
+        Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE,
+                                     COMMUNICATION_CONTROL_REASON_PC_AUTH_SUCCESS);
     }
 
     if (Communication_IsRemoteCommandAllowed(std_id, cmd, &result, &error) == 0U)

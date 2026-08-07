@@ -2326,6 +2326,13 @@ void Machine_EmergencyStop(void)
     }
 }
 
+void Machine_ResetRuntimeState(void)
+{
+    Machine_StopComboOutputs();
+    Machine_StopDispensePumpOutput();
+    MachineInit();
+}
+
 void Machine_ClearRemoteStepHold(void)
 {
     machine_remote_hold_step = COMMUNICATION_STEP_IDLE;
