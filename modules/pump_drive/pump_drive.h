@@ -476,6 +476,8 @@ void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32
  */
 uint32_t PumpDrive_VolumeUlToSteps(PumpDrive_s *pump, uint32_t volume_ul);
 
+/* Volume commands round up to whole pump turns: 5.2 turns is executed as 6 turns. */
+
 /**
  * @brief 将旋转角度换算成命令步数。
  *

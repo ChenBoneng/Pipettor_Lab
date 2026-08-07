@@ -118,4 +118,7 @@ void MachineCMD_SetStandbyInventory(uint16_t conc_x1000,
 void MachineCMD_ConsumeStandbyInventory(uint16_t volume_ml_x100);
 uint16_t MachineCMD_GetStandbyVolumeMlX100(void);
 
+/* 远控发药完成专用上报：0x181/0x23 -> 0x183/07 01 -> 0x181/0x23。 */
+void MachineCMD_ReportRemoteDispenseDoneActivity(void);
+
 #endif //MACHINECMD_H

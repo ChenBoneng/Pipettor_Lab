@@ -1104,15 +1104,21 @@ void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32
  */
 uint32_t PumpDrive_VolumeUlToSteps(PumpDrive_s *pump, uint32_t volume_ul)
 {
-    uint32_t steps;
+    uint32_t turns;
 
     if ((pump == NULL) || (pump->full_stroke_ul == 0U))
     {
         return 0U;
     }
 
-    steps = (volume_ul * pump->full_stroke_steps + pump->full_stroke_ul / 2U) / pump->full_stroke_ul;
-    return steps;
+    if (volume_ul == 0U)
+    {
+        return 0U;
+    }
+
+    /* 定量泵只能按整圈取液：5.2 圈按 6 圈执行，避免半圈停在不确定位置。 */
+    turns = (volume_ul + pump->full_stroke_ul - 1U) / pump->full_stroke_ul;
+    return turns * pump->full_stroke_steps;
 }
 
 /**

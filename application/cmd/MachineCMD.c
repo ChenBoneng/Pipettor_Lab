@@ -204,6 +204,9 @@ static void MachineCMD_ClearRemotePumpPending(void);
 static uint8_t MachineCMD_StartRemotePumpPending(uint8_t obj, uint8_t action, uint16_t volume_ul);
 static void MachineCMD_ProcessRemotePumpPending(void);
 static void MachineCMD_SendRemoteStatus(uint8_t seq);
+static void MachineCMD_SendRemoteStatusWithStep(uint8_t seq,
+                                                uint8_t step_override,
+                                                uint8_t use_step_override);
 static void MachineCMD_ReportRemainIfDue(uint32_t now_ms);
 static uint8_t MachineCMD_LineAppendBytes(uint8_t *line, uint8_t offset, const uint8_t *data, uint8_t len);
 static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const MachineCmdText_s *text);
@@ -2176,6 +2179,39 @@ static void MachineCMD_ReportTransferActivityIfReady(void)
 }
 
 /**
+ * @brief 远控发药完成时按上位机约定的顺序主动上报状态和最新活度。
+ *
+ * @note 上位机用第一次 0x181/Byte1=0x23 进入“等待发药后活度”状态，
+ *       再用 0x183/07 01 更新发药后活度，最后用第二次 0x181/Byte1=0x23
+ *       触发真正结算。这里故意只发送 07 01 活度值帧，不插入 07 02 附加信息帧，
+ *       避免打乱上位机按三帧顺序解析的逻辑。
+ */
+void MachineCMD_ReportRemoteDispenseDoneActivity(void)
+{
+    ActivityMeterData_s activity_data;
+    float activity = 0.0f;
+    uint8_t unit = (uint8_t)ACTIVITY_METER_UNIT_MCI;
+
+    MachineCMD_SendRemoteStatusWithStep(0U, COMMUNICATION_STEP_DISPENSE_DONE, 1U);
+
+    memset(&activity_data, 0, sizeof(activity_data));
+    if ((ActivityMeter_GetData(&activity_data) != 0U) &&
+        (activity_data.update_count != 0U))
+    {
+        activity = activity_data.activity;
+        unit = (uint8_t)activity_data.activity_unit;
+    }
+
+    if (Communication_SendActivity(activity, unit, MACHINE_CMD_ACTIVITY_PUSH_SEQ) != 0U)
+    {
+        machine_cmd.activity_reported_update_count = activity_data.update_count;
+    }
+
+    MachineCMD_SendRemoteStatusWithStep(0U, COMMUNICATION_STEP_DISPENSE_DONE, 1U);
+    machine_cmd.remote_status_last_ms = MachineCMD_GetMs();
+}
+
+/**
  * @brief 缓存上位机 SET_PARAM 参数。
  */
 static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *command)
@@ -2732,6 +2768,13 @@ static uint8_t MachineCMD_HandleRemoteStopObject(const CommunicationHostCommand_
  */
 static void MachineCMD_SendRemoteStatus(uint8_t seq)
 {
+    MachineCMD_SendRemoteStatusWithStep(seq, 0U, 0U);
+}
+
+static void MachineCMD_SendRemoteStatusWithStep(uint8_t seq,
+                                                uint8_t step_override,
+                                                uint8_t use_step_override)
+{
     CommunicationStatus_s status;
     const CommunicationControlContext_s *control;
     PumpDrive_s *pump;
@@ -2809,6 +2852,15 @@ static void MachineCMD_SendRemoteStatus(uint8_t seq)
                  (status.step == COMMUNICATION_STEP_IDLE))
         {
             status.step = COMMUNICATION_STEP_PREPARE_PARAM_READY;
+        }
+    }
+
+    if (use_step_override != 0U)
+    {
+        status.step = step_override;
+        if (step_override == COMMUNICATION_STEP_DISPENSE_DONE)
+        {
+            status.sys_state = COMMUNICATION_SYS_IDLE;
         }
     }
 
