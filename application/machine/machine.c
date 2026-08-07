@@ -164,6 +164,7 @@ static uint16_t machine_combo_final_conc_x1000 = 0U;
 static uint8_t machine_combo_paused = 0U;
 static uint32_t machine_combo_pause_start_ms = 0U;
 static uint8_t machine_combo_final_activity_ready = 0U;
+static uint8_t machine_remote_bottle_confirm_seen = 0U;
 
 static MachineDirectDispenseState_e machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
 static uint32_t machine_direct_dispense_state_start_ms = 0U;
@@ -1198,6 +1199,10 @@ static void Machine_EnterComboState(MachineComboState_e next_state)
 {
     machine_combo_state = next_state;
     machine_combo_state_start_ms = Machine_GetMs();
+    if (next_state == MACHINE_COMBO_STATE_WAIT_SWITCH_TANK)
+    {
+        machine_remote_bottle_confirm_seen = 0U;
+    }
     Machine_UpdatePrepUiForState(next_state);
     Machine_ExecuteComboState();
 }
@@ -1971,6 +1976,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_WAIT_SWITCH_TANK:
         if (MachineCMD_ConsumeLocalPrepSwitchRequested(NULL) != 0U)
         {
+            machine_remote_bottle_confirm_seen = 0U;
             machine_combo_bottle_index++;
             Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
         }
@@ -2573,6 +2579,7 @@ void MachineInit(void)
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_final_activity_ready = 0U;
+    machine_remote_bottle_confirm_seen = 0U;
 
     machine_direct_dispense_state = MACHINE_DIRECT_DISPENSE_STATE_IDLE;
     machine_direct_dispense_state_start_ms = 0U;
@@ -2817,6 +2824,7 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
     machine_combo_paused = 0U;
     machine_combo_pause_start_ms = 0U;
     machine_combo_final_activity_ready = 0U;
+    machine_remote_bottle_confirm_seen = 0U;
     machine_combo_running = 1U;
     machine_activity_wait_active = 0U;
     machine_activity_wait_started = 0U;
@@ -2908,6 +2916,80 @@ uint8_t Machine_StartRemoteExhaust(uint8_t seq)
                          MACHINE_FLOW_OWNER_REMOTE,
                          COMMUNICATION_PROCESS_EXHAUST,
                          seq);
+    return 1U;
+}
+
+uint8_t Machine_ConfirmRemoteBottleChanged(uint8_t bottle_index,
+                                           uint8_t confirm_step,
+                                           uint8_t *ack_result,
+                                           uint16_t *ack_error)
+{
+    uint8_t expected_bottle_index;
+
+    if (ack_result != NULL)
+    {
+        *ack_result = COMMUNICATION_RESULT_OK;
+    }
+    if (ack_error != NULL)
+    {
+        *ack_error = COMMUNICATION_ERROR_NONE;
+    }
+
+    if ((confirm_step != COMMUNICATION_BOTTLE_CONFIRM_SEEN) &&
+        (confirm_step != COMMUNICATION_BOTTLE_CONFIRM_CHANGED))
+    {
+        if (ack_result != NULL)
+        {
+            *ack_result = COMMUNICATION_RESULT_BAD_PARAM;
+        }
+        if (ack_error != NULL)
+        {
+            *ack_error = COMMUNICATION_ERROR_BAD_PARAM;
+        }
+        return 0U;
+    }
+
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
+        (machine_combo_running == 0U) ||
+        (machine_combo_owner != MACHINE_FLOW_OWNER_REMOTE) ||
+        (machine_combo_remote_process_id != COMMUNICATION_PROCESS_PREPARE) ||
+        (machine_combo_bottle_count < 2U) ||
+        (machine_combo_state != MACHINE_COMBO_STATE_WAIT_SWITCH_TANK))
+    {
+        if (ack_result != NULL)
+        {
+            *ack_result = COMMUNICATION_RESULT_BUSY;
+        }
+        if (ack_error != NULL)
+        {
+            *ack_error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
+        }
+        return 0U;
+    }
+
+    expected_bottle_index = machine_combo_bottle_index + 1U;
+    if (bottle_index != expected_bottle_index)
+    {
+        if (ack_result != NULL)
+        {
+            *ack_result = COMMUNICATION_RESULT_BAD_PARAM;
+        }
+        if (ack_error != NULL)
+        {
+            *ack_error = COMMUNICATION_ERROR_BAD_PARAM;
+        }
+        return 0U;
+    }
+
+    if (confirm_step == COMMUNICATION_BOTTLE_CONFIRM_SEEN)
+    {
+        machine_remote_bottle_confirm_seen = 1U;
+        return 1U;
+    }
+
+    machine_remote_bottle_confirm_seen = 0U;
+    machine_combo_bottle_index++;
+    Machine_EnterComboState(MACHINE_COMBO_STATE_TANK_PUSH);
     return 1U;
 }
 

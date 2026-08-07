@@ -176,8 +176,15 @@ typedef enum
     COMMUNICATION_PROCESS_DISPENSE = 0x02U,             /**< 发药。 */
     COMMUNICATION_PROCESS_FLUSH = 0x03U,                /**< 单独冲洗。 */
     COMMUNICATION_PROCESS_TRANSFER_TO_ACTIVITY = 0x04U, /**< 转移药液进活度计。 */
-    COMMUNICATION_PROCESS_EXHAUST = 0x05U               /**< 单独排气。 */
+    COMMUNICATION_PROCESS_EXHAUST = 0x05U,              /**< 单独排气。 */
+    COMMUNICATION_PROCESS_CONFIRM_BOTTLE_CHANGED = 0x06U /**< 上位机确认已完成换瓶。 */
 } CommunicationProcessId_e;
+
+typedef enum
+{
+    COMMUNICATION_BOTTLE_CONFIRM_SEEN = 0x01U,   /**< 用户已看到换瓶提示。 */
+    COMMUNICATION_BOTTLE_CONFIRM_CHANGED = 0x02U /**< 用户确认已完成换瓶，可以继续流程。 */
+} CommunicationBottleConfirmStep_e;
 
 /**
  * @brief 命令 ACK 结果码。

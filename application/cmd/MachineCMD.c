@@ -2293,7 +2293,14 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
     }
 
     process_id = command->data[2];
-    if (process_id == COMMUNICATION_PROCESS_PREPARE)
+    if (process_id == COMMUNICATION_PROCESS_CONFIRM_BOTTLE_CHANGED)
+    {
+        (void)Machine_ConfirmRemoteBottleChanged(command->data[3],
+                                                 command->data[4],
+                                                 &result,
+                                                 &error);
+    }
+    else if (process_id == COMMUNICATION_PROCESS_PREPARE)
     {
         if ((machine_cmd.remote_prepare_bottle_ready == 0U) ||
             (machine_cmd.remote_prepare_volume_ready == 0U))

@@ -49,6 +49,10 @@ uint8_t Machine_StartRemoteFlush(uint8_t seq);
 
 /* 上位机启动单独排气流程，seq 用于 PROCESS_RESULT 回传。 */
 uint8_t Machine_StartRemoteExhaust(uint8_t seq);
+uint8_t Machine_ConfirmRemoteBottleChanged(uint8_t bottle_index,
+                                           uint8_t confirm_step,
+                                           uint8_t *ack_result,
+                                           uint16_t *ack_error);
 
 /* 上位机启动“转移药液进活度计”流程，执行至原液活度读取完成后等待开始配药。 */
 uint8_t Machine_StartRemoteTransferToActivity(void);
