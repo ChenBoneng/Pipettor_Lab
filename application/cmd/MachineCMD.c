@@ -2010,22 +2010,6 @@ static void MachineCMD_HandleRemoteActivityRead(uint8_t seq)
     memset(&activity_data, 0, sizeof(activity_data));
     (void)ActivityMeter_GetData(&activity_data);
 
-    if (Machine_IsTransferToActivityDone() == 0U)
-    {
-        state = (uint8_t)ActivityMeter_GetState();
-        if ((state != (uint8_t)ACTIVITY_METER_STATE_TIMEOUT) &&
-            (state != (uint8_t)ACTIVITY_METER_STATE_CRC_ERROR) &&
-            (state != (uint8_t)ACTIVITY_METER_STATE_BAD_RESPONSE))
-        {
-            state = COMMUNICATION_ACTIVITY_NOT_READ;
-        }
-
-        (void)MachineCMD_SendActivityState(&activity_data,
-                                           state,
-                                           seq);
-        return;
-    }
-
     if (activity_data.state == ACTIVITY_METER_STATE_OK)
     {
         if (MachineCMD_SendActivityData(&activity_data, seq) != 0U)
@@ -2122,7 +2106,7 @@ static void MachineCMD_ReportActivityUpdate(void)
 {
     ActivityMeterData_s activity_data;
 
-    if (Machine_IsTransferToActivityDone() == 0U)
+    if (Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE)
     {
         return;
     }
@@ -2865,25 +2849,9 @@ static void MachineCMD_SendRemoteStatusWithStep(uint8_t seq,
     }
 
     activity_state = (uint8_t)ActivityMeter_GetState();
-    if (Machine_IsTransferToActivityDone() == 0U)
-    {
-        if ((activity_state == (uint8_t)COMMUNICATION_ACTIVITY_TIMEOUT) ||
-            (activity_state == (uint8_t)COMMUNICATION_ACTIVITY_CRC_ERROR) ||
-            (activity_state == (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE))
-        {
-            status.activity_state = activity_state;
-        }
-        else
-        {
-            status.activity_state = COMMUNICATION_ACTIVITY_NOT_READ;
-        }
-    }
-    else
-    {
-        status.activity_state = (activity_state <= (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE) ?
-                                activity_state :
-                                COMMUNICATION_ACTIVITY_NOT_READ;
-    }
+    status.activity_state = (activity_state <= (uint8_t)COMMUNICATION_ACTIVITY_BAD_RESPONSE) ?
+                            activity_state :
+                            COMMUNICATION_ACTIVITY_NOT_READ;
 
     (void)Communication_SendStatus(&status);
 }
