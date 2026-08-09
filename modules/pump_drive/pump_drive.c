@@ -340,7 +340,7 @@ static void PumpDrive_ClearBusWait(uint8_t device_id)
  * @param tx_len 命令文本长度。
  * @param result 1 表示已经调用 USARTSend，0 表示被格式/总线状态拦截。
  *
- * 该缓存只用于现场调试：比如泵2单段 100ul 时，应能看到 `2 in 400\n`。
+ * 该缓存只用于现场调试：比如泵2单段 100ul 时，应能看到 `2 in 200\n`。
  * 如果 last_tx_result 为 0，则说明命令还没真正发出去。
  */
 static void PumpDrive_SaveTxDebug(PumpDrive_s *pump, const char *tx_data, uint16_t tx_len, uint8_t result)

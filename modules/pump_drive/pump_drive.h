@@ -44,15 +44,15 @@
 #define PUMP_DRIVE_PUMP2_FULL_STROKE_UL 100U
 
 /** 两台定量泵转一圈对应的 ISC1000 in/out 命令步数。 */
-#define PUMP_DRIVE_FULL_STROKE_STEPS   400U
+#define PUMP_DRIVE_FULL_STROKE_STEPS   200U
 
 /**
  * 定量泵电机每转一圈对应的 ISC1000 in/out 命令步数。
  *
- * 当前目测 `in 1600` 约转 4 圈，所以体积换算和角度/RPM 换算统一按 400 步/圈处理。
+ * 现场称重发现 400 步/圈会让出量接近 2 倍，所以统一按 200 步/圈处理。
  * 如果后续现场复测仍有偏差，只需要同步标定这个常量和 PUMP_DRIVE_FULL_STROKE_STEPS。
  */
-#define PUMP_DRIVE_STEPS_PER_TURN      400U
+#define PUMP_DRIVE_STEPS_PER_TURN      200U
 
 /** ISC1000 单条 in/out 命令最大步数，超过该值需要业务层分段执行。 */
 #define PUMP_DRIVE_COMMAND_MAX_STEPS    60000U
@@ -232,7 +232,7 @@ typedef struct
     uint8_t last_tx_result;                   /**< 最近一次命令是否真正发出：1 已发送，0 被参数/总线状态拦截。 */
     uint32_t last_volume_ul;                  /**< 最近一次按体积运动的目标体积，单位 ul。 */
     uint32_t last_volume_steps;               /**< 最近一次按体积运动换算出的目标步数。 */
-    char last_tx_command[PUMP_DRIVE_LAST_TX_DEBUG_SIZE]; /**< 最近一次命令文本，例如泵2单圈 `2 in 400\n`。 */
+    char last_tx_command[PUMP_DRIVE_LAST_TX_DEBUG_SIZE]; /**< 最近一次命令文本，例如泵2单圈 `2 in 200\n`。 */
     uint32_t full_stroke_ul;                  /**< 该泵满行程体积，单位 ul。 */
     uint32_t full_stroke_steps;               /**< 该泵满行程命令步数。 */
     volatile uint32_t photo_count;            /**< 光电门下降沿累计计数，在 EXTI 中断里递增。 */
@@ -463,7 +463,7 @@ uint32_t PumpDrive_GetMoveTurnsX1000(PumpDrive_s *pump);
  * @param full_stroke_ul 满行程体积，单位 ul。
  * @param full_stroke_steps 满行程命令步数。
  *
- * @note 当前默认：泵1=300ul/400步，泵2=100ul/400步，即每转一圈吸取对应量程。
+ * @note 当前默认：泵1=300ul/200步，泵2=100ul/200步，即每转一圈吸取对应量程。
  */
 void PumpDrive_SetCalibration(PumpDrive_s *pump, uint32_t full_stroke_ul, uint32_t full_stroke_steps);
 

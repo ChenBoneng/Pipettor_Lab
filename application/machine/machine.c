@@ -15,7 +15,7 @@
  * - 本机配药最多 2 个铅罐，每罐流程为进罐 220mm、插针 120mm、抽水泵转移、
  *   泵1按 6ml 分段补水并由抽水泵送入活度计；
  * - 两罐完成后活度计稳定读数 15s，按配药有效容量计算单位浓度；
- * - 配药末尾预留排气和冲洗定量，默认 10ml，可由上位机参数帧调整；
+ * - 配药末尾预留排气定量，默认 10ml，可由上位机参数帧调整；
  * - 发药由泵2定量完成，完成后同样执行一次泵1定量冲洗。
  *
  * 所有动作均为非阻塞状态机推进，MachineTask 里不做长时间阻塞等待。
@@ -206,7 +206,6 @@ static uint32_t Machine_GetMs(void);
 static uint32_t Machine_GetPrepCapacityUl(void);
 static uint16_t Machine_GetPrepCapacityMlX100(void);
 static uint32_t Machine_SubtractVolumeUl(uint32_t volume_ul, uint32_t subtract_ul);
-static uint32_t Machine_SubtractPrepReturnVolumeUl(uint32_t water_total_ul);
 static uint8_t Machine_GetEffectiveBottleCount(uint8_t requested_count,
                                                uint16_t bottle1_ml_x100,
                                                uint16_t bottle2_ml_x100);
@@ -309,17 +308,6 @@ static uint32_t Machine_SubtractVolumeUl(uint32_t volume_ul, uint32_t subtract_u
 }
 
 /**
- * @brief 扣除配药前泵2回吸到活度计的管路残液体积。
- *
- * @note 活度计容量仍按 150ml 处理；泵2回吸完成后，这部分液体已经回到活度计，
- *       因此后续泵1补水量必须扣除同一个宏体积，避免最终体积超量。
- */
-static uint32_t Machine_SubtractPrepReturnVolumeUl(uint32_t water_total_ul)
-{
-    return Machine_SubtractVolumeUl(water_total_ul, Machine_GetExhaustVolumeUl());
-}
-
-/**
  * @brief 根据本机 UI 输入判断本次实际参与配药的药瓶数量。
  *
  * @param requested_count UI 选择的药瓶数量，最大 2。
@@ -359,6 +347,7 @@ static uint8_t Machine_GetEffectiveBottleCount(uint8_t requested_count,
  *       - 两瓶：纯净水总量 = 配药有效容量 - 药瓶1 + 1.5ml - 药瓶2 + 1.5ml；
  *       - 一瓶：纯净水总量 = 配药有效容量 - 药瓶1 + 1.5ml；
  *       - 有余量时，先从总补水量里扣除余量。
+ *       - 配药前回吸只回收已经计入库存的管路液体，不再从补水量里扣除。
  */
 static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
                                                     const uint16_t bottle_ml_x100[],
@@ -393,7 +382,6 @@ static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
     water_total_ul = capacity_ul + dead_total_ul - bottle_total_ul;
     residual_ul = (uint32_t)residual_ml_x100 * 10U;
     water_total_ul = Machine_SubtractVolumeUl(water_total_ul, residual_ul);
-    water_total_ul = Machine_SubtractPrepReturnVolumeUl(water_total_ul);
 
     return (water_total_ul + ((uint32_t)bottle_count / 2U)) / (uint32_t)bottle_count;
 }
@@ -521,19 +509,18 @@ static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100)
 /**
  * @brief 设置泵1补水到铅罐的流路。
  *
- * @note 当前按既有代码约定，阀1上电表示 C1-A1 连通，用于“纯净水->泵1->铅罐”。
+ * @note 现场确认阀1 A/B 口与旧注释相反，阀1掉电表示 C1-A1 连通，
+ *       用于“纯净水->泵1->铅罐”。
  */
 static void Machine_SetPrepareWaterFlow(void)
 {
-    SolenoidValve_Off(SOLENOID_VALVE_ID_MED);
-    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
-                                 SOLENOID_VALVE_STATE_ON_NC_OPEN);
+    SolenoidValve_AllOff();
 }
 
 /**
  * @brief 设置泵2发药/排气流路。
  *
- * @note 两阀均掉电；阀2保持既有默认 A2-C2 通路，对应“活度计->泵2->出口”。
+ * @note 阀2保持原始映射，掉电表示 A2-C2 连通，对应“活度计->泵2->出口”。
  */
 static void Machine_SetDispenseFlow(void)
 {
@@ -544,13 +531,12 @@ static void Machine_SetDispenseFlow(void)
  * @brief 设置泵1定量冲洗流路。
  *
  * @note 按文档冲洗流向为“纯净水->泵1->C1->B1->B2->C2”。
- *       这里保持阀1掉电走 C1-B1，并将阀2上电切到 B2-C2。
+ *       现场确认 A/B 口与旧注释相反，所以阀1上电走 C1-B1，阀2掉电走 B2-C2。
  */
 static void Machine_SetFlushFlow(void)
 {
+    SolenoidValve_Off(SOLENOID_VALVE_ID_MED);
     (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
-                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
-    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
                                  SOLENOID_VALVE_STATE_ON_NC_OPEN);
 }
 
@@ -2168,14 +2154,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            if (machine_combo_utility_mode == MACHINE_COMBO_UTILITY_EXHAUST_ONLY)
-            {
-                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
-            }
-            else
-            {
-                Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
-            }
+            Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
         }
         break;
 
@@ -2951,7 +2930,7 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
         return 0U;
     }
 
-    water_total_ul = Machine_SubtractPrepReturnVolumeUl((uint32_t)water_volume_x100 * 10U);
+    water_total_ul = (uint32_t)water_volume_x100 * 10U;
 
     machine_combo_owner = MACHINE_FLOW_OWNER_REMOTE;
     machine_combo_current_conc_x1000 = 0U;

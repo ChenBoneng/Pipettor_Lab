@@ -2662,7 +2662,7 @@ static void MachineCMD_ProcessRemotePumpPending(void)
  *       PUMP_1/PUMP_2 使用 Byte2=0/1/2 表示停止/吸入/排出。
  *       Byte3~4 非 0 时按体积 ul 精确运动；Byte3~4 为 0 时作为上位机点动命令。
  *       点动命令固定按 10 圈处理，底层通过独立的每圈步数常量换算成 ISC1000 步数。
- *       注意不要把满行程 1600 步当成电机一圈，也不要把 `in/out 10` 误认为 10 圈。
+ *       注意不要把 `in/out 10` 误认为 10 圈，ISC1000 命令参数是步数。
  */
 static uint8_t MachineCMD_HandleRemotePump(const CommunicationHostCommand_s *command)
 {
