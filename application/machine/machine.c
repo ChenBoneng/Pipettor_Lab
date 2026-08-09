@@ -15,7 +15,7 @@
  * - 本机配药最多 2 个铅罐，每罐流程为进罐 220mm、插针 120mm、抽水泵转移、
  *   泵1按 6ml 分段补水并由抽水泵送入活度计；
  * - 两罐完成后活度计稳定读数 15s，按配药有效容量计算单位浓度；
- * - 配药末尾预留排气和冲洗定量，数值由装机调试给出，默认 0 表示不动作；
+ * - 配药末尾预留排气和冲洗定量，默认 10ml，可由上位机参数帧调整；
  * - 发药由泵2定量完成，完成后同样执行一次泵1定量冲洗。
  *
  * 所有动作均为非阻塞状态机推进，MachineTask 里不做长时间阻塞等待。
@@ -34,11 +34,9 @@
 #define MACHINE_PREP_MAX_BOTTLE_COUNT            2U
 #define MACHINE_PUMP1_WATER_SEGMENT_UL           6000UL
 
-/* 自动排气/冲洗体积为装机标定参数。当前测试暂定 3.00ml，后续只改这里。 */
-#define MACHINE_EXHAUST_VOLUME_ML_X100           300U
-#define MACHINE_FLUSH_VOLUME_ML_X100             300U
-#define MACHINE_EXHAUST_VOLUME_UL                ((uint32_t)MACHINE_EXHAUST_VOLUME_ML_X100 * 10UL)
-#define MACHINE_FLUSH_VOLUME_UL                  ((uint32_t)MACHINE_FLUSH_VOLUME_ML_X100 * 10UL)
+/* 自动排气/冲洗体积默认 10.00ml，运行中由 machine 层变量保存，便于上位机参数帧修改。 */
+#define MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100   1000U
+#define MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100     1000U
 /*
  * 泵2发药尽量用单条 ISC1000 in 命令连续完成。
  * 之前按 100ul/圈切段，会导致每一圈都等待 Busy 清零再发下一条命令，现场表现为“停一下转一下”。
@@ -170,6 +168,8 @@ static uint32_t machine_combo_water_per_bottle_ul = 0U;
 static uint32_t machine_combo_pump1_remaining_ul = 0U;
 static uint32_t machine_combo_pump1_segment_ul = 0U;
 static uint32_t machine_combo_post_volume_ul = 0U;
+static uint16_t machine_exhaust_volume_ml_x100 = MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100;
+static uint16_t machine_flush_volume_ml_x100 = MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100;
 static MachineComboUtilityMode_e machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
 static uint8_t machine_combo_prepare_finished = 0U;
 static uint16_t machine_combo_final_conc_x1000 = 0U;
@@ -215,7 +215,10 @@ static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
                                                     uint16_t residual_ml_x100);
 static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100);
 static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul);
+static uint32_t Machine_VolumeMlX100ToUl(uint16_t volume_ml_x100);
 static uint16_t Machine_VolumeUlToMlX100(uint32_t volume_ul);
+static uint32_t Machine_GetExhaustVolumeUl(void);
+static uint32_t Machine_GetFlushVolumeUl(void);
 static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul);
 static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100);
 static void Machine_SetPrepareWaterFlow(void);
@@ -313,7 +316,7 @@ static uint32_t Machine_SubtractVolumeUl(uint32_t volume_ul, uint32_t subtract_u
  */
 static uint32_t Machine_SubtractPrepReturnVolumeUl(uint32_t water_total_ul)
 {
-    return Machine_SubtractVolumeUl(water_total_ul, MACHINE_EXHAUST_VOLUME_UL);
+    return Machine_SubtractVolumeUl(water_total_ul, Machine_GetExhaustVolumeUl());
 }
 
 /**
@@ -451,6 +454,21 @@ static uint16_t Machine_VolumeUlToMlX100(uint32_t volume_ul)
     return (uint16_t)((volume_ul + 5U) / 10U);
 }
 
+static uint32_t Machine_VolumeMlX100ToUl(uint16_t volume_ml_x100)
+{
+    return (uint32_t)volume_ml_x100 * 10UL;
+}
+
+static uint32_t Machine_GetExhaustVolumeUl(void)
+{
+    return Machine_VolumeMlX100ToUl(machine_exhaust_volume_ml_x100);
+}
+
+static uint32_t Machine_GetFlushVolumeUl(void)
+{
+    return Machine_VolumeMlX100ToUl(machine_flush_volume_ml_x100);
+}
+
 static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul)
 {
     uint32_t elapsed_ms;
@@ -488,7 +506,7 @@ static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t t
 
 static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100)
 {
-    uint16_t total_ml_x100 = Machine_VolumeUlToMlX100(MACHINE_FLUSH_VOLUME_UL);
+    uint16_t total_ml_x100 = machine_flush_volume_ml_x100;
 
     if (done_ml_x100 > total_ml_x100)
     {
@@ -507,6 +525,7 @@ static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100)
  */
 static void Machine_SetPrepareWaterFlow(void)
 {
+    SolenoidValve_Off(SOLENOID_VALVE_ID_MED);
     (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
                                  SOLENOID_VALVE_STATE_ON_NC_OPEN);
 }
@@ -514,12 +533,11 @@ static void Machine_SetPrepareWaterFlow(void)
 /**
  * @brief 设置泵2发药/排气流路。
  *
- * @note 阀2掉电保持既有默认 A2-C2 通路，对应“活度计->泵2->出口”。
+ * @note 两阀均掉电；阀2保持既有默认 A2-C2 通路，对应“活度计->泵2->出口”。
  */
 static void Machine_SetDispenseFlow(void)
 {
-    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
-                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+    SolenoidValve_AllOff();
 }
 
 /**
@@ -563,7 +581,7 @@ static void Machine_UpdatePrepUiForState(MachineComboState_e state)
             break;
 
         case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
-            Machine_UpdateFlushUiProgress(Machine_VolumeUlToMlX100(MACHINE_FLUSH_VOLUME_UL));
+            Machine_UpdateFlushUiProgress(machine_flush_volume_ml_x100);
             break;
 
         default:
@@ -645,7 +663,7 @@ static void Machine_UpdatePrepUiForState(MachineComboState_e state)
         break;
 
     case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
-        Machine_UpdateFlushUiProgress(Machine_VolumeUlToMlX100(MACHINE_FLUSH_VOLUME_UL));
+        Machine_UpdateFlushUiProgress(machine_flush_volume_ml_x100);
         break;
 
     default:
@@ -910,12 +928,12 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
         else if (step == COMMUNICATION_STEP_EXHAUST_DONE)
         {
             process_id = COMMUNICATION_PROCESS_EXHAUST;
-            process_detail = MACHINE_EXHAUST_VOLUME_ML_X100;
+            process_detail = machine_exhaust_volume_ml_x100;
         }
         else if (step == COMMUNICATION_STEP_FLUSH_DONE)
         {
             process_id = COMMUNICATION_PROCESS_FLUSH;
-            process_detail = MACHINE_FLUSH_VOLUME_ML_X100;
+            process_detail = machine_flush_volume_ml_x100;
         }
         else
         {
@@ -1299,7 +1317,7 @@ static void Machine_ExecuteComboState(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_PREP_RETURN_OUT:
-        machine_combo_post_volume_ul = MACHINE_EXHAUST_VOLUME_UL;
+        machine_combo_post_volume_ul = Machine_GetExhaustVolumeUl();
         if (Machine_StartComboPostPumpVolume(Machine_GetDispensePump(),
                                              machine_combo_post_volume_ul,
                                              1U) == 0U)
@@ -1431,7 +1449,7 @@ static void Machine_ExecuteComboState(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
-        machine_combo_post_volume_ul = MACHINE_EXHAUST_VOLUME_UL;
+        machine_combo_post_volume_ul = Machine_GetExhaustVolumeUl();
         if (Machine_StartComboPostPumpVolume(Machine_GetDispensePump(),
                                              machine_combo_post_volume_ul,
                                              0U) == 0U)
@@ -1452,7 +1470,7 @@ static void Machine_ExecuteComboState(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
-        machine_combo_post_volume_ul = MACHINE_FLUSH_VOLUME_UL;
+        machine_combo_post_volume_ul = Machine_GetFlushVolumeUl();
         if (Machine_StartComboPostPumpVolume(PumpDrive_GetPump1(),
                                              machine_combo_post_volume_ul,
                                              0U) == 0U)
@@ -1823,7 +1841,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_PREP_RETURN_VALVE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            if (MACHINE_EXHAUST_VOLUME_UL == 0U)
+            if (Machine_GetExhaustVolumeUl() == 0U)
             {
                 Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PREP_RETURN);
             }
@@ -1846,7 +1864,7 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_PREP_RETURN_OUT:
-        if ((MACHINE_EXHAUST_VOLUME_UL == 0U) ||
+        if ((Machine_GetExhaustVolumeUl() == 0U) ||
             (PumpDrive_IsMoveDone(Machine_GetDispensePump()) != 0U))
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_PREP_RETURN);
@@ -2117,7 +2135,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST_VALVE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            if (MACHINE_EXHAUST_VOLUME_UL == 0U)
+            if (Machine_GetExhaustVolumeUl() == 0U)
             {
                 Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST);
             }
@@ -2140,7 +2158,7 @@ static void Machine_UpdateCombo(void)
         break;
 
     case MACHINE_COMBO_STATE_PUMP2_EXHAUST_IN:
-        if ((MACHINE_EXHAUST_VOLUME_UL == 0U) ||
+        if ((Machine_GetExhaustVolumeUl() == 0U) ||
             (PumpDrive_IsMoveDone(Machine_GetDispensePump()) != 0U))
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST);
@@ -2168,7 +2186,7 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH_VALVE:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            if (MACHINE_FLUSH_VOLUME_UL == 0U)
+            if (Machine_GetFlushVolumeUl() == 0U)
             {
                 Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_FLUSH);
             }
@@ -2192,8 +2210,8 @@ static void Machine_UpdateCombo(void)
 
     case MACHINE_COMBO_STATE_PUMP1_FLUSH_IN:
         Machine_UpdateFlushUiProgress(Machine_EstimatePumpProgressMlX100(PumpDrive_GetPump1(),
-                                                                         MACHINE_FLUSH_VOLUME_UL));
-        if ((MACHINE_FLUSH_VOLUME_UL == 0U) ||
+                                                                         Machine_GetFlushVolumeUl()));
+        if ((Machine_GetFlushVolumeUl() == 0U) ||
             (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) != 0U))
         {
             Machine_EnterComboState(MACHINE_COMBO_STATE_GAP_AFTER_FLUSH);
@@ -2474,6 +2492,12 @@ void Machine_ClearRemoteStepHold(void)
     machine_remote_dispense_done_until_ms = 0U;
 }
 
+void Machine_SetPipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100)
+{
+    machine_exhaust_volume_ml_x100 = exhaust_volume_x100;
+    machine_flush_volume_ml_x100 = flush_volume_x100;
+}
+
 /**
  * @brief 暂停待机直接发药流程。
  */
@@ -2522,7 +2546,7 @@ static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOw
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
     machine_direct_dispense_done_ul = 0U;
-    machine_direct_flush_ul = MACHINE_FLUSH_VOLUME_UL;
+    machine_direct_flush_ul = Machine_GetFlushVolumeUl();
     machine_dispense_progress_percent = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;

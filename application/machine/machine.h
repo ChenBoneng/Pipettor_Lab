@@ -44,6 +44,9 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
 /* 上位机启动独立发药流程，volume_ml_x100 单位为 0.01ml，seq 用于完成 ACK 回传。 */
 uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq);
 
+/* 设置定量排气和冲洗体积，单位均为 0.01ml。 */
+void Machine_SetPipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100);
+
 /* 上位机启动单独冲洗流程，seq 用于 PROCESS_RESULT 回传。 */
 uint8_t Machine_StartRemoteFlush(uint8_t seq);
 

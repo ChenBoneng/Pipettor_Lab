@@ -68,6 +68,26 @@ static void SolenoidValve_WriteOutput(SolenoidValveId_e valve, SolenoidValveStat
 }
 
 /**
+ * @brief 打开某个阀前，先强制关闭其它已经打开的阀。
+ */
+static void SolenoidValve_CloseOtherOpened(SolenoidValveId_e active_valve)
+{
+    for (uint8_t i = 0U; i < SOLENOID_VALVE_ID_MAX; i++)
+    {
+        if ((SolenoidValveId_e)i == active_valve)
+        {
+            continue;
+        }
+
+        if (solenoid_valve_state[i] == SOLENOID_VALVE_STATE_ON_NC_OPEN)
+        {
+            SolenoidValve_WriteOutput((SolenoidValveId_e)i,
+                                      SOLENOID_VALVE_STATE_OFF_NO_OPEN);
+        }
+    }
+}
+
+/**
  * @brief 初始化电磁阀状态并强制掉电。
  */
 void SolenoidValve_Init(void)
@@ -96,6 +116,11 @@ uint8_t SolenoidValve_SetState(SolenoidValveId_e valve, SolenoidValveState_e sta
     if ((solenoid_valve_inited == 0U) || (SolenoidValve_IsValidId(valve) == 0U))
     {
         return 0U;
+    }
+
+    if (state == SOLENOID_VALVE_STATE_ON_NC_OPEN)
+    {
+        SolenoidValve_CloseOtherOpened(valve);
     }
 
     if (solenoid_valve_state[valve] == state)

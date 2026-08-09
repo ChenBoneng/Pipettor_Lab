@@ -47,6 +47,8 @@
 #define MACHINE_CMD_ACTIVITY_PUSH_SEQ      0U
 #define MACHINE_CMD_PREP_MAX_BOTTLE_COUNT 2U
 #define MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT 3U
+#define MACHINE_CMD_MANUAL_WATER_MASK (MACHINE_CMD_MANUAL_WATER_IN | MACHINE_CMD_MANUAL_WATER_OUT)
+#define MACHINE_CMD_MANUAL_MED_MASK   (MACHINE_CMD_MANUAL_MED_IN | MACHINE_CMD_MANUAL_MED_OUT)
 
 typedef enum
 {
@@ -1574,6 +1576,22 @@ static void MachineCMD_SetManualAction(KeypadState_e key)
 static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask)
 {
     machine_cmd.manual_switches ^= switch_mask;
+
+    if ((switch_mask & MACHINE_CMD_MANUAL_WATER_MASK) != 0U)
+    {
+        if ((machine_cmd.manual_switches & switch_mask) != 0U)
+        {
+            machine_cmd.manual_switches &= (uint8_t)(~MACHINE_CMD_MANUAL_MED_MASK);
+        }
+    }
+    else if ((switch_mask & MACHINE_CMD_MANUAL_MED_MASK) != 0U)
+    {
+        if ((machine_cmd.manual_switches & switch_mask) != 0U)
+        {
+            machine_cmd.manual_switches &= (uint8_t)(~MACHINE_CMD_MANUAL_WATER_MASK);
+        }
+    }
+
     MachineCMD_ApplyManualOutputs();
 }
 
@@ -1608,10 +1626,8 @@ static void MachineCMD_ApplyManualOutputs(void)
      *
      * “进”方向目前只作为阀门开关，不额外打开泵，避免没有方向控制时误动作。
      */
-    water_valve_on = ((machine_cmd.manual_switches &
-                       (MACHINE_CMD_MANUAL_WATER_IN | MACHINE_CMD_MANUAL_WATER_OUT)) != 0U) ? 1U : 0U;
-    med_valve_on = ((machine_cmd.manual_switches &
-                     (MACHINE_CMD_MANUAL_MED_IN | MACHINE_CMD_MANUAL_MED_OUT)) != 0U) ? 1U : 0U;
+    water_valve_on = ((machine_cmd.manual_switches & MACHINE_CMD_MANUAL_WATER_MASK) != 0U) ? 1U : 0U;
+    med_valve_on = ((machine_cmd.manual_switches & MACHINE_CMD_MANUAL_MED_MASK) != 0U) ? 1U : 0U;
     pump_on = ((machine_cmd.manual_switches &
                 (MACHINE_CMD_MANUAL_WATER_OUT | MACHINE_CMD_MANUAL_MED_OUT)) != 0U) ? 1U : 0U;
 
@@ -2246,6 +2262,8 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
             Communication_ReadU16LE(&command->data[4]);
         machine_cmd.remote_pipe_flags = command->data[7];
         machine_cmd.remote_pipe_param_ready = 1U;
+        Machine_SetPipeVolumes(machine_cmd.remote_pipe_exhaust_volume_x100,
+                               machine_cmd.remote_pipe_flush_volume_x100);
         break;
 
     case COMMUNICATION_OBJ_REMAIN_PARAM:

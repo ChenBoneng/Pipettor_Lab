@@ -53,8 +53,8 @@ void SolenoidValve_Init(void);
  * @param state 目标物理状态，取值见 SolenoidValveState_e。
  * @return 1 表示设置成功或状态本来一致；0 表示模块未初始化、编号非法或仍在响应等待期。
  *
- * @note 文档要求阀门切换后至少等待 30ms。本函数在 30ms 内拒绝反复切换，
- *       业务层如果需要严格等待流路稳定，可以调用 SolenoidValve_IsBusy()。
+ * @note 文档要求阀门切换后至少等待 30ms。本函数在 30ms 内拒绝反复切换；
+ *       打开任一阀前会先关闭其它已打开的阀，保证阀1和阀2不会同时保持打开。
  */
 uint8_t SolenoidValve_SetState(SolenoidValveId_e valve, SolenoidValveState_e state);
 
