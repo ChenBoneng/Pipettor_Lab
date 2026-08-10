@@ -102,6 +102,8 @@ static uint8_t StepMotor_CalcTargetPosition(StepMotorId_e motor,
 static uint32_t StepMotor_UmToSteps(uint32_t distance_um);
 static uint32_t StepMotor_StepsToUm(uint32_t steps);
 static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s);
+static StepMotorDirection_e StepMotor_GetOutputDirection(StepMotorId_e motor,
+                                                         StepMotorDirection_e direction);
 static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e direction);
 static void StepMotor_UpdatePositionOnStop(StepMotorId_e motor);
 static void StepMotor_RebaseRunningMove(StepMotorId_e motor);
@@ -421,20 +423,33 @@ static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s)
     return (uint32_t)(numerator / STEP_MOTOR_SCREW_LEAD_UM);
 }
 
+/* B 轴进罐导轨现场拉/推方向相反，只反转实际 DIR 输出，软件位置模型不变。 */
+static StepMotorDirection_e StepMotor_GetOutputDirection(StepMotorId_e motor,
+                                                         StepMotorDirection_e direction)
+{
+    if (motor == STEP_MOTOR_ID_TANK_RAIL)
+    {
+        return (direction == STEP_MOTOR_DIR_FORWARD) ? STEP_MOTOR_DIR_REVERSE : STEP_MOTOR_DIR_FORWARD;
+    }
+
+    return direction;
+}
+
 /**
  * @brief 设置 DM542 方向差分输入。
  *
  * @param motor 电机编号。
- * @param direction 目标方向。
+ * @param direction 业务方向。
  *
- * @note 当前约定正向为 DIR+ 高、DIR- 低；反向为 DIR+ 低、DIR- 高。
+ * @note 正向输出 DIR+ 高、DIR- 低；反向输出 DIR+ 低、DIR- 高。
  */
 static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e direction)
 {
     GPIO_PinState plus_state = GPIO_PIN_RESET;
     GPIO_PinState minus_state = GPIO_PIN_SET;
+    StepMotorDirection_e output_direction = StepMotor_GetOutputDirection(motor, direction);
 
-    if (direction == STEP_MOTOR_DIR_FORWARD)
+    if (output_direction == STEP_MOTOR_DIR_FORWARD)
     {
         plus_state = GPIO_PIN_SET;
         minus_state = GPIO_PIN_RESET;
