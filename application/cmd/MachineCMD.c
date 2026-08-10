@@ -49,6 +49,14 @@
 #define MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT 3U
 #define MACHINE_CMD_MANUAL_WATER_MASK (MACHINE_CMD_MANUAL_WATER_IN | MACHINE_CMD_MANUAL_WATER_OUT)
 #define MACHINE_CMD_MANUAL_MED_MASK   (MACHINE_CMD_MANUAL_MED_IN | MACHINE_CMD_MANUAL_MED_OUT)
+#define MACHINE_CMD_DEBUG_JOG_DISTANCE_MM_X100 100U
+#define MACHINE_CMD_DEBUG_JOG_SPEED_MM_S_X100 500U
+#define MACHINE_CMD_DEBUG_CLEAR_NEEDLE_MM_X100 12000U
+#define MACHINE_CMD_DEBUG_CLEAR_TANK_MM_X100   22000U
+#define MACHINE_CMD_DEBUG_CLEAR_SPEED_MM_S_X100 2000U
+#define MACHINE_CMD_DEBUG_PUMP_ANGLE_DEG_X10   10800U
+#define MACHINE_CMD_DEBUG_PUMP_ENABLE_GAP_MS   200U
+#define MACHINE_CMD_DEBUG_PUMP_TIMEOUT_MS      2000U
 
 typedef enum
 {
@@ -72,6 +80,25 @@ typedef enum
     MACHINE_CMD_MANUAL_ACTION_WATER_OUT,      // 水出
     MACHINE_CMD_MANUAL_ACTION_MED_OUT,        // 药出
 } MachineCmdManualAction_e;
+
+typedef enum
+{
+    MACHINE_CMD_DEBUG_STATE_IDLE = 0,
+    MACHINE_CMD_DEBUG_STATE_STEPPER_WAIT,
+    MACHINE_CMD_DEBUG_STATE_CLEAR_NEEDLE_WAIT,
+    MACHINE_CMD_DEBUG_STATE_CLEAR_TANK_WAIT,
+    MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE,
+    MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE_GAP,
+    MACHINE_CMD_DEBUG_STATE_PUMP_MOVE_WAIT,
+    MACHINE_CMD_DEBUG_STATE_ERROR,
+} MachineCmdDebugState_e;
+
+typedef enum
+{
+    MACHINE_CMD_DEBUG_PUMP_NONE = 0,
+    MACHINE_CMD_DEBUG_PUMP_IN,
+    MACHINE_CMD_DEBUG_PUMP_OUT,
+} MachineCmdDebugPumpAction_e;
 
 typedef struct
 {
@@ -147,6 +174,11 @@ typedef struct
     MachineCmdPrepFocus_e prep_focus;                     // 配药设置页当前输入焦点
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
     MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
+    MachineCmdDebugState_e debug_state;
+    StepMotorId_e debug_stepper;
+    PumpDrive_s *debug_pump;
+    MachineCmdDebugPumpAction_e debug_pump_action;
+    uint32_t debug_state_start_ms;
 } MachineCmdContext_s;
 
 static MachineCmdContext_s machine_cmd = {0};
@@ -174,6 +206,14 @@ static void MachineCMD_HandleDispSettingKey(KeypadState_e key);
 static void MachineCMD_HandleDispRunningKey(KeypadState_e key);
 static void MachineCMD_HandleRemoteKey(KeypadState_e key);
 static void MachineCMD_HandleManualKey(KeypadState_e key);
+static void MachineCMD_HandleDebugKey(KeypadState_e key);
+static void MachineCMD_EnterDebugMode(void);
+static void MachineCMD_ExitDebugMode(void);
+static void MachineCMD_ResetDebugState(void);
+static void MachineCMD_ProcessDebugState(void);
+static uint8_t MachineCMD_StartDebugJog(StepMotorId_e motor, StepMotorDirection_e direction);
+static uint8_t MachineCMD_StartDebugClear(void);
+static uint8_t MachineCMD_StartDebugPump(PumpDrive_s *pump, MachineCmdDebugPumpAction_e action);
 static void MachineCMD_HandlePausedKey(KeypadState_e key);
 static void MachineCMD_SetManualAction(KeypadState_e key);
 static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask);
@@ -228,6 +268,7 @@ static void MachineCMD_ShowDispSettingPage(void);
 static void MachineCMD_ShowDispRunningPage(void);
 static void MachineCMD_ShowRemotePage(void);
 static void MachineCMD_ShowManualPage(void);
+static void MachineCMD_ShowDebugPage(void);
 static void MachineCMD_ShowCleanPage(void);
 static void MachineCMD_ShowPausedPage(void);
 static void MachineCMD_ShowAlarmPage(void);
@@ -316,6 +357,8 @@ void MachineCMD_Process(void)
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
     }
 
+    MachineCMD_ProcessDebugState();
+
     key = Keypad_GetPressedState();
     if (key == KEYPAD_STATE_NONE)
     {
@@ -368,6 +411,7 @@ void MachineCMD_Process(void)
         MachineCMD_ClearInput();
         MachineCMD_ClearManualSwitches();
         MachineCMD_StopRemoteOutputs();
+        MachineCMD_ResetDebugState();
         machine_cmd.prep_confirmed = 0U;
         machine_cmd.dispense_confirmed = 0U;
         machine_cmd.prep_start_requested = 0U;
@@ -426,6 +470,10 @@ void MachineCMD_Process(void)
 
     case MACHINE_CMD_PAGE_MANUAL:
         MachineCMD_HandleManualKey(key);
+        break;
+
+    case MACHINE_CMD_PAGE_DEBUG:
+        MachineCMD_HandleDebugKey(key);
         break;
 
     case MACHINE_CMD_PAGE_PAUSED:
@@ -489,6 +537,10 @@ void MachineCMD_LCDTask(void)
 
     case MACHINE_CMD_PAGE_MANUAL:
         MachineCMD_ShowManualPage();
+        break;
+
+    case MACHINE_CMD_PAGE_DEBUG:
+        MachineCMD_ShowDebugPage();
         break;
 
     case MACHINE_CMD_PAGE_CLEAN:
@@ -1209,8 +1261,7 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
         break;
 
     case KEYPAD_STATE_FAULT:
-        MachineCMD_ClearManualSwitches();
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_ALARM);
+        MachineCMD_EnterDebugMode();
         break;
 
     case KEYPAD_STATE_REMOTE:
@@ -1506,6 +1557,327 @@ static void MachineCMD_HandleManualKey(KeypadState_e key)
     if (MachineCMD_IsNumberKey(key) == 0U)
     {
         MachineCMD_SetManualAction(key);
+    }
+}
+
+/**
+ * @brief 进入故障键调试模式。
+ *
+ * 仅允许在本地控制、业务流程停止且两个导轨和两个定量泵都空闲时进入，
+ * 避免调试动作与现有配药、发药流程争用执行器。
+ */
+static void MachineCMD_EnterDebugMode(void)
+{
+    PumpDrive_s *pump1 = PumpDrive_GetPump1();
+    PumpDrive_s *pump2 = PumpDrive_GetPump2();
+
+    if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_LOCAL) ||
+        (Machine_IsFlowRunning() != 0U) ||
+        (StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) != 0U) ||
+        (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) != 0U) ||
+        (pump1 == NULL) ||
+        (pump2 == NULL) ||
+        (PumpDrive_IsMoveDone(pump1) == 0U) ||
+        (PumpDrive_IsMoveDone(pump2) == 0U))
+    {
+        return;
+    }
+
+    MachineCMD_ClearManualSwitches();
+    MachineCMD_ResetDebugState();
+    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_DEBUG);
+}
+
+/**
+ * @brief 再次按故障键退出调试模式并立即停止调试输出。
+ */
+static void MachineCMD_ExitDebugMode(void)
+{
+    MachineCMD_StopRemoteOutputs();
+    MachineCMD_ClearManualSwitches();
+    MachineCMD_ResetDebugState();
+    MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
+}
+
+static void MachineCMD_ResetDebugState(void)
+{
+    machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_IDLE;
+    machine_cmd.debug_stepper = STEP_MOTOR_ID_NEEDLE_RAIL;
+    machine_cmd.debug_pump = NULL;
+    machine_cmd.debug_pump_action = MACHINE_CMD_DEBUG_PUMP_NONE;
+    machine_cmd.debug_state_start_ms = 0U;
+}
+
+/**
+ * @brief 按一次调试导轨键运行固定 1 mm。
+ *
+ * 调试接口按固定脉冲运行，不因软件位置为 0 而拒绝后退动作。
+ */
+static uint8_t MachineCMD_StartDebugJog(StepMotorId_e motor,
+                                        StepMotorDirection_e direction)
+{
+    uint32_t speed_pps;
+    uint32_t steps;
+
+    if ((StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) != 0U) ||
+        (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) != 0U))
+    {
+        return 0U;
+    }
+
+    speed_pps = StepMotor_MmPerSecX100ToPps(MACHINE_CMD_DEBUG_JOG_SPEED_MM_S_X100);
+    steps = StepMotor_MmX100ToSteps(MACHINE_CMD_DEBUG_JOG_DISTANCE_MM_X100);
+    if (StepMotor_RunDebugSteps(motor, direction, speed_pps, steps) == 0U)
+    {
+        return 0U;
+    }
+
+    machine_cmd.debug_stepper = motor;
+    machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_STEPPER_WAIT;
+    return 1U;
+}
+
+/**
+ * @brief 执行清除键动作的第一段：插针导轨从当前位置后退 120 mm。
+ *
+ * 第二段进罐导轨后退 220 mm 由 MachineCMD_ProcessDebugState() 在第一段
+ * 完成后启动。两段都是固定相对位移，不调用回零接口。
+ */
+static uint8_t MachineCMD_StartDebugClear(void)
+{
+    uint32_t speed_pps;
+    uint32_t steps;
+
+    if ((StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) != 0U) ||
+        (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) != 0U))
+    {
+        return 0U;
+    }
+
+    speed_pps = StepMotor_MmPerSecX100ToPps(MACHINE_CMD_DEBUG_CLEAR_SPEED_MM_S_X100);
+    steps = StepMotor_MmX100ToSteps(MACHINE_CMD_DEBUG_CLEAR_NEEDLE_MM_X100);
+    if (StepMotor_RunDebugSteps(STEP_MOTOR_ID_NEEDLE_RAIL,
+                                STEP_MOTOR_DIR_PULL,
+                                speed_pps,
+                                steps) == 0U)
+    {
+        return 0U;
+    }
+
+    machine_cmd.debug_stepper = STEP_MOTOR_ID_NEEDLE_RAIL;
+    machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_CLEAR_NEEDLE_WAIT;
+    return 1U;
+}
+
+/**
+ * @brief 启动调试定量泵动作；实际固定运转 3 圈的命令在使能间隔后下发。
+ */
+static uint8_t MachineCMD_StartDebugPump(PumpDrive_s *pump,
+                                         MachineCmdDebugPumpAction_e action)
+{
+    if ((pump == NULL) ||
+        (action == MACHINE_CMD_DEBUG_PUMP_NONE) ||
+        (PumpDrive_IsMoveDone(PumpDrive_GetPump1()) == 0U) ||
+        (PumpDrive_IsMoveDone(PumpDrive_GetPump2()) == 0U))
+    {
+        return 0U;
+    }
+
+    machine_cmd.debug_pump = pump;
+    machine_cmd.debug_pump_action = action;
+    machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE;
+    machine_cmd.debug_state_start_ms = MachineCMD_GetMs();
+    return 1U;
+}
+
+/**
+ * @brief 处理调试页的一次性按键动作。
+ */
+static void MachineCMD_HandleDebugKey(KeypadState_e key)
+{
+    uint8_t started = 1U;
+
+    if (key == KEYPAD_STATE_FAULT)
+    {
+        MachineCMD_ExitDebugMode();
+        return;
+    }
+
+    if (machine_cmd.debug_state != MACHINE_CMD_DEBUG_STATE_IDLE)
+    {
+        return;
+    }
+
+    switch (key)
+    {
+    case KEYPAD_STATE_IN_TANK:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IN_TANK;
+        started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_TANK_RAIL, STEP_MOTOR_DIR_PUSH);
+        break;
+
+    case KEYPAD_STATE_OUT_TANK:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_OUT_TANK;
+        started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_TANK_RAIL, STEP_MOTOR_DIR_PULL);
+        break;
+
+    case KEYPAD_STATE_INSERT_NEEDLE:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN;
+        started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_NEEDLE_RAIL, STEP_MOTOR_DIR_PUSH);
+        break;
+
+    case KEYPAD_STATE_RETRACT_NEEDLE:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT;
+        started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_NEEDLE_RAIL, STEP_MOTOR_DIR_PULL);
+        break;
+
+    case KEYPAD_STATE_CLEAR_INPUT:
+        started = MachineCMD_StartDebugClear();
+        break;
+
+    case KEYPAD_STATE_NUM_1:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_IN;
+        started = MachineCMD_StartDebugPump(PumpDrive_GetPump1(), MACHINE_CMD_DEBUG_PUMP_IN);
+        break;
+
+    case KEYPAD_STATE_NUM_4:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_OUT;
+        started = MachineCMD_StartDebugPump(PumpDrive_GetPump1(), MACHINE_CMD_DEBUG_PUMP_OUT);
+        break;
+
+    case KEYPAD_STATE_NUM_2:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_IN;
+        started = MachineCMD_StartDebugPump(PumpDrive_GetPump2(), MACHINE_CMD_DEBUG_PUMP_IN);
+        break;
+
+    case KEYPAD_STATE_NUM_5:
+        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_OUT;
+        started = MachineCMD_StartDebugPump(PumpDrive_GetPump2(), MACHINE_CMD_DEBUG_PUMP_OUT);
+        break;
+
+    default:
+        return;
+    }
+
+    if (started == 0U)
+    {
+        machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+    }
+}
+
+/**
+ * @brief 非阻塞推进调试动作状态机。
+ */
+static void MachineCMD_ProcessDebugState(void)
+{
+    uint32_t now_ms;
+    uint32_t speed_pps;
+    uint32_t steps;
+    uint8_t moved = 0U;
+
+    if (machine_cmd.page != MACHINE_CMD_PAGE_DEBUG)
+    {
+        return;
+    }
+
+    if (Communication_GetControlMode() != COMMUNICATION_CONTROL_LOCAL)
+    {
+        MachineCMD_StopRemoteOutputs();
+        MachineCMD_ResetDebugState();
+        MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
+        return;
+    }
+
+    now_ms = MachineCMD_GetMs();
+
+    switch (machine_cmd.debug_state)
+    {
+    case MACHINE_CMD_DEBUG_STATE_STEPPER_WAIT:
+        if (StepMotor_IsBusy(machine_cmd.debug_stepper) == 0U)
+        {
+            MachineCMD_ResetDebugState();
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_CLEAR_NEEDLE_WAIT:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) == 0U)
+        {
+            speed_pps = StepMotor_MmPerSecX100ToPps(MACHINE_CMD_DEBUG_CLEAR_SPEED_MM_S_X100);
+            steps = StepMotor_MmX100ToSteps(MACHINE_CMD_DEBUG_CLEAR_TANK_MM_X100);
+            if (StepMotor_RunDebugSteps(STEP_MOTOR_ID_TANK_RAIL,
+                                        STEP_MOTOR_DIR_PULL,
+                                        speed_pps,
+                                        steps) != 0U)
+            {
+                machine_cmd.debug_stepper = STEP_MOTOR_ID_TANK_RAIL;
+                machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_CLEAR_TANK_WAIT;
+            }
+            else
+            {
+                machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+            }
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_CLEAR_TANK_WAIT:
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) == 0U)
+        {
+            MachineCMD_ResetDebugState();
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE:
+        if ((now_ms - machine_cmd.debug_state_start_ms) >= MACHINE_CMD_DEBUG_PUMP_TIMEOUT_MS)
+        {
+            machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+        }
+        else if (PumpDrive_Enable(machine_cmd.debug_pump) != 0U)
+        {
+            machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE_GAP;
+            machine_cmd.debug_state_start_ms = now_ms;
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE_GAP:
+        if ((now_ms - machine_cmd.debug_state_start_ms) >= MACHINE_CMD_DEBUG_PUMP_TIMEOUT_MS)
+        {
+            machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+            break;
+        }
+
+        if ((now_ms - machine_cmd.debug_state_start_ms) < MACHINE_CMD_DEBUG_PUMP_ENABLE_GAP_MS)
+        {
+            break;
+        }
+
+        if (machine_cmd.debug_pump_action == MACHINE_CMD_DEBUG_PUMP_IN)
+        {
+            moved = PumpDrive_MoveInAngleDegX10(machine_cmd.debug_pump,
+                                                MACHINE_CMD_DEBUG_PUMP_ANGLE_DEG_X10);
+        }
+        else if (machine_cmd.debug_pump_action == MACHINE_CMD_DEBUG_PUMP_OUT)
+        {
+            moved = PumpDrive_MoveOutAngleDegX10(machine_cmd.debug_pump,
+                                                 MACHINE_CMD_DEBUG_PUMP_ANGLE_DEG_X10);
+        }
+
+        if (moved != 0U)
+        {
+            machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_PUMP_MOVE_WAIT;
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_PUMP_MOVE_WAIT:
+        if (PumpDrive_IsMoveDone(machine_cmd.debug_pump) != 0U)
+        {
+            MachineCMD_ResetDebugState();
+        }
+        break;
+
+    case MACHINE_CMD_DEBUG_STATE_IDLE:
+    case MACHINE_CMD_DEBUG_STATE_ERROR:
+    default:
+        break;
     }
 }
 
@@ -3594,6 +3966,89 @@ static void MachineCMD_ShowManualPage(void)
     }
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_manual_switch_hint);
+}
+
+/**
+ * @brief 显示故障键调试模式及当前动作状态。
+ */
+static void MachineCMD_ShowDebugPage(void)
+{
+    const MachineCmdText_s *action_text = NULL;
+    const MachineCmdText_s *state_text = &machine_cmd_text_ui_wait;
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_debug_title);
+
+    if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_IDLE)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_debug_idle_rail);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_debug_idle_pump);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_debug_idle_exit);
+        return;
+    }
+
+    if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_CLEAR_NEEDLE_WAIT)
+    {
+        action_text = &machine_cmd_text_debug_clear_needle;
+    }
+    else if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_CLEAR_TANK_WAIT)
+    {
+        action_text = &machine_cmd_text_debug_clear_tank;
+    }
+    else if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_ERROR)
+    {
+        action_text = &machine_cmd_text_debug_action_error;
+        state_text = NULL;
+    }
+    else
+    {
+        switch (machine_cmd.manual_action)
+        {
+        case MACHINE_CMD_MANUAL_ACTION_IN_TANK:
+            action_text = &machine_cmd_text_debug_tank_forward;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_OUT_TANK:
+            action_text = &machine_cmd_text_debug_tank_backward;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN:
+            action_text = &machine_cmd_text_debug_needle_forward;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT:
+            action_text = &machine_cmd_text_debug_needle_backward;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_WATER_IN:
+            action_text = &machine_cmd_text_debug_water_in;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_WATER_OUT:
+            action_text = &machine_cmd_text_debug_water_out;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_MED_IN:
+            action_text = &machine_cmd_text_debug_med_in;
+            break;
+
+        case MACHINE_CMD_MANUAL_ACTION_MED_OUT:
+            action_text = &machine_cmd_text_debug_med_out;
+            break;
+
+        default:
+            break;
+        }
+
+        if ((machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE) ||
+            (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE_GAP))
+        {
+            state_text = &machine_cmd_text_debug_pump_enabling;
+        }
+    }
+
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, action_text);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, state_text);
+    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_debug_fault_exit);
 }
 
 /**

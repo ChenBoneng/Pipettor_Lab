@@ -162,5 +162,22 @@ extern const MachineCmdText_s machine_cmd_text_ui_activity_label;
 extern const MachineCmdText_s machine_cmd_text_ui_volume_label;
 extern const MachineCmdText_s machine_cmd_text_ui_bottle1_label;
 extern const MachineCmdText_s machine_cmd_text_ui_bottle2_label;
+extern const MachineCmdText_s machine_cmd_text_debug_title;
+extern const MachineCmdText_s machine_cmd_text_debug_idle_rail;
+extern const MachineCmdText_s machine_cmd_text_debug_idle_pump;
+extern const MachineCmdText_s machine_cmd_text_debug_idle_exit;
+extern const MachineCmdText_s machine_cmd_text_debug_tank_forward;
+extern const MachineCmdText_s machine_cmd_text_debug_tank_backward;
+extern const MachineCmdText_s machine_cmd_text_debug_needle_forward;
+extern const MachineCmdText_s machine_cmd_text_debug_needle_backward;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_needle;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_tank;
+extern const MachineCmdText_s machine_cmd_text_debug_water_in;
+extern const MachineCmdText_s machine_cmd_text_debug_water_out;
+extern const MachineCmdText_s machine_cmd_text_debug_med_in;
+extern const MachineCmdText_s machine_cmd_text_debug_med_out;
+extern const MachineCmdText_s machine_cmd_text_debug_pump_enabling;
+extern const MachineCmdText_s machine_cmd_text_debug_action_error;
+extern const MachineCmdText_s machine_cmd_text_debug_fault_exit;
 
 #endif //MACHINECMD_TEXT_H

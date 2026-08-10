@@ -25,6 +25,7 @@ typedef enum
     MACHINE_CMD_PAGE_DISP_RUNNING,   // 发药运行提示页
     MACHINE_CMD_PAGE_REMOTE,         // 上位机远控接管页
     MACHINE_CMD_PAGE_MANUAL,         // 手动调试页
+    MACHINE_CMD_PAGE_DEBUG,          // 故障键进入的设备调试页
     MACHINE_CMD_PAGE_CLEAN,          // 自动清洗页
     MACHINE_CMD_PAGE_PAUSED,         // 流程暂停页
     MACHINE_CMD_PAGE_ALARM,          // 报警页
