@@ -164,7 +164,6 @@ extern const MachineCmdText_s machine_cmd_text_ui_bottle1_label;
 extern const MachineCmdText_s machine_cmd_text_ui_bottle2_label;
 extern const MachineCmdText_s machine_cmd_text_debug_title;
 extern const MachineCmdText_s machine_cmd_text_debug_idle_rail;
-extern const MachineCmdText_s machine_cmd_text_debug_idle_pump;
 extern const MachineCmdText_s machine_cmd_text_debug_idle_exit;
 extern const MachineCmdText_s machine_cmd_text_debug_tank_forward;
 extern const MachineCmdText_s machine_cmd_text_debug_tank_backward;
@@ -183,5 +182,7 @@ extern const MachineCmdText_s machine_cmd_text_debug_clear_warning;
 extern const MachineCmdText_s machine_cmd_text_debug_clear_again;
 extern const MachineCmdText_s machine_cmd_text_debug_clear_execute;
 extern const MachineCmdText_s machine_cmd_text_debug_clear_back;
+extern const MachineCmdText_s machine_cmd_text_debug_water_pump_on;
+extern const MachineCmdText_s machine_cmd_text_debug_water_pump_off;
 
 #endif //MACHINECMD_TEXT_H

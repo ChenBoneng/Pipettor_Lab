@@ -24,7 +24,7 @@ typedef enum
     KEYPAD_STATE_NUM_0 = 6U,             // 数字 0
 
     KEYPAD_STATE_FAULT = 7U,             // 故障
-    KEYPAD_STATE_DRAW_MEDICINE = 8U,     // 抽药
+    KEYPAD_STATE_DRAW_MEDICINE = 8U,     // 抽药/抽水，调试模式下作为抽水泵开关
     KEYPAD_STATE_PREPARE_MEDICINE = 9U,  // 配药
     KEYPAD_STATE_SEND_MEDICINE = 10U,    // 发药
     KEYPAD_STATE_EXHAUST_FIXED = 11U,    // 定量排气

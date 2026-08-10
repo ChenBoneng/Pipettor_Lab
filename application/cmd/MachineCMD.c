@@ -1749,6 +1749,17 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
         started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_NEEDLE_RAIL, STEP_MOTOR_DIR_PULL);
         break;
 
+    case KEYPAD_STATE_DRAW_MEDICINE:
+        if (WaterPump_IsOn(WATER_PUMP_ID_MAIN) != 0U)
+        {
+            WaterPump_Stop(WATER_PUMP_ID_MAIN);
+        }
+        else if (WaterPump_Start(WATER_PUMP_ID_MAIN) == 0U)
+        {
+            machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+        }
+        return;
+
     case KEYPAD_STATE_CLEAR_INPUT:
         machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM;
         return;
@@ -4009,7 +4020,10 @@ static void MachineCMD_ShowDebugPage(void)
     if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_IDLE)
     {
         MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_debug_idle_rail);
-        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_debug_idle_pump);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3,
+                             (WaterPump_IsOn(WATER_PUMP_ID_MAIN) != 0U) ?
+                             &machine_cmd_text_debug_water_pump_on :
+                             &machine_cmd_text_debug_water_pump_off);
         MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_debug_idle_exit);
         return;
     }
