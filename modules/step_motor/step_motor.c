@@ -64,6 +64,12 @@ typedef struct
 
 typedef struct
 {
+    GPIO_TypeDef *port;
+    uint16_t pin;
+} StepMotorHomeSensorHw_s;
+
+typedef struct
+{
     uint8_t enabled;          // 1 表示当前需要 StepMotor_Process() 调整速度
     uint32_t target_speed_pps; // 应用层要求的目标速度
     uint32_t current_speed_pps; // 当前实际输出速度
@@ -75,6 +81,11 @@ static const StepMotorHw_s step_motor_hw[STEP_MOTOR_ID_MAX] = {
     {GPIOA, GPIO_PIN_5, GPIOA, GPIO_PIN_4, TIM_CHANNEL_2},
 };
 
+static const StepMotorHomeSensorHw_s step_motor_home_sensor_hw[STEP_MOTOR_ID_MAX] = {
+    {GPIOC, GPIO_PIN_4}, /* 插针导轨零点 */
+    {GPIOC, GPIO_PIN_5}, /* 进罐导轨零点 */
+};
+
 static const uint32_t step_motor_max_travel_um[STEP_MOTOR_ID_MAX] = {
     STEP_MOTOR_A_TRAVEL_UM,
     STEP_MOTOR_B_TRAVEL_UM,
@@ -84,6 +95,7 @@ static volatile StepMotorStatus_s step_motor_status[STEP_MOTOR_ID_MAX];
 static volatile uint32_t step_motor_move_start_position_um[STEP_MOTOR_ID_MAX];
 static volatile uint32_t step_motor_move_target_position_um[STEP_MOTOR_ID_MAX];
 static volatile StepMotorId_e step_motor_active_id = STEP_MOTOR_ID_MAX;
+static volatile uint8_t step_motor_home_sensor_event[STEP_MOTOR_ID_MAX] = {0U};
 static StepMotorRamp_s step_motor_ramp = {0};
 static uint8_t step_motor_inited = 0U;
 
@@ -731,6 +743,7 @@ void StepMotor_Init(void)
     memset((void *)step_motor_status, 0, sizeof(step_motor_status));
     memset((void *)step_motor_move_start_position_um, 0, sizeof(step_motor_move_start_position_um));
     memset((void *)step_motor_move_target_position_um, 0, sizeof(step_motor_move_target_position_um));
+    memset((void *)step_motor_home_sensor_event, 0, sizeof(step_motor_home_sensor_event));
     memset(&step_motor_ramp, 0, sizeof(step_motor_ramp));
 
     StepMotor_StopAll();
@@ -744,6 +757,43 @@ void StepMotor_Init(void)
 
     step_motor_active_id = STEP_MOTOR_ID_MAX;
     step_motor_inited = 1U;
+}
+
+uint8_t StepMotor_IsHomeSensorActive(StepMotorId_e motor)
+{
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    return (HAL_GPIO_ReadPin(step_motor_home_sensor_hw[motor].port,
+                             step_motor_home_sensor_hw[motor].pin) == GPIO_PIN_RESET) ? 1U : 0U;
+}
+
+uint8_t StepMotor_ConsumeHomeSensorEvent(StepMotorId_e motor)
+{
+    uint8_t triggered;
+
+    if (StepMotor_IsValidId(motor) == 0U)
+    {
+        return 0U;
+    }
+
+    triggered = step_motor_home_sensor_event[motor];
+    step_motor_home_sensor_event[motor] = 0U;
+    return triggered;
+}
+
+void StepMotor_HomeSensorIrqHandler(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_4)
+    {
+        step_motor_home_sensor_event[STEP_MOTOR_ID_NEEDLE_RAIL] = 1U;
+    }
+    else if (GPIO_Pin == GPIO_PIN_5)
+    {
+        step_motor_home_sensor_event[STEP_MOTOR_ID_TANK_RAIL] = 1U;
+    }
 }
 
 void StepMotor_Process(void)

@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "pump_drive.h"
+#include "step_motor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -167,6 +168,20 @@ void DebugMon_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles EXTI line4 interrupt.
+  */
+void EXTI4_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI4_IRQn 0 */
+
+  /* USER CODE END EXTI4_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_4);
+  /* USER CODE BEGIN EXTI4_IRQn 1 */
+
+  /* USER CODE END EXTI4_IRQn 1 */
+}
+
+/**
   * @brief This function handles DMA1 channel3 global interrupt.
   */
 void DMA1_Channel3_IRQHandler(void)
@@ -206,6 +221,20 @@ void CAN1_RX1_IRQHandler(void)
   /* USER CODE BEGIN CAN1_RX1_IRQn 1 */
 
   /* USER CODE END CAN1_RX1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles EXTI line[9:5] interrupts.
+  */
+void EXTI9_5_IRQHandler(void)
+{
+  /* USER CODE BEGIN EXTI9_5_IRQn 0 */
+
+  /* USER CODE END EXTI9_5_IRQn 0 */
+  HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_5);
+  /* USER CODE BEGIN EXTI9_5_IRQn 1 */
+
+  /* USER CODE END EXTI9_5_IRQn 1 */
 }
 
 /**
@@ -284,12 +313,18 @@ void EXTI15_10_IRQHandler(void)
 /**
   * @brief GPIO EXTI 回调。
   *
-  * 当前只把 PB14/PB15 分发给定量泵光电门计数，
-  * 后续如果其它模块也使用 EXTI，可以继续在这里按引脚分发。
+  * PC4/PC5 用于导轨上电归零，PB14/PB15 用于定量泵光电门计数。
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
-  PumpDrive_PhotoSensorIrqHandler(GPIO_Pin);
+  if ((GPIO_Pin == GPIO_PIN_4) || (GPIO_Pin == GPIO_PIN_5))
+  {
+    StepMotor_HomeSensorIrqHandler(GPIO_Pin);
+  }
+  else if ((GPIO_Pin == GPIO_PIN_14) || (GPIO_Pin == GPIO_PIN_15))
+  {
+    PumpDrive_PhotoSensorIrqHandler(GPIO_Pin);
+  }
 }
 
 /* USER CODE END 1 */

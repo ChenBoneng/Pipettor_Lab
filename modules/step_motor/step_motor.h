@@ -291,4 +291,26 @@ uint8_t StepMotor_IsBusy(StepMotorId_e motor);
  */
 uint8_t StepMotor_GetStatus(StepMotorId_e motor, StepMotorStatus_s *status);
 
+/**
+ * @brief 读取指定导轨的零点光电门状态。
+ *
+ * @param motor 电机编号；插针导轨使用 PC4，进罐导轨使用 PC5。
+ * @return 1 表示光电门为低电平、导轨已经到达零点；0 表示未到位或参数错误。
+ */
+uint8_t StepMotor_IsHomeSensorActive(StepMotorId_e motor);
+
+/**
+ * @brief 读取并清除指定导轨的零点光电门下降沿事件。
+ *
+ * @return 1 表示自上次读取后发生过下降沿；0 表示没有事件或参数错误。
+ */
+uint8_t StepMotor_ConsumeHomeSensorEvent(StepMotorId_e motor);
+
+/**
+ * @brief 零点光电门 EXTI 中断分发入口。
+ *
+ * @note 仅记录 PC4/PC5 事件，不在中断中停止电机或推进业务状态机。
+ */
+void StepMotor_HomeSensorIrqHandler(uint16_t GPIO_Pin);
+
 #endif //STEP_MOTOR_H

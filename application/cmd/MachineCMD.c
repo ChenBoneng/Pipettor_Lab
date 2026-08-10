@@ -389,6 +389,7 @@ void MachineCMD_Process(void)
      * 当前设备默认交给上位机控制，所以启动结束后直接进入远控页。
      */
     if ((machine_cmd.page == MACHINE_CMD_PAGE_BOOT) &&
+        (Machine_IsStartupHomeComplete() != 0U) &&
         ((now_ms - machine_cmd.boot_start_ms) >= MACHINE_CMD_BOOT_HOLD_MS))
     {
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
@@ -2262,6 +2263,15 @@ static void MachineCMD_ProcessRemoteCommand(void)
 {
     CommunicationHostCommand_s command;
 
+    if (Machine_IsStartupHomeComplete() == 0U)
+    {
+        if (Communication_HasNewCommand() != 0U)
+        {
+            Communication_ClearNewCommandFlag();
+        }
+        return;
+    }
+
     if (Communication_HasNewCommand() == 0U)
     {
         return;
@@ -3595,9 +3605,24 @@ static const MachineCmdText_s *MachineCMD_GetManualActionText(void)
 static void MachineCMD_ShowBootPage(void)
 {
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_title);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_init);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_eeprom);
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ready);
+    if (Machine_IsStartupHomeFailed() != 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_fault);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_rail_home);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_alarm);
+    }
+    else if (Machine_IsStartupHomeComplete() == 0U)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_init);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_ui_rail_home);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ui_wait);
+    }
+    else
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_init);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_eeprom);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_ready);
+    }
 }
 
 /**

@@ -34,6 +34,12 @@
 #define MACHINE_PREP_MAX_BOTTLE_COUNT            2U
 #define MACHINE_PUMP1_WATER_SEGMENT_UL           6000UL
 
+/* 上电只执行一次的导轨物理归零参数。 */
+#define MACHINE_STARTUP_HOME_SPEED_MM_S_X100     500U
+#define MACHINE_STARTUP_HOME_CONFIRM_MS          10U
+#define MACHINE_STARTUP_HOME_NEEDLE_TIMEOUT_MS   40000U
+#define MACHINE_STARTUP_HOME_TANK_TIMEOUT_MS     70000U
+
 /* 自动排气/冲洗默认 10.00ml；单独远控排气/冲洗只覆盖本次流程。 */
 #define MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100   1000U
 #define MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100     1000U
@@ -141,6 +147,15 @@ typedef enum
     MACHINE_ACTIVITY_WAIT_ERROR        // 活度计通信超时、CRC 错误或响应格式错误
 } MachineActivityWaitResult_e;
 
+typedef enum
+{
+    MACHINE_STARTUP_HOME_START = 0,
+    MACHINE_STARTUP_HOME_SEEK,
+    MACHINE_STARTUP_HOME_CONFIRM,
+    MACHINE_STARTUP_HOME_DONE,
+    MACHINE_STARTUP_HOME_ERROR
+} MachineStartupHomeState_e;
+
 static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
 static uint8_t machine_combo_running = 0U;
@@ -205,8 +220,18 @@ static uint8_t machine_activity_wait_active = 0U;
 static uint8_t machine_activity_wait_started = 0U;
 static uint32_t machine_activity_wait_start_ms = 0U;
 static uint32_t machine_activity_wait_update_count = 0U;
+static MachineStartupHomeState_e machine_startup_home_state = MACHINE_STARTUP_HOME_START;
+static StepMotorId_e machine_startup_home_motor = STEP_MOTOR_ID_NEEDLE_RAIL;
+static uint32_t machine_startup_home_state_start_ms = 0U;
+static uint32_t machine_startup_home_axis_start_ms = 0U;
+static uint8_t machine_startup_home_initialized = 0U;
+static uint8_t machine_startup_home_complete = 0U;
+static uint8_t machine_startup_home_failed = 0U;
 
 static uint32_t Machine_GetMs(void);
+static void Machine_EnterStartupHomeState(MachineStartupHomeState_e next_state);
+static void Machine_FailStartupHome(void);
+static void Machine_UpdateStartupHome(void);
 static uint32_t Machine_GetPrepCapacityUl(void);
 static uint16_t Machine_GetPrepCapacityMlX100(void);
 static uint32_t Machine_SubtractVolumeUl(uint32_t volume_ul, uint32_t subtract_ul);
@@ -293,6 +318,125 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step);
 static uint32_t Machine_GetMs(void)
 {
     return HAL_GetTick();
+}
+
+static void Machine_EnterStartupHomeState(MachineStartupHomeState_e next_state)
+{
+    machine_startup_home_state = next_state;
+    machine_startup_home_state_start_ms = Machine_GetMs();
+}
+
+static void Machine_FailStartupHome(void)
+{
+    StepMotor_StopAll();
+    machine_startup_home_failed = 1U;
+    Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_ERROR);
+}
+
+/**
+ * @brief 非阻塞推进本次上电唯一一次导轨物理归零。
+ *
+ * 插针导轨先按拉方向寻找 PC4，完成后进罐导轨再寻找 PC5。下降沿中断只
+ * 记录事件；MachineTask 在这里停止 PWM，并确认信号持续为低后设置软件零点。
+ */
+static void Machine_UpdateStartupHome(void)
+{
+    uint32_t now_ms = Machine_GetMs();
+    uint32_t speed_pps;
+    uint32_t timeout_ms;
+
+    timeout_ms = (machine_startup_home_motor == STEP_MOTOR_ID_NEEDLE_RAIL) ?
+                 MACHINE_STARTUP_HOME_NEEDLE_TIMEOUT_MS :
+                 MACHINE_STARTUP_HOME_TANK_TIMEOUT_MS;
+
+    switch (machine_startup_home_state)
+    {
+    case MACHINE_STARTUP_HOME_START:
+        (void)StepMotor_ConsumeHomeSensorEvent(machine_startup_home_motor);
+        machine_startup_home_axis_start_ms = now_ms;
+        if (StepMotor_IsHomeSensorActive(machine_startup_home_motor) != 0U)
+        {
+            Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_CONFIRM);
+            break;
+        }
+
+        speed_pps = StepMotor_MmPerSecX100ToPps(MACHINE_STARTUP_HOME_SPEED_MM_S_X100);
+        if (StepMotor_RunDebugContinuous(machine_startup_home_motor,
+                                         STEP_MOTOR_DIR_PULL,
+                                         speed_pps) == 0U)
+        {
+            Machine_FailStartupHome();
+            break;
+        }
+        Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_SEEK);
+        break;
+
+    case MACHINE_STARTUP_HOME_SEEK:
+        if ((StepMotor_ConsumeHomeSensorEvent(machine_startup_home_motor) != 0U) ||
+            (StepMotor_IsHomeSensorActive(machine_startup_home_motor) != 0U))
+        {
+            StepMotor_Stop(machine_startup_home_motor);
+            Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_CONFIRM);
+        }
+        else if (((uint32_t)(now_ms - machine_startup_home_axis_start_ms) >=
+                  timeout_ms) ||
+                 (StepMotor_IsBusy(machine_startup_home_motor) == 0U))
+        {
+            Machine_FailStartupHome();
+        }
+        break;
+
+    case MACHINE_STARTUP_HOME_CONFIRM:
+        if ((uint32_t)(now_ms - machine_startup_home_state_start_ms) <
+            MACHINE_STARTUP_HOME_CONFIRM_MS)
+        {
+            break;
+        }
+
+        if (StepMotor_IsHomeSensorActive(machine_startup_home_motor) != 0U)
+        {
+            StepMotor_Stop(machine_startup_home_motor);
+            if (StepMotor_SetCurrentPositionZero(machine_startup_home_motor) == 0U)
+            {
+                Machine_FailStartupHome();
+                break;
+            }
+            if (machine_startup_home_motor == STEP_MOTOR_ID_NEEDLE_RAIL)
+            {
+                machine_startup_home_motor = STEP_MOTOR_ID_TANK_RAIL;
+                Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_START);
+            }
+            else
+            {
+                machine_startup_home_complete = 1U;
+                Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_DONE);
+            }
+            break;
+        }
+
+        if ((uint32_t)(now_ms - machine_startup_home_axis_start_ms) >= timeout_ms)
+        {
+            Machine_FailStartupHome();
+            break;
+        }
+
+        (void)StepMotor_ConsumeHomeSensorEvent(machine_startup_home_motor);
+        speed_pps = StepMotor_MmPerSecX100ToPps(MACHINE_STARTUP_HOME_SPEED_MM_S_X100);
+        if (StepMotor_RunDebugContinuous(machine_startup_home_motor,
+                                         STEP_MOTOR_DIR_PULL,
+                                         speed_pps) == 0U)
+        {
+            Machine_FailStartupHome();
+            break;
+        }
+        Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_SEEK);
+        break;
+
+    case MACHINE_STARTUP_HOME_DONE:
+    case MACHINE_STARTUP_HOME_ERROR:
+    default:
+        break;
+    }
 }
 
 /**
@@ -2804,6 +2948,16 @@ void MachineInit(void)
 
     Machine_UseDefaultPipeVolumes();
     Machine_StopComboOutputs();
+
+    if (machine_startup_home_initialized == 0U)
+    {
+        machine_startup_home_complete = 0U;
+        machine_startup_home_failed = 0U;
+        machine_startup_home_axis_start_ms = 0U;
+        machine_startup_home_motor = STEP_MOTOR_ID_NEEDLE_RAIL;
+        machine_startup_home_initialized = 1U;
+        Machine_EnterStartupHomeState(MACHINE_STARTUP_HOME_START);
+    }
 }
 
 void MachineControl(void)
@@ -2815,6 +2969,12 @@ void MachineControl(void)
     uint16_t current_ml_x100;
     uint16_t target_conc_x1000;
     uint16_t dispense_ml_x100;
+
+    if (machine_startup_home_complete == 0U)
+    {
+        Machine_UpdateStartupHome();
+        return;
+    }
 
     if (MachineCMD_ConsumeResetRequested() != 0U)
     {
@@ -2895,6 +3055,16 @@ void MachineControl(void)
     }
 
     Machine_UpdateCombo();
+}
+
+uint8_t Machine_IsStartupHomeComplete(void)
+{
+    return machine_startup_home_complete;
+}
+
+uint8_t Machine_IsStartupHomeFailed(void)
+{
+    return machine_startup_home_failed;
 }
 
 uint8_t MachineCombinationTestIsRunning(void)

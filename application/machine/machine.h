@@ -6,6 +6,10 @@
 void MachineInit(void);
 void MachineControl(void);
 
+/* 上电导轨归零状态；归零只在本次上电初始化时执行一次。 */
+uint8_t Machine_IsStartupHomeComplete(void);
+uint8_t Machine_IsStartupHomeFailed(void);
+
 /* 上位机急停入口：立即停止输出并终止当前整体流程，不执行复位收尾。 */
 void Machine_EmergencyStop(void);
 void Machine_ResetRuntimeState(void);
