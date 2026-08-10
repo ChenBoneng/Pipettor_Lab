@@ -85,6 +85,7 @@ typedef enum
 {
     MACHINE_CMD_DEBUG_STATE_IDLE = 0,
     MACHINE_CMD_DEBUG_STATE_STEPPER_WAIT,
+    MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM,
     MACHINE_CMD_DEBUG_STATE_CLEAR_NEEDLE_WAIT,
     MACHINE_CMD_DEBUG_STATE_CLEAR_TANK_WAIT,
     MACHINE_CMD_DEBUG_STATE_PUMP_ENABLE,
@@ -1704,6 +1705,23 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
         return;
     }
 
+    if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM)
+    {
+        if (key == KEYPAD_STATE_CLEAR_INPUT)
+        {
+            if (MachineCMD_StartDebugClear() == 0U)
+            {
+                machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_ERROR;
+            }
+        }
+        else if (key == KEYPAD_STATE_CLEAR_ALL)
+        {
+            MachineCMD_ResetDebugState();
+            machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
+        }
+        return;
+    }
+
     if (machine_cmd.debug_state != MACHINE_CMD_DEBUG_STATE_IDLE)
     {
         return;
@@ -1732,8 +1750,8 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
         break;
 
     case KEYPAD_STATE_CLEAR_INPUT:
-        started = MachineCMD_StartDebugClear();
-        break;
+        machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM;
+        return;
 
     case KEYPAD_STATE_NUM_1:
         machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_IN;
@@ -1875,6 +1893,7 @@ static void MachineCMD_ProcessDebugState(void)
         break;
 
     case MACHINE_CMD_DEBUG_STATE_IDLE:
+    case MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM:
     case MACHINE_CMD_DEBUG_STATE_ERROR:
     default:
         break;
@@ -3977,6 +3996,15 @@ static void MachineCMD_ShowDebugPage(void)
     const MachineCmdText_s *state_text = &machine_cmd_text_ui_wait;
 
     MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_debug_title);
+
+    if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_CLEAR_CONFIRM)
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_debug_clear_warning);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_debug_clear_again);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_debug_clear_execute);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_debug_clear_back);
+        return;
+    }
 
     if (machine_cmd.debug_state == MACHINE_CMD_DEBUG_STATE_IDLE)
     {

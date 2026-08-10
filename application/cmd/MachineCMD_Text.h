@@ -179,5 +179,9 @@ extern const MachineCmdText_s machine_cmd_text_debug_med_out;
 extern const MachineCmdText_s machine_cmd_text_debug_pump_enabling;
 extern const MachineCmdText_s machine_cmd_text_debug_action_error;
 extern const MachineCmdText_s machine_cmd_text_debug_fault_exit;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_warning;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_again;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_execute;
+extern const MachineCmdText_s machine_cmd_text_debug_clear_back;
 
 #endif //MACHINECMD_TEXT_H
