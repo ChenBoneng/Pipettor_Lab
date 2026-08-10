@@ -142,6 +142,21 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
                            uint32_t steps);
 
 /**
+ * @brief 调试模式连续运行指定电机，不做软件行程边界保护。
+ */
+uint8_t StepMotor_RunDebugContinuous(StepMotorId_e motor,
+                                     StepMotorDirection_e direction,
+                                     uint32_t speed_pps);
+
+/**
+ * @brief 调试模式按步数运行指定电机，不做软件行程边界保护。
+ */
+uint8_t StepMotor_RunDebugSteps(StepMotorId_e motor,
+                                StepMotorDirection_e direction,
+                                uint32_t speed_pps,
+                                uint32_t steps);
+
+/**
  * @brief 把距离从 0.01mm 单位换算成脉冲数。
  *
  * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。

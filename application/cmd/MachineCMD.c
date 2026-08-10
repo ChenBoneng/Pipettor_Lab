@@ -2482,10 +2482,10 @@ static uint8_t MachineCMD_HandleRemoteStepper(const CommunicationHostCommand_s *
 
     if (steps == 0U)
     {
-        return StepMotor_RunContinuous(motor, direction, frequency_hz);
+        return StepMotor_RunDebugContinuous(motor, direction, frequency_hz);
     }
 
-    return StepMotor_RunSteps(motor, direction, frequency_hz, steps);
+    return StepMotor_RunDebugSteps(motor, direction, frequency_hz, steps);
 }
 
 /**

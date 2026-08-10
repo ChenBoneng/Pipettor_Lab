@@ -108,6 +108,12 @@ static void StepMotor_SetDirection(StepMotorId_e motor, StepMotorDirection_e dir
 static void StepMotor_UpdatePositionOnStop(StepMotorId_e motor);
 static void StepMotor_RebaseRunningMove(StepMotorId_e motor);
 static void StepMotor_StopOutput(StepMotorId_e motor);
+static uint8_t StepMotor_StartInternal(StepMotorId_e motor,
+                                       StepMotorDirection_e direction,
+                                       uint32_t speed_pps,
+                                       uint32_t steps,
+                                       uint32_t target_position_um,
+                                       uint8_t skip_position_limit);
 static uint8_t StepMotor_Start(StepMotorId_e motor,
                                StepMotorDirection_e direction,
                                uint32_t speed_pps,
@@ -625,18 +631,20 @@ static void StepMotor_StopOutput(StepMotorId_e motor)
  * @param target_position_um 本次运动结束后的目标软件位置，单位 um。
  * @return 1 表示启动成功；0 表示启动失败。
  */
-static uint8_t StepMotor_Start(StepMotorId_e motor,
-                               StepMotorDirection_e direction,
-                               uint32_t speed_pps,
-                               uint32_t steps,
-                               uint32_t target_position_um)
+static uint8_t StepMotor_StartInternal(StepMotorId_e motor,
+                                       StepMotorDirection_e direction,
+                                       uint32_t speed_pps,
+                                       uint32_t steps,
+                                       uint32_t target_position_um,
+                                       uint8_t skip_position_limit)
 {
     uint32_t start_speed_pps;
 
     if ((step_motor_inited == 0U) ||
         (StepMotor_IsValidId(motor) == 0U) ||
         (speed_pps == 0U) ||
-        (StepMotor_IsPositionAllowed(motor, target_position_um) == 0U))
+        ((skip_position_limit == 0U) &&
+         (StepMotor_IsPositionAllowed(motor, target_position_um) == 0U)))
     {
         return 0U;
     }
@@ -702,6 +710,20 @@ static uint8_t StepMotor_Start(StepMotorId_e motor,
     }
 
     return 1U;
+}
+
+static uint8_t StepMotor_Start(StepMotorId_e motor,
+                               StepMotorDirection_e direction,
+                               uint32_t speed_pps,
+                               uint32_t steps,
+                               uint32_t target_position_um)
+{
+    return StepMotor_StartInternal(motor,
+                                   direction,
+                                   speed_pps,
+                                   steps,
+                                   target_position_um,
+                                   0U);
 }
 
 void StepMotor_Init(void)
@@ -872,6 +894,63 @@ uint8_t StepMotor_RunSteps(StepMotorId_e motor,
     }
 
     return StepMotor_Start(motor, direction, speed_pps, steps, target_position_um);
+}
+
+uint8_t StepMotor_RunDebugContinuous(StepMotorId_e motor,
+                                     StepMotorDirection_e direction,
+                                     uint32_t speed_pps)
+{
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (speed_pps == 0U))
+    {
+        return 0U;
+    }
+
+    return StepMotor_StartInternal(motor,
+                                   direction,
+                                   speed_pps,
+                                   0U,
+                                   step_motor_status[motor].current_position_um,
+                                   1U);
+}
+
+uint8_t StepMotor_RunDebugSteps(StepMotorId_e motor,
+                                StepMotorDirection_e direction,
+                                uint32_t speed_pps,
+                                uint32_t steps)
+{
+    uint32_t current_position_um;
+    uint32_t distance_um;
+    uint32_t target_position_um;
+
+    if ((StepMotor_IsValidId(motor) == 0U) ||
+        (speed_pps == 0U) ||
+        (steps == 0U))
+    {
+        return 0U;
+    }
+
+    current_position_um = step_motor_status[motor].current_position_um;
+    distance_um = StepMotor_StepsToUm(steps);
+    if (direction == STEP_MOTOR_DIR_PUSH)
+    {
+        target_position_um = current_position_um + distance_um;
+        if (target_position_um < current_position_um)
+        {
+            target_position_um = UINT32_MAX;
+        }
+    }
+    else
+    {
+        target_position_um = (distance_um >= current_position_um) ? 0U : (current_position_um - distance_um);
+    }
+
+    return StepMotor_StartInternal(motor,
+                                   direction,
+                                   speed_pps,
+                                   steps,
+                                   target_position_um,
+                                   1U);
 }
 
 uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100)
