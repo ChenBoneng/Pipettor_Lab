@@ -39,19 +39,26 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
                                            uint16_t final_volume_x100,
                                            uint16_t initial_activity_x100,
                                            uint16_t target_conc_x1000,
+                                           uint16_t pipe_exhaust_volume_x100,
+                                           uint16_t pipe_flush_volume_x100,
+                                           uint8_t auto_exhaust,
+                                           uint8_t auto_flush,
                                            uint8_t seq);
 
 /* 上位机启动独立发药流程，volume_ml_x100 单位为 0.01ml，seq 用于完成 ACK 回传。 */
-uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq);
+uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100,
+                                    uint16_t flush_volume_x100,
+                                    uint8_t auto_flush,
+                                    uint8_t seq);
 
-/* 设置定量排气和冲洗体积，单位均为 0.01ml。 */
+/* 设置完整流程使用的默认排气和冲洗体积，单位均为 0.01ml。 */
 void Machine_SetPipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100);
 
-/* 上位机启动单独冲洗流程，seq 用于 PROCESS_RESULT 回传。 */
-uint8_t Machine_StartRemoteFlush(uint8_t seq);
+/* 上位机启动单独冲洗流程，flush_volume_x100 只用于本次流程，seq 用于 PROCESS_RESULT 回传。 */
+uint8_t Machine_StartRemoteFlush(uint16_t flush_volume_x100, uint8_t seq);
 
-/* 上位机启动单独排气流程，seq 用于 PROCESS_RESULT 回传。 */
-uint8_t Machine_StartRemoteExhaust(uint8_t seq);
+/* 上位机启动单独排气流程，exhaust_volume_x100 只用于本次流程，seq 用于 PROCESS_RESULT 回传。 */
+uint8_t Machine_StartRemoteExhaust(uint16_t exhaust_volume_x100, uint8_t seq);
 uint8_t Machine_ConfirmRemoteBottleChanged(uint8_t bottle_index,
                                            uint8_t confirm_step,
                                            uint8_t *ack_result,

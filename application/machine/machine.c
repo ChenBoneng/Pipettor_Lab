@@ -34,7 +34,7 @@
 #define MACHINE_PREP_MAX_BOTTLE_COUNT            2U
 #define MACHINE_PUMP1_WATER_SEGMENT_UL           6000UL
 
-/* 自动排气/冲洗体积默认 10.00ml，运行中由 machine 层变量保存，便于上位机参数帧修改。 */
+/* 自动排气/冲洗默认 10.00ml；单独远控排气/冲洗只覆盖本次流程。 */
 #define MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100   1000U
 #define MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100     1000U
 /*
@@ -168,8 +168,12 @@ static uint32_t machine_combo_water_per_bottle_ul = 0U;
 static uint32_t machine_combo_pump1_remaining_ul = 0U;
 static uint32_t machine_combo_pump1_segment_ul = 0U;
 static uint32_t machine_combo_post_volume_ul = 0U;
-static uint16_t machine_exhaust_volume_ml_x100 = MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100;
-static uint16_t machine_flush_volume_ml_x100 = MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100;
+static uint16_t machine_default_exhaust_volume_ml_x100 = MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100;
+static uint16_t machine_default_flush_volume_ml_x100 = MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100;
+static uint16_t machine_active_exhaust_volume_ml_x100 = MACHINE_DEFAULT_EXHAUST_VOLUME_ML_X100;
+static uint16_t machine_active_flush_volume_ml_x100 = MACHINE_DEFAULT_FLUSH_VOLUME_ML_X100;
+static uint8_t machine_active_auto_exhaust = 1U;
+static uint8_t machine_active_auto_flush = 0U;
 static MachineComboUtilityMode_e machine_combo_utility_mode = MACHINE_COMBO_UTILITY_NONE;
 static uint8_t machine_combo_prepare_finished = 0U;
 static uint16_t machine_combo_final_conc_x1000 = 0U;
@@ -216,6 +220,12 @@ static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100);
 static uint8_t Machine_CalcDispenseProgressPercent(uint32_t done_ul, uint32_t target_ul);
 static uint32_t Machine_VolumeMlX100ToUl(uint16_t volume_ml_x100);
 static uint16_t Machine_VolumeUlToMlX100(uint32_t volume_ul);
+static void Machine_SetActivePipeConfig(uint16_t exhaust_volume_x100,
+                                        uint16_t flush_volume_x100,
+                                        uint8_t auto_exhaust,
+                                        uint8_t auto_flush);
+static void Machine_SetActivePipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100);
+static void Machine_UseDefaultPipeVolumes(void);
 static uint32_t Machine_GetExhaustVolumeUl(void);
 static uint32_t Machine_GetFlushVolumeUl(void);
 static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul);
@@ -258,7 +268,10 @@ static void Machine_PauseDirectDispense(void);
 static void Machine_ResumeDirectDispense(void);
 static uint8_t Machine_StartDirectDispenseSegment(void);
 static uint8_t Machine_StartDirectFlush(void);
-static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner);
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100,
+                                        MachineFlowOwner_e owner,
+                                        uint16_t flush_volume_x100,
+                                        uint8_t auto_flush);
 static void Machine_UpdateDirectDispense(void);
 static void Machine_BeginActivityWait(void);
 static MachineActivityWaitResult_e Machine_UpdateActivityWait(uint32_t stable_delay_ms);
@@ -394,17 +407,17 @@ static uint32_t Machine_CalcPrepareWaterPerBottleUl(uint8_t bottle_count,
  */
 static uint16_t Machine_CalcConcentrationFromActivity(uint16_t activity_x100)
 {
-    uint16_t capacity_ml_x100 = Machine_GetPrepCapacityMlX100();
+    uint16_t volume_ml_x100 = Machine_GetPreparedVolumeMlX100();
     uint32_t conc_x1000;
 
-    if (capacity_ml_x100 == 0U)
+    if (volume_ml_x100 == 0U)
     {
         return 0U;
     }
 
     conc_x1000 = (((uint32_t)activity_x100 * 1000U) +
-                  (capacity_ml_x100 / 2U)) /
-                 capacity_ml_x100;
+                  (volume_ml_x100 / 2U)) /
+                 volume_ml_x100;
     if (conc_x1000 > 0xFFFFU)
     {
         conc_x1000 = 0xFFFFU;
@@ -447,14 +460,36 @@ static uint32_t Machine_VolumeMlX100ToUl(uint16_t volume_ml_x100)
     return (uint32_t)volume_ml_x100 * 10UL;
 }
 
+static void Machine_SetActivePipeConfig(uint16_t exhaust_volume_x100,
+                                        uint16_t flush_volume_x100,
+                                        uint8_t auto_exhaust,
+                                        uint8_t auto_flush)
+{
+    machine_active_exhaust_volume_ml_x100 = exhaust_volume_x100;
+    machine_active_flush_volume_ml_x100 = flush_volume_x100;
+    machine_active_auto_exhaust = (auto_exhaust != 0U) ? 1U : 0U;
+    machine_active_auto_flush = (auto_flush != 0U) ? 1U : 0U;
+}
+
+static void Machine_SetActivePipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100)
+{
+    Machine_SetActivePipeConfig(exhaust_volume_x100, flush_volume_x100, 1U, 0U);
+}
+
+static void Machine_UseDefaultPipeVolumes(void)
+{
+    Machine_SetActivePipeVolumes(machine_default_exhaust_volume_ml_x100,
+                                 machine_default_flush_volume_ml_x100);
+}
+
 static uint32_t Machine_GetExhaustVolumeUl(void)
 {
-    return Machine_VolumeMlX100ToUl(machine_exhaust_volume_ml_x100);
+    return Machine_VolumeMlX100ToUl(machine_active_exhaust_volume_ml_x100);
 }
 
 static uint32_t Machine_GetFlushVolumeUl(void)
 {
-    return Machine_VolumeMlX100ToUl(machine_flush_volume_ml_x100);
+    return Machine_VolumeMlX100ToUl(machine_active_flush_volume_ml_x100);
 }
 
 static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t total_ul)
@@ -494,7 +529,7 @@ static uint16_t Machine_EstimatePumpProgressMlX100(PumpDrive_s *pump, uint32_t t
 
 static void Machine_UpdateFlushUiProgress(uint16_t done_ml_x100)
 {
-    uint16_t total_ml_x100 = machine_flush_volume_ml_x100;
+    uint16_t total_ml_x100 = machine_active_flush_volume_ml_x100;
 
     if (done_ml_x100 > total_ml_x100)
     {
@@ -567,7 +602,7 @@ static void Machine_UpdatePrepUiForState(MachineComboState_e state)
             break;
 
         case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
-            Machine_UpdateFlushUiProgress(machine_flush_volume_ml_x100);
+            Machine_UpdateFlushUiProgress(machine_active_flush_volume_ml_x100);
             break;
 
         default:
@@ -649,7 +684,7 @@ static void Machine_UpdatePrepUiForState(MachineComboState_e state)
         break;
 
     case MACHINE_COMBO_STATE_GAP_AFTER_FLUSH:
-        Machine_UpdateFlushUiProgress(machine_flush_volume_ml_x100);
+        Machine_UpdateFlushUiProgress(machine_active_flush_volume_ml_x100);
         break;
 
     default:
@@ -750,10 +785,6 @@ static uint16_t Machine_GetPreparedVolumeMlX100(void)
     if ((machine_combo_owner == MACHINE_FLOW_OWNER_REMOTE) &&
         (machine_combo_remote_volume_valid != 0U))
     {
-        if (machine_combo_remote_final_ml_x100 > capacity_ml_x100)
-        {
-            return capacity_ml_x100;
-        }
         return machine_combo_remote_final_ml_x100;
     }
 
@@ -914,12 +945,12 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
         else if (step == COMMUNICATION_STEP_EXHAUST_DONE)
         {
             process_id = COMMUNICATION_PROCESS_EXHAUST;
-            process_detail = machine_exhaust_volume_ml_x100;
+            process_detail = machine_active_exhaust_volume_ml_x100;
         }
         else if (step == COMMUNICATION_STEP_FLUSH_DONE)
         {
             process_id = COMMUNICATION_PROCESS_FLUSH;
-            process_detail = machine_flush_volume_ml_x100;
+            process_detail = machine_active_flush_volume_ml_x100;
         }
         else
         {
@@ -1583,6 +1614,8 @@ static void Machine_StartCombo(uint16_t current_conc_x1000,
                                uint16_t target_conc_x1000,
                                MachineFlowOwner_e owner)
 {
+    Machine_UseDefaultPipeVolumes();
+
     machine_combo_owner = owner;
     machine_combo_current_conc_x1000 = current_conc_x1000;
     machine_combo_current_ml_x100 = current_ml_x100;
@@ -1678,6 +1711,8 @@ static void Machine_StartUtility(MachineComboUtilityMode_e utility_mode,
  */
 static void Machine_StartLocalExhaust(void)
 {
+    Machine_UseDefaultPipeVolumes();
+
     Machine_StartUtility(MACHINE_COMBO_UTILITY_EXHAUST_ONLY,
                          MACHINE_COMBO_STATE_EXHAUST_VALVE_ON,
                          MACHINE_FLOW_OWNER_LOCAL,
@@ -1690,6 +1725,8 @@ static void Machine_StartLocalExhaust(void)
  */
 static void Machine_StartLocalEmpty(void)
 {
+    Machine_UseDefaultPipeVolumes();
+
     Machine_StartUtility(MACHINE_COMBO_UTILITY_EMPTY_ONLY,
                          MACHINE_COMBO_STATE_FLUSH_VALVE_ON,
                          MACHINE_FLOW_OWNER_LOCAL,
@@ -1715,6 +1752,7 @@ static void Machine_StartResetRecovery(void)
         Machine_AbortDirectDispense();
     }
 
+    Machine_UseDefaultPipeVolumes();
     MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_ABORTING, 0U, 0U);
     Machine_StartUtility(MACHINE_COMBO_UTILITY_RESET_RECOVERY,
                          MACHINE_COMBO_STATE_FLUSH_VALVE_ON,
@@ -1743,6 +1781,8 @@ static void Machine_StartLocalPrepare(uint8_t bottle_count,
     {
         return;
     }
+
+    Machine_UseDefaultPipeVolumes();
 
     machine_combo_owner = MACHINE_FLOW_OWNER_LOCAL;
     machine_combo_current_conc_x1000 = 0U;
@@ -2048,7 +2088,18 @@ static void Machine_UpdateCombo(void)
              * 配药完成后的排气属于整机工艺收尾动作。
              * 远控 processId=1 和本机配药保持一致，不要求上位机额外发送排气命令。
              */
-            Machine_EnterComboState(MACHINE_COMBO_STATE_EXHAUST_VALVE_ON);
+            if (machine_active_auto_exhaust != 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_EXHAUST_VALVE_ON);
+            }
+            else if (machine_active_auto_flush != 0U)
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            }
         }
         else if ((activity_wait == MACHINE_ACTIVITY_WAIT_ERROR) &&
                  (machine_combo_owner != MACHINE_FLOW_OWNER_LOCAL))
@@ -2154,7 +2205,15 @@ static void Machine_UpdateCombo(void)
     case MACHINE_COMBO_STATE_GAP_AFTER_EXHAUST:
         if (elapsed_ms >= MACHINE_COMBO_STEP_GAP_MS)
         {
-            Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            if ((machine_combo_utility_mode == MACHINE_COMBO_UTILITY_NONE) &&
+                (machine_active_auto_flush != 0U))
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FLUSH_VALVE_ON);
+            }
+            else
+            {
+                Machine_EnterComboState(MACHINE_COMBO_STATE_FINISHED);
+            }
         }
         break;
 
@@ -2473,8 +2532,9 @@ void Machine_ClearRemoteStepHold(void)
 
 void Machine_SetPipeVolumes(uint16_t exhaust_volume_x100, uint16_t flush_volume_x100)
 {
-    machine_exhaust_volume_ml_x100 = exhaust_volume_x100;
-    machine_flush_volume_ml_x100 = flush_volume_x100;
+    machine_default_exhaust_volume_ml_x100 = exhaust_volume_x100;
+    machine_default_flush_volume_ml_x100 = flush_volume_x100;
+    Machine_UseDefaultPipeVolumes();
 }
 
 /**
@@ -2517,15 +2577,23 @@ static void Machine_ResumeDirectDispense(void)
  *
  * @param dispense_ml_x100 发药体积，单位 0.01ml。
  */
-static void Machine_StartDirectDispense(uint16_t dispense_ml_x100, MachineFlowOwner_e owner)
+static void Machine_StartDirectDispense(uint16_t dispense_ml_x100,
+                                        MachineFlowOwner_e owner,
+                                        uint16_t flush_volume_x100,
+                                        uint8_t auto_flush)
 {
+    Machine_SetActivePipeConfig(machine_default_exhaust_volume_ml_x100,
+                                flush_volume_x100,
+                                0U,
+                                auto_flush);
+
     machine_direct_dispense_owner = owner;
     machine_direct_dispense_ml_x100 = dispense_ml_x100;
     machine_direct_dispense_ul = 0U;
     machine_direct_dispense_remaining_ul = 0U;
     machine_direct_dispense_segment_ul = 0U;
     machine_direct_dispense_done_ul = 0U;
-    machine_direct_flush_ul = Machine_GetFlushVolumeUl();
+    machine_direct_flush_ul = (auto_flush != 0U) ? Machine_GetFlushVolumeUl() : 0U;
     machine_dispense_progress_percent = 0U;
     machine_direct_dispense_paused = 0U;
     machine_direct_dispense_pause_start_ms = 0U;
@@ -2734,6 +2802,7 @@ void MachineInit(void)
     machine_activity_wait_active = 0U;
     machine_activity_wait_started = 0U;
 
+    Machine_UseDefaultPipeVolumes();
     Machine_StopComboOutputs();
 }
 
@@ -2808,14 +2877,20 @@ void MachineControl(void)
     if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumeLocalDispenseStartRequested(&dispense_ml_x100) != 0U))
     {
-        Machine_StartDirectDispense(dispense_ml_x100, MACHINE_FLOW_OWNER_LOCAL);
+        Machine_StartDirectDispense(dispense_ml_x100,
+                                    MACHINE_FLOW_OWNER_LOCAL,
+                                    machine_default_flush_volume_ml_x100,
+                                    1U);
         return;
     }
 
     if ((machine_combo_running == 0U) &&
         (MachineCMD_ConsumeDispenseConfirmed(&dispense_ml_x100) != 0U))
     {
-        Machine_StartDirectDispense(dispense_ml_x100, MACHINE_FLOW_OWNER_LOCAL);
+        Machine_StartDirectDispense(dispense_ml_x100,
+                                    MACHINE_FLOW_OWNER_LOCAL,
+                                    machine_default_flush_volume_ml_x100,
+                                    1U);
         return;
     }
 
@@ -2861,7 +2936,6 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
                                    uint8_t seq)
 {
     uint16_t current_ml_x100 = 0U;
-    uint16_t capacity_ml_x100 = Machine_GetPrepCapacityMlX100();
 
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running == 0U) ||
@@ -2869,8 +2943,8 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
         (machine_combo_state != MACHINE_COMBO_STATE_WAIT_REMOTE_PREPARE) ||
         (machine_direct_dispense_running != 0U) ||
         (machine_transfer_done == 0U) ||
-        (final_volume_x100 == 0U) ||
-        (final_volume_x100 > capacity_ml_x100) ||
+        (final_volume_x100 > COMMUNICATION_PREP_FINAL_VOLUME_MAX_X100) ||
+        ((final_volume_x100 % COMMUNICATION_PREP_FINAL_VOLUME_STEP_X100) != 0U) ||
         (target_conc_x1000 == 0U))
     {
         return 0U;
@@ -2880,6 +2954,8 @@ uint8_t Machine_StartRemotePrepare(uint16_t water_volume_x100,
     {
         current_ml_x100 = final_volume_x100 - water_volume_x100;
     }
+
+    Machine_UseDefaultPipeVolumes();
 
     machine_combo_remote_water_ml_x100 = water_volume_x100;
     machine_combo_remote_final_ml_x100 = final_volume_x100;
@@ -2907,17 +2983,20 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
                                            uint16_t final_volume_x100,
                                            uint16_t initial_activity_x100,
                                            uint16_t target_conc_x1000,
+                                           uint16_t pipe_exhaust_volume_x100,
+                                           uint16_t pipe_flush_volume_x100,
+                                           uint8_t auto_exhaust,
+                                           uint8_t auto_flush,
                                            uint8_t seq)
 {
     uint8_t effective_count;
-    uint16_t capacity_ml_x100 = Machine_GetPrepCapacityMlX100();
     uint32_t water_total_ul;
 
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
         (machine_direct_dispense_running != 0U) ||
-        (final_volume_x100 == 0U) ||
-        (final_volume_x100 > capacity_ml_x100))
+        (final_volume_x100 > COMMUNICATION_PREP_FINAL_VOLUME_MAX_X100) ||
+        ((final_volume_x100 % COMMUNICATION_PREP_FINAL_VOLUME_STEP_X100) != 0U))
     {
         return 0U;
     }
@@ -2929,6 +3008,11 @@ uint8_t Machine_StartRemotePrepareByBottle(uint16_t bottle1_ml_x100,
     {
         return 0U;
     }
+
+    Machine_SetActivePipeConfig(pipe_exhaust_volume_x100,
+                                pipe_flush_volume_x100,
+                                auto_exhaust,
+                                auto_flush);
 
     water_total_ul = (uint32_t)water_volume_x100 * 10U;
 
@@ -3004,7 +3088,10 @@ uint8_t Machine_IsTransferToActivityDone(void)
     return (machine_transfer_done != 0U) ? 1U : 0U;
 }
 
-uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq)
+uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100,
+                                    uint16_t flush_volume_x100,
+                                    uint8_t auto_flush,
+                                    uint8_t seq)
 {
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
@@ -3016,11 +3103,14 @@ uint8_t Machine_StartRemoteDispense(uint16_t volume_ml_x100, uint8_t seq)
 
     machine_direct_dispense_seq = seq;
     machine_remote_dispense_done_until_ms = 0U;
-    Machine_StartDirectDispense(volume_ml_x100, MACHINE_FLOW_OWNER_REMOTE);
+    Machine_StartDirectDispense(volume_ml_x100,
+                                MACHINE_FLOW_OWNER_REMOTE,
+                                flush_volume_x100,
+                                auto_flush);
     return 1U;
 }
 
-uint8_t Machine_StartRemoteFlush(uint8_t seq)
+uint8_t Machine_StartRemoteFlush(uint16_t flush_volume_x100, uint8_t seq)
 {
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
@@ -3029,6 +3119,10 @@ uint8_t Machine_StartRemoteFlush(uint8_t seq)
         return 0U;
     }
 
+    Machine_SetActivePipeConfig(machine_default_exhaust_volume_ml_x100,
+                                flush_volume_x100,
+                                0U,
+                                1U);
     Machine_StartUtility(MACHINE_COMBO_UTILITY_EMPTY_ONLY,
                          MACHINE_COMBO_STATE_FLUSH_VALVE_ON,
                          MACHINE_FLOW_OWNER_REMOTE,
@@ -3037,7 +3131,7 @@ uint8_t Machine_StartRemoteFlush(uint8_t seq)
     return 1U;
 }
 
-uint8_t Machine_StartRemoteExhaust(uint8_t seq)
+uint8_t Machine_StartRemoteExhaust(uint16_t exhaust_volume_x100, uint8_t seq)
 {
     if ((Communication_GetControlMode() != COMMUNICATION_CONTROL_REMOTE) ||
         (machine_combo_running != 0U) ||
@@ -3046,6 +3140,10 @@ uint8_t Machine_StartRemoteExhaust(uint8_t seq)
         return 0U;
     }
 
+    Machine_SetActivePipeConfig(exhaust_volume_x100,
+                                machine_default_flush_volume_ml_x100,
+                                1U,
+                                0U);
     Machine_StartUtility(MACHINE_COMBO_UTILITY_EXHAUST_ONLY,
                          MACHINE_COMBO_STATE_EXHAUST_VALVE_ON,
                          MACHINE_FLOW_OWNER_REMOTE,

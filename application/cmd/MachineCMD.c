@@ -47,6 +47,7 @@
 #define MACHINE_CMD_ACTIVITY_PUSH_SEQ      0U
 #define MACHINE_CMD_PREP_MAX_BOTTLE_COUNT 2U
 #define MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT 3U
+#define MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100 1000U
 #define MACHINE_CMD_MANUAL_WATER_MASK (MACHINE_CMD_MANUAL_WATER_IN | MACHINE_CMD_MANUAL_WATER_OUT)
 #define MACHINE_CMD_MANUAL_MED_MASK   (MACHINE_CMD_MANUAL_MED_IN | MACHINE_CMD_MANUAL_MED_OUT)
 #define MACHINE_CMD_DEBUG_JOG_DISTANCE_MM_X100 100U
@@ -144,6 +145,10 @@ typedef struct
     uint16_t remote_prepare_bottle_volume_x100[MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT]; // 远程药瓶量1/2/3，单位 0.01ml
     uint16_t remote_pipe_exhaust_volume_x100;              // 远程配置排气量，单位 0.01ml
     uint16_t remote_pipe_flush_volume_x100;                // 远程配置冲洗量，单位 0.01ml
+    uint16_t remote_prepare_pipe_exhaust_volume_x100;
+    uint16_t remote_prepare_pipe_flush_volume_x100;
+    uint16_t remote_dispense_pipe_exhaust_volume_x100;
+    uint16_t remote_dispense_pipe_flush_volume_x100;
     uint16_t remote_remain_volume_x100;                    // 远程下发当前余量体积，单位 0.01ml
     uint16_t remote_remain_conc_x1000;                     // 远程下发当前余量浓度，单位 0.001mCi/ml
     uint16_t remote_dispense_volume_x100;                  // 远程发药体积，单位 0.01ml
@@ -154,6 +159,10 @@ typedef struct
     /* 远程排气/冲洗参数标志位。 */
     uint8_t remote_pipe_flags;
     uint8_t remote_pipe_param_ready;                       // 已收到 PIPE_PARAM
+    uint8_t remote_prepare_pipe_auto_exhaust;
+    uint8_t remote_prepare_pipe_auto_flush;
+    uint8_t remote_dispense_pipe_auto_exhaust;
+    uint8_t remote_dispense_pipe_auto_flush;
     /* 远程余量参数标志位。 */
     uint8_t remote_remain_flags;
     uint8_t remote_remain_param_ready;                     // 已收到 REMAIN_PARAM
@@ -189,6 +198,10 @@ static void MachineCMD_EnterPage(MachineCmdPage_e page);
 static void MachineCMD_TryEnterDispSettingPage(uint8_t allow_direct_dispense);
 static void MachineCMD_ClearInput(void);
 static void MachineCMD_ResetPrepUi(void);
+static void MachineCMD_ResetRemotePipeConfigs(void);
+static void MachineCMD_ApplyRemotePipeParam(uint16_t exhaust_volume_x100,
+                                            uint16_t flush_volume_x100,
+                                            uint8_t flags);
 static uint8_t MachineCMD_ShouldShowAbortOnReset(void);
 static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit);
 static uint8_t MachineCMD_IsNumberKey(KeypadState_e key);
@@ -295,8 +308,54 @@ void MachineCMD_Init(void)
     machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
     machine_cmd.remote_enabled = 0U;
     machine_cmd.remote_paused = 0U;
+    MachineCMD_ResetRemotePipeConfigs();
     MachineCMD_ResetPrepUi();
     MachineCMD_ClearManualSwitches();
+}
+
+static void MachineCMD_ResetRemotePipeConfigs(void)
+{
+    machine_cmd.remote_pipe_exhaust_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_pipe_flush_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_prepare_pipe_exhaust_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_prepare_pipe_flush_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_dispense_pipe_exhaust_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_dispense_pipe_flush_volume_x100 = MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100;
+    machine_cmd.remote_prepare_pipe_auto_exhaust = 1U;
+    machine_cmd.remote_prepare_pipe_auto_flush = 1U;
+    machine_cmd.remote_dispense_pipe_auto_exhaust = 1U;
+    machine_cmd.remote_dispense_pipe_auto_flush = 1U;
+    machine_cmd.remote_pipe_flags = 0U;
+    machine_cmd.remote_pipe_param_ready = 0U;
+}
+
+static void MachineCMD_ApplyRemotePipeParam(uint16_t exhaust_volume_x100,
+                                            uint16_t flush_volume_x100,
+                                            uint8_t flags)
+{
+    uint8_t auto_exhaust = ((flags & COMMUNICATION_PIPE_FLAG_AUTO_EXHAUST) != 0U) ? 1U : 0U;
+    uint8_t auto_flush = ((flags & COMMUNICATION_PIPE_FLAG_AUTO_FLUSH) != 0U) ? 1U : 0U;
+
+    machine_cmd.remote_pipe_exhaust_volume_x100 = exhaust_volume_x100;
+    machine_cmd.remote_pipe_flush_volume_x100 = flush_volume_x100;
+    machine_cmd.remote_pipe_flags = flags;
+    machine_cmd.remote_pipe_param_ready = 1U;
+
+    if ((flags & COMMUNICATION_PIPE_FLAG_SCOPE_PREPARE) != 0U)
+    {
+        machine_cmd.remote_prepare_pipe_exhaust_volume_x100 = exhaust_volume_x100;
+        machine_cmd.remote_prepare_pipe_flush_volume_x100 = flush_volume_x100;
+        machine_cmd.remote_prepare_pipe_auto_exhaust = auto_exhaust;
+        machine_cmd.remote_prepare_pipe_auto_flush = auto_flush;
+    }
+
+    if ((flags & COMMUNICATION_PIPE_FLAG_SCOPE_DISPENSE) != 0U)
+    {
+        machine_cmd.remote_dispense_pipe_exhaust_volume_x100 = exhaust_volume_x100;
+        machine_cmd.remote_dispense_pipe_flush_volume_x100 = flush_volume_x100;
+        machine_cmd.remote_dispense_pipe_auto_exhaust = auto_exhaust;
+        machine_cmd.remote_dispense_pipe_auto_flush = auto_flush;
+    }
 }
 
 /**
@@ -2268,7 +2327,7 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
         machine_cmd.remote_prepare_param_ready = 0U;
         machine_cmd.remote_prepare_volume_ready = 0U;
         machine_cmd.remote_prepare_bottle_ready = 0U;
-        machine_cmd.remote_pipe_param_ready = 0U;
+        MachineCMD_ResetRemotePipeConfigs();
         machine_cmd.remote_dispense_param_ready = 0U;
         machine_cmd.activity_request_pending = 0U;
         machine_cmd.activity_request_started = 0U;
@@ -2637,12 +2696,25 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
         break;
 
     case COMMUNICATION_OBJ_PREPARE_VOLUME_PARAM:
-        machine_cmd.remote_prepare_water_volume_x100 =
-            Communication_ReadU16LE(&command->data[2]);
-        machine_cmd.remote_prepare_final_volume_x100 =
-            Communication_ReadU16LE(&command->data[4]);
-        machine_cmd.remote_prepare_volume_ready = 1U;
+    {
+        uint16_t final_volume_x100 = Communication_ReadU16LE(&command->data[4]);
+
+        if ((final_volume_x100 > COMMUNICATION_PREP_FINAL_VOLUME_MAX_X100) ||
+            ((final_volume_x100 % COMMUNICATION_PREP_FINAL_VOLUME_STEP_X100) != 0U))
+        {
+            machine_cmd.remote_prepare_volume_ready = 0U;
+            result = COMMUNICATION_RESULT_BAD_PARAM;
+            error = COMMUNICATION_ERROR_BAD_PARAM;
+        }
+        else
+        {
+            machine_cmd.remote_prepare_water_volume_x100 =
+                Communication_ReadU16LE(&command->data[2]);
+            machine_cmd.remote_prepare_final_volume_x100 = final_volume_x100;
+            machine_cmd.remote_prepare_volume_ready = 1U;
+        }
         break;
+    }
 
     case COMMUNICATION_OBJ_PREPARE_BOTTLE_PARAM:
         machine_cmd.remote_prepare_bottle_volume_x100[0] =
@@ -2658,14 +2730,9 @@ static void MachineCMD_HandleRemoteSetParam(const CommunicationHostCommand_s *co
         break;
 
     case COMMUNICATION_OBJ_PIPE_PARAM:
-        machine_cmd.remote_pipe_exhaust_volume_x100 =
-            Communication_ReadU16LE(&command->data[2]);
-        machine_cmd.remote_pipe_flush_volume_x100 =
-            Communication_ReadU16LE(&command->data[4]);
-        machine_cmd.remote_pipe_flags = command->data[7];
-        machine_cmd.remote_pipe_param_ready = 1U;
-        Machine_SetPipeVolumes(machine_cmd.remote_pipe_exhaust_volume_x100,
-                               machine_cmd.remote_pipe_flush_volume_x100);
+        MachineCMD_ApplyRemotePipeParam(Communication_ReadU16LE(&command->data[2]),
+                                        Communication_ReadU16LE(&command->data[4]),
+                                        command->data[7]);
         break;
 
     case COMMUNICATION_OBJ_REMAIN_PARAM:
@@ -2754,6 +2821,10 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
                                                     machine_cmd.remote_prepare_final_volume_x100,
                                                     machine_cmd.remote_prepare_initial_activity_x100,
                                                     machine_cmd.remote_prepare_target_conc_x1000,
+                                                    machine_cmd.remote_prepare_pipe_exhaust_volume_x100,
+                                                    machine_cmd.remote_prepare_pipe_flush_volume_x100,
+                                                    machine_cmd.remote_prepare_pipe_auto_exhaust,
+                                                    machine_cmd.remote_prepare_pipe_auto_flush,
                                                     command->seq) != 0U)
         {
             machine_cmd.remote_prepare_param_ready = 0U;
@@ -2775,6 +2846,8 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
             error = COMMUNICATION_ERROR_BAD_PARAM;
         }
         else if (Machine_StartRemoteDispense(machine_cmd.remote_dispense_volume_x100,
+                                             machine_cmd.remote_dispense_pipe_flush_volume_x100,
+                                             machine_cmd.remote_dispense_pipe_auto_flush,
                                              command->seq) != 0U)
         {
             machine_cmd.remote_dispense_param_ready = 0U;
@@ -2801,7 +2874,17 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
     }
     else if (process_id == COMMUNICATION_PROCESS_FLUSH)
     {
-        if (Machine_StartRemoteFlush(command->seq) == 0U)
+        if (machine_cmd.remote_pipe_param_ready == 0U)
+        {
+            result = COMMUNICATION_RESULT_BAD_PARAM;
+            error = COMMUNICATION_ERROR_BAD_PARAM;
+        }
+        else if (Machine_StartRemoteFlush(machine_cmd.remote_pipe_flush_volume_x100,
+                                          command->seq) != 0U)
+        {
+            machine_cmd.remote_pipe_param_ready = 0U;
+        }
+        else
         {
             result = COMMUNICATION_RESULT_BUSY;
             error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;
@@ -2809,7 +2892,17 @@ static void MachineCMD_HandleRemoteStartProcess(const CommunicationHostCommand_s
     }
     else if (process_id == COMMUNICATION_PROCESS_EXHAUST)
     {
-        if (Machine_StartRemoteExhaust(command->seq) == 0U)
+        if (machine_cmd.remote_pipe_param_ready == 0U)
+        {
+            result = COMMUNICATION_RESULT_BAD_PARAM;
+            error = COMMUNICATION_ERROR_BAD_PARAM;
+        }
+        else if (Machine_StartRemoteExhaust(machine_cmd.remote_pipe_exhaust_volume_x100,
+                                            command->seq) != 0U)
+        {
+            machine_cmd.remote_pipe_param_ready = 0U;
+        }
+        else
         {
             result = COMMUNICATION_RESULT_BUSY;
             error = COMMUNICATION_ERROR_STATE_NOT_ALLOWED;

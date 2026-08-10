@@ -102,8 +102,14 @@
 #define COMMUNICATION_AUTH_FLAGS_NONE            0x00U
 
 /** 0x101 / PIPE_PARAM Byte7 标志位。 */
-#define COMMUNICATION_PIPE_FLAG_SAVE              0x01U
-#define COMMUNICATION_PIPE_FLAG_APPLY_NOW         0x02U
+#define COMMUNICATION_PIPE_FLAG_SCOPE_PREPARE     0x01U
+#define COMMUNICATION_PIPE_FLAG_SCOPE_DISPENSE    0x02U
+#define COMMUNICATION_PIPE_FLAG_AUTO_EXHAUST      0x04U
+#define COMMUNICATION_PIPE_FLAG_AUTO_FLUSH        0x08U
+
+/** 0x101 / PREPARE_VOLUME_PARAM 最终总体积范围及步进，单位 0.01ml。 */
+#define COMMUNICATION_PREP_FINAL_VOLUME_MAX_X100  60000U
+#define COMMUNICATION_PREP_FINAL_VOLUME_STEP_X100 100U
 
 /** 0x101 / REMAIN_PARAM Byte7 标志位。 */
 #define COMMUNICATION_REMAIN_FLAG_PRESENT         0x01U
@@ -420,7 +426,7 @@ typedef struct
 {
     uint16_t exhaust_volume_x100; /**< 排气量，单位 0.01ml。 */
     uint16_t flush_volume_x100;   /**< 冲洗量，单位 0.01ml。 */
-    uint8_t flags;                /**< 保存及立即生效标志。 */
+    uint8_t flags;                /**< 作用范围及自动排气/冲洗标志。 */
     uint8_t seq;                  /**< 上位机参数帧序号。 */
 } CommunicationPipeParam_s;
 
