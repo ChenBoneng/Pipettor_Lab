@@ -24,7 +24,7 @@ typedef enum
     KEYPAD_STATE_NUM_0 = 6U,             // 数字 0
 
     KEYPAD_STATE_FAULT = 7U,             // 故障
-    KEYPAD_STATE_DRAW_MEDICINE = 8U,     // 抽药/抽水，调试模式下作为抽水泵开关
+    KEYPAD_STATE_DRAW_MEDICINE = 8U,     // 抽药/抽水，设备调试页中翻转抽水泵开关
     KEYPAD_STATE_PREPARE_MEDICINE = 9U,  // 配药
     KEYPAD_STATE_SEND_MEDICINE = 10U,    // 发药
     KEYPAD_STATE_EXHAUST_FIXED = 11U,    // 定量排气
@@ -32,13 +32,13 @@ typedef enum
 
     KEYPAD_STATE_INSERT_NEEDLE = 13U,    // 插针
     KEYPAD_STATE_RETRACT_NEEDLE = 14U,   // 收针
-    KEYPAD_STATE_NUM_4 = 15U,            // 数字 4，手动调试模式下为水出
-    KEYPAD_STATE_NUM_5 = 16U,            // 数字 5，手动调试模式下为药出
+    KEYPAD_STATE_NUM_4 = 15U,            // 数字 4，设备调试页中控制泵1排出
+    KEYPAD_STATE_NUM_5 = 16U,            // 数字 5，设备调试页中控制泵2排出
     KEYPAD_STATE_NUM_6 = 17U,            // 数字 6
     KEYPAD_STATE_DOT = 18U,              // 小数点 .
 
-    KEYPAD_STATE_NUM_1 = 21U,            // 数字 1,手动调试模式下为水进
-    KEYPAD_STATE_NUM_2 = 22U,            // 数字 2，手动调试模式下为药进
+    KEYPAD_STATE_NUM_1 = 21U,            // 数字 1，设备调试页中控制泵1吸入
+    KEYPAD_STATE_NUM_2 = 22U,            // 数字 2，设备调试页中控制泵2吸入
     KEYPAD_STATE_NUM_3 = 23U,            // 数字 3
     KEYPAD_STATE_CLEAR_INPUT = 24U,      // 清除
     KEYPAD_STATE_RESET = 25U,            // 复位

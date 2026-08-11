@@ -63,7 +63,7 @@ uint8_t SolenoidValve_SetState(SolenoidValveId_e valve, SolenoidValveState_e sta
  *
  * @param valve 电磁阀编号，取值见 SolenoidValveId_e。
  *
- * @note 本函数不受 30ms 响应等待限制，适合急停、退出手动调试和异常复位。
+ * @note 本函数不受 30ms 响应等待限制，适合急停、退出设备调试和异常复位。
  */
 void SolenoidValve_Off(SolenoidValveId_e valve);
 

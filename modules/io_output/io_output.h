@@ -58,7 +58,7 @@ uint8_t IoOutput_Set(IoOutputId_e output, IoOutputState_e state);
 /**
  * @brief 关闭全部 24V 功率输出。
  *
- * @note 适合初始化、急停、退出手动调试等场景调用。
+ * @note 适合初始化、急停、退出设备调试等场景调用。
  */
 void IoOutput_AllOff(void);
 

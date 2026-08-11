@@ -48,8 +48,6 @@
 #define MACHINE_CMD_PREP_MAX_BOTTLE_COUNT 2U
 #define MACHINE_CMD_REMOTE_BOTTLE_PARAM_COUNT 3U
 #define MACHINE_CMD_DEFAULT_PIPE_VOLUME_ML_X100 1000U
-#define MACHINE_CMD_MANUAL_WATER_MASK (MACHINE_CMD_MANUAL_WATER_IN | MACHINE_CMD_MANUAL_WATER_OUT)
-#define MACHINE_CMD_MANUAL_MED_MASK   (MACHINE_CMD_MANUAL_MED_IN | MACHINE_CMD_MANUAL_MED_OUT)
 #define MACHINE_CMD_DEBUG_JOG_DISTANCE_MM_X100 100U
 #define MACHINE_CMD_DEBUG_JOG_SPEED_MM_S_X100 500U
 #define MACHINE_CMD_DEBUG_CLEAR_NEEDLE_MM_X100 12000U
@@ -68,19 +66,16 @@ typedef enum
 
 typedef enum
 {
-    MACHINE_CMD_MANUAL_ACTION_IDLE = 0,       // 空闲
-    MACHINE_CMD_MANUAL_ACTION_IN_TANK,        // 进罐导轨
-    MACHINE_CMD_MANUAL_ACTION_OUT_TANK,       // 出罐导轨
-    MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN,      // 插针
-    MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT,     // 收针
-    MACHINE_CMD_MANUAL_ACTION_DRAW_MED,       // 抽药
-    MACHINE_CMD_MANUAL_ACTION_EXHAUST,        // 定量排气
-    MACHINE_CMD_MANUAL_ACTION_REMOTE,         // 上位机远控
-    MACHINE_CMD_MANUAL_ACTION_WATER_IN,       // 水进
-    MACHINE_CMD_MANUAL_ACTION_MED_IN,         // 药进
-    MACHINE_CMD_MANUAL_ACTION_WATER_OUT,      // 水出
-    MACHINE_CMD_MANUAL_ACTION_MED_OUT,        // 药出
-} MachineCmdManualAction_e;
+    MACHINE_CMD_DEBUG_ACTION_IDLE = 0,
+    MACHINE_CMD_DEBUG_ACTION_TANK_FORWARD,
+    MACHINE_CMD_DEBUG_ACTION_TANK_BACKWARD,
+    MACHINE_CMD_DEBUG_ACTION_NEEDLE_FORWARD,
+    MACHINE_CMD_DEBUG_ACTION_NEEDLE_BACKWARD,
+    MACHINE_CMD_DEBUG_ACTION_PUMP1_IN,
+    MACHINE_CMD_DEBUG_ACTION_PUMP1_OUT,
+    MACHINE_CMD_DEBUG_ACTION_PUMP2_IN,
+    MACHINE_CMD_DEBUG_ACTION_PUMP2_OUT,
+} MachineCmdDebugAction_e;
 
 typedef enum
 {
@@ -106,7 +101,6 @@ typedef struct
 {
     MachineCmdPage_e page;                              // 当前 LCD 页面
     uint32_t boot_start_ms;                             // 开机页进入时间
-    uint8_t manual_switches;                            // 手动调试开关位
     uint32_t measure_start_ms;                           // 活度计测量页进入时间
     uint32_t dispense_done_start_ms;                     // 发药完成页开始保持 100% 的时间
     uint8_t dispense_done_holding;                       // 发药完成后正在保持 100% 页面
@@ -183,7 +177,7 @@ typedef struct
     uint32_t activity_reported_update_count;                // 已主动上报给上位机的最新解析计数
     MachineCmdPrepFocus_e prep_focus;                     // 配药设置页当前输入焦点
     char input[MACHINE_CMD_INPUT_MAX_LEN + 1U];          // 当前输入缓冲区
-    MachineCmdManualAction_e manual_action;              // 手动页当前动作说明
+    MachineCmdDebugAction_e debug_action;
     MachineCmdDebugState_e debug_state;
     StepMotorId_e debug_stepper;
     PumpDrive_s *debug_pump;
@@ -204,7 +198,6 @@ static void MachineCMD_ApplyRemotePipeParam(uint16_t exhaust_volume_x100,
                                             uint8_t flags);
 static uint8_t MachineCMD_ShouldShowAbortOnReset(void);
 static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit);
-static uint8_t MachineCMD_IsNumberKey(KeypadState_e key);
 static void MachineCMD_AppendDigit(uint8_t digit);
 static void MachineCMD_AppendDot(void);
 static uint16_t MachineCMD_InputToScaledValue(uint16_t scale);
@@ -219,7 +212,6 @@ static void MachineCMD_HandlePrepMeasureKey(KeypadState_e key);
 static void MachineCMD_HandleDispSettingKey(KeypadState_e key);
 static void MachineCMD_HandleDispRunningKey(KeypadState_e key);
 static void MachineCMD_HandleRemoteKey(KeypadState_e key);
-static void MachineCMD_HandleManualKey(KeypadState_e key);
 static void MachineCMD_HandleDebugKey(KeypadState_e key);
 static void MachineCMD_EnterDebugMode(void);
 static void MachineCMD_ExitDebugMode(void);
@@ -229,10 +221,6 @@ static uint8_t MachineCMD_StartDebugJog(StepMotorId_e motor, StepMotorDirection_
 static uint8_t MachineCMD_StartDebugClear(void);
 static uint8_t MachineCMD_StartDebugPump(PumpDrive_s *pump, MachineCmdDebugPumpAction_e action);
 static void MachineCMD_HandlePausedKey(KeypadState_e key);
-static void MachineCMD_SetManualAction(KeypadState_e key);
-static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask);
-static void MachineCMD_ClearManualSwitches(void);
-static void MachineCMD_ApplyManualOutputs(void);
 static void MachineCMD_PauseCurrentFlow(void);
 static void MachineCMD_EnterRemoteMode(void);
 static void MachineCMD_StopRemoteOutputs(void);
@@ -267,11 +255,9 @@ static void MachineCMD_ReportRemainIfDue(uint32_t now_ms);
 static uint8_t MachineCMD_LineAppendBytes(uint8_t *line, uint8_t offset, const uint8_t *data, uint8_t len);
 static uint8_t MachineCMD_LineAppendText(uint8_t *line, uint8_t offset, const MachineCmdText_s *text);
 static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const char *text);
-static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, uint8_t switch_mask);
 static void MachineCMD_WriteBytes(DisplayLcdRow_e row, const uint8_t *data, uint8_t len);
 static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *text);
 static void MachineCMD_FormatActivityAscii(char *buffer, uint8_t size, float value, const char *unit);
-static const MachineCmdText_s *MachineCMD_GetManualActionText(void);
 static void MachineCMD_ShowBootPage(void);
 static void MachineCMD_ShowReadyPage(void);
 static void MachineCMD_ShowStandbyPage(void);
@@ -281,7 +267,6 @@ static void MachineCMD_ShowPrepMeasurePage(void);
 static void MachineCMD_ShowDispSettingPage(void);
 static void MachineCMD_ShowDispRunningPage(void);
 static void MachineCMD_ShowRemotePage(void);
-static void MachineCMD_ShowManualPage(void);
 static void MachineCMD_ShowDebugPage(void);
 static void MachineCMD_ShowCleanPage(void);
 static void MachineCMD_ShowPausedPage(void);
@@ -294,7 +279,7 @@ static void MachineCMD_ShowAbortPage(void);
 /**
  * @brief 初始化 LCD/按键命令层。
  *
- * @note 本函数只初始化界面状态和手动调试输出状态，不负责初始化 LCD、
+ * @note 本函数只初始化界面状态，不负责初始化 LCD、
  *       键盘扫描或底层电机驱动。底层模块仍然由 AllTaskInit() 统一初始化。
  */
 void MachineCMD_Init(void)
@@ -305,12 +290,11 @@ void MachineCMD_Init(void)
     machine_cmd.boot_start_ms = MachineCMD_GetMs();
     machine_cmd.left_ml_x100 = 0U;
     machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
-    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
+    machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_IDLE;
     machine_cmd.remote_enabled = 0U;
     machine_cmd.remote_paused = 0U;
     MachineCMD_ResetRemotePipeConfigs();
     MachineCMD_ResetPrepUi();
-    MachineCMD_ClearManualSwitches();
 }
 
 static void MachineCMD_ResetRemotePipeConfigs(void)
@@ -362,8 +346,8 @@ static void MachineCMD_ApplyRemotePipeParam(uint16_t exhaust_volume_x100,
  * @brief 处理一次按键事件和页面状态跳转。
  *
  * @note 本函数不阻塞等待按键，只读取 Keypad_GetPressedState() 产生的一次性
- *       稳定按下事件。数字键在配药/发药设置页作为数值输入，在手动调试页
- *       作为水进、药进、水出、药出四个独立开关。
+ *       稳定按下事件。数字键在配药/发药设置页作为数值输入；在故障键进入的
+ *       设备调试页中，1/4 控制泵1吸入/排出，2/5 控制泵2吸入/排出。
  */
 void MachineCMD_Process(void)
 {
@@ -444,7 +428,7 @@ void MachineCMD_Process(void)
     /*
      * 复位键作为当前 UI 层的统一退出键：
      * - 清空当前数字输入；
-     * - 关闭手动调试输出；
+     * - 停止当前流程或调试输出；
      * - 回到待机看板。
      */
     if (key == KEYPAD_STATE_RESET)
@@ -470,7 +454,6 @@ void MachineCMD_Process(void)
          */
         Communication_OnLocalResetKey();
         MachineCMD_ClearInput();
-        MachineCMD_ClearManualSwitches();
         MachineCMD_StopRemoteOutputs();
         MachineCMD_ResetDebugState();
         machine_cmd.prep_confirmed = 0U;
@@ -527,10 +510,6 @@ void MachineCMD_Process(void)
 
     case MACHINE_CMD_PAGE_REMOTE:
         MachineCMD_HandleRemoteKey(key);
-        break;
-
-    case MACHINE_CMD_PAGE_MANUAL:
-        MachineCMD_HandleManualKey(key);
         break;
 
     case MACHINE_CMD_PAGE_DEBUG:
@@ -596,10 +575,6 @@ void MachineCMD_LCDTask(void)
         MachineCMD_ShowRemotePage();
         break;
 
-    case MACHINE_CMD_PAGE_MANUAL:
-        MachineCMD_ShowManualPage();
-        break;
-
     case MACHINE_CMD_PAGE_DEBUG:
         MachineCMD_ShowDebugPage();
         break;
@@ -627,16 +602,6 @@ void MachineCMD_LCDTask(void)
 MachineCmdPage_e MachineCMD_GetPage(void)
 {
     return machine_cmd.page;
-}
-
-/**
- * @brief 获取当前手动调试开关位。
- *
- * @return bit0=水进，bit1=药进，bit2=水出，bit3=药出。
- */
-uint8_t MachineCMD_GetManualSwitches(void)
-{
-    return machine_cmd.manual_switches;
 }
 
 /**
@@ -1111,19 +1076,6 @@ static uint8_t MachineCMD_KeyToDigit(KeypadState_e key, uint8_t *digit)
 }
 
 /**
- * @brief 判断按键是否属于数字键。
- *
- * @param key 当前按键功能枚举。
- * @return 1 表示数字键；0 表示非数字键。
- */
-static uint8_t MachineCMD_IsNumberKey(KeypadState_e key)
-{
-    uint8_t digit;
-
-    return MachineCMD_KeyToDigit(key, &digit);
-}
-
-/**
  * @brief 向当前输入缓存追加一个数字字符。
  *
  * @param digit 要追加的数字，范围 0~9。
@@ -1294,7 +1246,7 @@ static uint16_t MachineCMD_CalcInventoryActivityX100(uint16_t conc_x1000, uint16
  * @note 待机页只负责入口分流：
  *       - 配药键进入配药参数设置；
  *       - 发药键进入发药参数设置；
- *       - 动作类按键进入手动调试页。
+ *       - 故障键在安全条件满足时进入设备调试页。
  */
 static void MachineCMD_HandleStandbyKey(KeypadState_e key)
 {
@@ -1309,7 +1261,6 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
         break;
 
     case KEYPAD_STATE_CLEAR_ALL:
-        MachineCMD_ClearManualSwitches();
         machine_cmd.empty_requested = 1U;
         MachineCMD_SetPrepRunStage(MACHINE_CMD_PREP_RUN_STAGE_FLUSH, 0U, 0U);
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_CLEAN);
@@ -1327,23 +1278,6 @@ static void MachineCMD_HandleStandbyKey(KeypadState_e key)
 
     case KEYPAD_STATE_REMOTE:
         MachineCMD_EnterRemoteMode();
-        break;
-
-    case KEYPAD_STATE_NUM_1:
-    case KEYPAD_STATE_NUM_2:
-    case KEYPAD_STATE_NUM_4:
-    case KEYPAD_STATE_NUM_5:
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_MANUAL);
-        MachineCMD_HandleManualKey(key);
-        break;
-
-    case KEYPAD_STATE_IN_TANK:
-    case KEYPAD_STATE_OUT_TANK:
-    case KEYPAD_STATE_INSERT_NEEDLE:
-    case KEYPAD_STATE_RETRACT_NEEDLE:
-    case KEYPAD_STATE_DRAW_MEDICINE:
-        MachineCMD_SetManualAction(key);
-        MachineCMD_EnterPage(MACHINE_CMD_PAGE_MANUAL);
         break;
 
     default:
@@ -1578,50 +1512,6 @@ static void MachineCMD_HandleDispRunningKey(KeypadState_e key)
 }
 
 /**
- * @brief 处理手动调试页按键。
- *
- * @param key 当前一次性按下事件。
- *
- * @note 本页面下数字 1/2/4/5 不再参与数值输入，而是分别翻转水进、药进、
- *       水出、药出四个逻辑开关。其它动作键只更新当前动作提示文本。
- */
-static void MachineCMD_HandleManualKey(KeypadState_e key)
-{
-    if (key == KEYPAD_STATE_NUM_1)
-    {
-        MachineCMD_ToggleManualSwitch(MACHINE_CMD_MANUAL_WATER_IN);
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_IN;
-        return;
-    }
-
-    if (key == KEYPAD_STATE_NUM_2)
-    {
-        MachineCMD_ToggleManualSwitch(MACHINE_CMD_MANUAL_MED_IN);
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_IN;
-        return;
-    }
-
-    if (key == KEYPAD_STATE_NUM_4)
-    {
-        MachineCMD_ToggleManualSwitch(MACHINE_CMD_MANUAL_WATER_OUT);
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_OUT;
-        return;
-    }
-
-    if (key == KEYPAD_STATE_NUM_5)
-    {
-        MachineCMD_ToggleManualSwitch(MACHINE_CMD_MANUAL_MED_OUT);
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_OUT;
-        return;
-    }
-
-    if (MachineCMD_IsNumberKey(key) == 0U)
-    {
-        MachineCMD_SetManualAction(key);
-    }
-}
-
-/**
  * @brief 进入故障键调试模式。
  *
  * 仅允许在本地控制、业务流程停止且两个导轨和两个定量泵都空闲时进入，
@@ -1644,9 +1534,9 @@ static void MachineCMD_EnterDebugMode(void)
         return;
     }
 
-    MachineCMD_ClearManualSwitches();
+    SolenoidValve_AllOff();
+    WaterPump_StopAll();
     MachineCMD_ResetDebugState();
-    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_DEBUG);
 }
 
@@ -1656,13 +1546,13 @@ static void MachineCMD_EnterDebugMode(void)
 static void MachineCMD_ExitDebugMode(void)
 {
     MachineCMD_StopRemoteOutputs();
-    MachineCMD_ClearManualSwitches();
     MachineCMD_ResetDebugState();
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_STANDBY);
 }
 
 static void MachineCMD_ResetDebugState(void)
 {
+    machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_IDLE;
     machine_cmd.debug_state = MACHINE_CMD_DEBUG_STATE_IDLE;
     machine_cmd.debug_stepper = STEP_MOTOR_ID_NEEDLE_RAIL;
     machine_cmd.debug_pump = NULL;
@@ -1777,7 +1667,6 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
         else if (key == KEYPAD_STATE_CLEAR_ALL)
         {
             MachineCMD_ResetDebugState();
-            machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IDLE;
         }
         return;
     }
@@ -1790,22 +1679,22 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
     switch (key)
     {
     case KEYPAD_STATE_IN_TANK:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IN_TANK;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_TANK_FORWARD;
         started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_TANK_RAIL, STEP_MOTOR_DIR_PUSH);
         break;
 
     case KEYPAD_STATE_OUT_TANK:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_OUT_TANK;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_TANK_BACKWARD;
         started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_TANK_RAIL, STEP_MOTOR_DIR_PULL);
         break;
 
     case KEYPAD_STATE_INSERT_NEEDLE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_NEEDLE_FORWARD;
         started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_NEEDLE_RAIL, STEP_MOTOR_DIR_PUSH);
         break;
 
     case KEYPAD_STATE_RETRACT_NEEDLE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_NEEDLE_BACKWARD;
         started = MachineCMD_StartDebugJog(STEP_MOTOR_ID_NEEDLE_RAIL, STEP_MOTOR_DIR_PULL);
         break;
 
@@ -1825,22 +1714,22 @@ static void MachineCMD_HandleDebugKey(KeypadState_e key)
         return;
 
     case KEYPAD_STATE_NUM_1:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_IN;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_PUMP1_IN;
         started = MachineCMD_StartDebugPump(PumpDrive_GetPump1(), MACHINE_CMD_DEBUG_PUMP_IN);
         break;
 
     case KEYPAD_STATE_NUM_4:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_WATER_OUT;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_PUMP1_OUT;
         started = MachineCMD_StartDebugPump(PumpDrive_GetPump1(), MACHINE_CMD_DEBUG_PUMP_OUT);
         break;
 
     case KEYPAD_STATE_NUM_2:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_IN;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_PUMP2_IN;
         started = MachineCMD_StartDebugPump(PumpDrive_GetPump2(), MACHINE_CMD_DEBUG_PUMP_IN);
         break;
 
     case KEYPAD_STATE_NUM_5:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_MED_OUT;
+        machine_cmd.debug_action = MACHINE_CMD_DEBUG_ACTION_PUMP2_OUT;
         started = MachineCMD_StartDebugPump(PumpDrive_GetPump2(), MACHINE_CMD_DEBUG_PUMP_OUT);
         break;
 
@@ -1987,125 +1876,6 @@ static void MachineCMD_HandlePausedKey(KeypadState_e key)
 }
 
 /**
- * @brief 根据动作键更新手动调试页当前动作说明。
- *
- * @param key 当前动作按键。
- */
-static void MachineCMD_SetManualAction(KeypadState_e key)
-{
-    switch (key)
-    {
-    case KEYPAD_STATE_IN_TANK:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_IN_TANK;
-        break;
-
-    case KEYPAD_STATE_OUT_TANK:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_OUT_TANK;
-        break;
-
-    case KEYPAD_STATE_INSERT_NEEDLE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN;
-        break;
-
-    case KEYPAD_STATE_RETRACT_NEEDLE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT;
-        break;
-
-    case KEYPAD_STATE_DRAW_MEDICINE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_DRAW_MED;
-        break;
-
-    case KEYPAD_STATE_EXHAUST_FIXED:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_EXHAUST;
-        break;
-
-    case KEYPAD_STATE_REMOTE:
-        machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
-        break;
-
-    default:
-        break;
-    }
-}
-
-/**
- * @brief 翻转一个手动调试逻辑开关。
- *
- * @param switch_mask 要翻转的开关位，见 MACHINE_CMD_MANUAL_xxx。
- *
- * @note 每次开关变化后立即调用 MachineCMD_ApplyManualOutputs() 同步到底层输出模块。
- */
-static void MachineCMD_ToggleManualSwitch(uint8_t switch_mask)
-{
-    machine_cmd.manual_switches ^= switch_mask;
-
-    if ((switch_mask & MACHINE_CMD_MANUAL_WATER_MASK) != 0U)
-    {
-        if ((machine_cmd.manual_switches & switch_mask) != 0U)
-        {
-            machine_cmd.manual_switches &= (uint8_t)(~MACHINE_CMD_MANUAL_MED_MASK);
-        }
-    }
-    else if ((switch_mask & MACHINE_CMD_MANUAL_MED_MASK) != 0U)
-    {
-        if ((machine_cmd.manual_switches & switch_mask) != 0U)
-        {
-            machine_cmd.manual_switches &= (uint8_t)(~MACHINE_CMD_MANUAL_WATER_MASK);
-        }
-    }
-
-    MachineCMD_ApplyManualOutputs();
-}
-
-/**
- * @brief 关闭所有手动调试逻辑开关。
- *
- * @note 复位退出手动页时调用，确保阀门和泵不会保持上一次手动输出状态。
- */
-static void MachineCMD_ClearManualSwitches(void)
-{
-    machine_cmd.manual_switches = 0U;
-    SolenoidValve_AllOff();
-    WaterPump_StopAll();
-}
-
-/**
- * @brief 将手动调试逻辑开关同步到底层阀门和抽水泵。
- *
- * @note LCD 页面和按键处理只关心“水进/药进/水出/药出”，不再直接依赖具体引脚。
- */
-static void MachineCMD_ApplyManualOutputs(void)
-{
-    uint8_t water_valve_on;
-    uint8_t med_valve_on;
-    uint8_t pump_on;
-
-    /*
-     * 三路已确认硬件输出映射：
-     * - 水进/水出打开水路阀；
-     * - 药进/药出打开药路阀；
-     * - 水出/药出打开抽水泵。
-     *
-     * “进”方向目前只作为阀门开关，不额外打开泵，避免没有方向控制时误动作。
-     */
-    water_valve_on = ((machine_cmd.manual_switches & MACHINE_CMD_MANUAL_WATER_MASK) != 0U) ? 1U : 0U;
-    med_valve_on = ((machine_cmd.manual_switches & MACHINE_CMD_MANUAL_MED_MASK) != 0U) ? 1U : 0U;
-    pump_on = ((machine_cmd.manual_switches &
-                (MACHINE_CMD_MANUAL_WATER_OUT | MACHINE_CMD_MANUAL_MED_OUT)) != 0U) ? 1U : 0U;
-
-    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_WATER,
-                                 water_valve_on ?
-                                 SOLENOID_VALVE_STATE_ON_NC_OPEN :
-                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
-    (void)SolenoidValve_SetState(SOLENOID_VALVE_ID_MED,
-                                 med_valve_on ?
-                                 SOLENOID_VALVE_STATE_ON_NC_OPEN :
-                                 SOLENOID_VALVE_STATE_OFF_NO_OPEN);
-    (void)WaterPump_SetState(WATER_PUMP_ID_MAIN,
-                             pump_on ? WATER_PUMP_STATE_ON : WATER_PUMP_STATE_OFF);
-}
-
-/**
  * @brief 暂停当前运行提示页。
  *
  * @note 暂停必须先让所有已知执行器停到安全状态，再切换 UI 页面。
@@ -2114,7 +1884,6 @@ static void MachineCMD_ApplyManualOutputs(void)
 static void MachineCMD_PauseCurrentFlow(void)
 {
     machine_cmd.paused_page = machine_cmd.page;
-    MachineCMD_ClearManualSwitches();
     MachineCMD_StopRemoteOutputs();
     MachineCMD_EnterPage(MACHINE_CMD_PAGE_PAUSED);
 }
@@ -2156,20 +1925,18 @@ static void MachineCMD_HandleRemoteKey(KeypadState_e key)
 /**
  * @brief 从本机待机页进入上位机远控接管模式。
  *
- * @note 进入远控时先清掉本机输入事件和手动输出，再交给上位机。
+ * @note 进入远控时先清掉本机输入事件并停止当前输出，再交给上位机。
  *       这样可以避免用户刚才在配药/发药页留下的确认事件继续被 machine 层消费。
  */
 static void MachineCMD_EnterRemoteMode(void)
 {
     MachineCMD_ClearInput();
-    MachineCMD_ClearManualSwitches();
     MachineCMD_StopRemoteOutputs();
 
     machine_cmd.prep_confirmed = 0U;
     machine_cmd.dispense_confirmed = 0U;
     machine_cmd.dispense_input_error = 0U;
     machine_cmd.prep_focus = MACHINE_CMD_PREP_FOCUS_CURRENT_CONC;
-    machine_cmd.manual_action = MACHINE_CMD_MANUAL_ACTION_REMOTE;
     Communication_OnLocalRemoteKey();
     MachineCMD_SyncRemoteState();
 
@@ -3483,25 +3250,6 @@ static uint8_t MachineCMD_LineAppendString(uint8_t *line, uint8_t offset, const 
 }
 
 /**
- * @brief 向行缓冲追加一个开关状态。
- *
- * @param line 目标行缓冲。
- * @param offset 当前写入偏移。
- * @param switch_mask 手动调试开关位。
- * @return 追加后的偏移。
- */
-static uint8_t MachineCMD_LineAppendSwitchState(uint8_t *line, uint8_t offset, uint8_t switch_mask)
-{
-    const MachineCmdText_s *state_text;
-
-    state_text = ((machine_cmd.manual_switches & switch_mask) != 0U) ?
-                 &machine_cmd_text_on :
-                 &machine_cmd_text_off;
-
-    return MachineCMD_LineAppendText(line, offset, state_text);
-}
-
-/**
  * @brief 把活度值转换成 LCD 可显示的 ASCII 文本。
  *
  * @param buffer 输出缓冲区。
@@ -3563,41 +3311,6 @@ static void MachineCMD_WriteText(DisplayLcdRow_e row, const MachineCmdText_s *te
     }
 
     MachineCMD_WriteBytes(row, text->data, text->len);
-}
-
-/**
- * @brief 获取手动动作键对应的提示文案。
- *
- * @return 当前动作键文案；NULL 表示当前是数字开关动作或空闲。
- *
- * @note 手动页的主体已经用中文显示四个开关状态。
- *       这里仅用于动作键反馈，避免按【进罐】【插针】这类键时 LCD 看起来没有变化。
- */
-static const MachineCmdText_s *MachineCMD_GetManualActionText(void)
-{
-    switch (machine_cmd.manual_action)
-    {
-    case MACHINE_CMD_MANUAL_ACTION_IN_TANK:
-        return &machine_cmd_text_in_tank;
-
-    case MACHINE_CMD_MANUAL_ACTION_OUT_TANK:
-        return &machine_cmd_text_out_tank;
-
-    case MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN:
-        return &machine_cmd_text_needle_in;
-
-    case MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT:
-        return &machine_cmd_text_needle_out;
-
-    case MACHINE_CMD_MANUAL_ACTION_DRAW_MED:
-        return &machine_cmd_text_draw_med;
-
-    case MACHINE_CMD_MANUAL_ACTION_EXHAUST:
-        return &machine_cmd_text_exhaust;
-
-    default:
-        return NULL;
-    }
 }
 
 /**
@@ -4085,52 +3798,6 @@ static void MachineCMD_ShowRemotePage(void)
 }
 
 /**
- * @brief 显示手动调试页。
- *
- * @note 直接显示四个手动开关的中文开/关状态。
- *       按 1/2/4/5 翻转后，下一轮刷新会立即反映到对应项目。
- */
-static void MachineCMD_ShowManualPage(void)
-{
-    uint8_t line[MACHINE_CMD_LCD_LINE_BYTES];
-    uint8_t offset;
-    const MachineCmdText_s *action_text;
-
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_1, &machine_cmd_text_manual);
-
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_water_in);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
-    offset = MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_WATER_IN);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_med_in);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
-    (void)MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_MED_IN);
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_2, line, sizeof(line));
-
-    memset(line, ' ', sizeof(line));
-    offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_water_out);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
-    offset = MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_WATER_OUT);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_med_out);
-    offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
-    (void)MachineCMD_LineAppendSwitchState(line, offset, MACHINE_CMD_MANUAL_MED_OUT);
-    MachineCMD_WriteBytes(DISPLAY_LCD_ROW_3, line, sizeof(line));
-
-    action_text = MachineCMD_GetManualActionText();
-    if (action_text != NULL)
-    {
-        memset(line, ' ', sizeof(line));
-        offset = MachineCMD_LineAppendText(line, 0U, &machine_cmd_text_last);
-        offset = MachineCMD_LineAppendText(line, offset, &machine_cmd_text_full_colon);
-        (void)MachineCMD_LineAppendText(line, offset, action_text);
-        MachineCMD_WriteBytes(DISPLAY_LCD_ROW_4, line, sizeof(line));
-        return;
-    }
-
-    MachineCMD_WriteText(DISPLAY_LCD_ROW_4, &machine_cmd_text_manual_switch_hint);
-}
-
-/**
  * @brief 显示故障键调试模式及当前动作状态。
  */
 static void MachineCMD_ShowDebugPage(void)
@@ -4175,37 +3842,37 @@ static void MachineCMD_ShowDebugPage(void)
     }
     else
     {
-        switch (machine_cmd.manual_action)
+        switch (machine_cmd.debug_action)
         {
-        case MACHINE_CMD_MANUAL_ACTION_IN_TANK:
+        case MACHINE_CMD_DEBUG_ACTION_TANK_FORWARD:
             action_text = &machine_cmd_text_debug_tank_forward;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_OUT_TANK:
+        case MACHINE_CMD_DEBUG_ACTION_TANK_BACKWARD:
             action_text = &machine_cmd_text_debug_tank_backward;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_NEEDLE_IN:
+        case MACHINE_CMD_DEBUG_ACTION_NEEDLE_FORWARD:
             action_text = &machine_cmd_text_debug_needle_forward;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_NEEDLE_OUT:
+        case MACHINE_CMD_DEBUG_ACTION_NEEDLE_BACKWARD:
             action_text = &machine_cmd_text_debug_needle_backward;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_WATER_IN:
+        case MACHINE_CMD_DEBUG_ACTION_PUMP1_IN:
             action_text = &machine_cmd_text_debug_water_in;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_WATER_OUT:
+        case MACHINE_CMD_DEBUG_ACTION_PUMP1_OUT:
             action_text = &machine_cmd_text_debug_water_out;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_MED_IN:
+        case MACHINE_CMD_DEBUG_ACTION_PUMP2_IN:
             action_text = &machine_cmd_text_debug_med_in;
             break;
 
-        case MACHINE_CMD_MANUAL_ACTION_MED_OUT:
+        case MACHINE_CMD_DEBUG_ACTION_PUMP2_OUT:
             action_text = &machine_cmd_text_debug_med_out;
             break;
 

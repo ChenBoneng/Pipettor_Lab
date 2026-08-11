@@ -24,7 +24,6 @@ typedef enum
     MACHINE_CMD_PAGE_DISP_SETTING,   // 发药参数输入页
     MACHINE_CMD_PAGE_DISP_RUNNING,   // 发药运行提示页
     MACHINE_CMD_PAGE_REMOTE,         // 上位机远控接管页
-    MACHINE_CMD_PAGE_MANUAL,         // 手动调试页
     MACHINE_CMD_PAGE_DEBUG,          // 故障键进入的设备调试页
     MACHINE_CMD_PAGE_CLEAN,          // 自动清洗页
     MACHINE_CMD_PAGE_PAUSED,         // 流程暂停页
@@ -52,21 +51,7 @@ typedef enum
     MACHINE_CMD_PREP_RUN_STAGE_ABORTING            /**< 正在中止并等待收尾动作。 */
 } MachineCmdPrepRunStage_e;
 
-/**
- * @brief 手动调试开关位。
- *
- * 数字键在手动调试页不再作为数值输入，而是作为独立动作开关：
- * - 数字 1：水进；
- * - 数字 2：药进；
- * - 数字 4：水出；
- * - 数字 5：药出。
- */
-#define MACHINE_CMD_MANUAL_WATER_IN   (1U << 0)
-#define MACHINE_CMD_MANUAL_MED_IN     (1U << 1)
-#define MACHINE_CMD_MANUAL_WATER_OUT  (1U << 2)
-#define MACHINE_CMD_MANUAL_MED_OUT    (1U << 3)
-
-// 初始化按键/LCD 命令层状态，并关闭手动输出。
+// 初始化按键/LCD 命令层状态。
 void MachineCMD_Init(void);
 
 // 处理按键事件和页面状态，建议放在 MachineTask() 中周期调用。
@@ -77,9 +62,6 @@ void MachineCMD_LCDTask(void);
 
 // 读取当前 LCD 页面，便于业务层判断当前交互状态。
 MachineCmdPage_e MachineCMD_GetPage(void);
-
-// 读取当前手动调试开关位。
-uint8_t MachineCMD_GetManualSwitches(void);
 
 // 判断当前是否处于上位机远控接管模式。
 uint8_t MachineCMD_IsRemoteMode(void);
