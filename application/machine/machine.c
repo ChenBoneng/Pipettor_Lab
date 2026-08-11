@@ -156,6 +156,13 @@ typedef enum
     MACHINE_STARTUP_HOME_ERROR
 } MachineStartupHomeState_e;
 
+typedef enum
+{
+    MACHINE_MOTOR_RESET_IDLE = 0,
+    MACHINE_MOTOR_RESET_NEEDLE,
+    MACHINE_MOTOR_RESET_TANK
+} MachineMotorResetState_e;
+
 static MachineComboState_e machine_combo_state = MACHINE_COMBO_STATE_IDLE;
 static uint32_t machine_combo_state_start_ms = 0U;
 static uint8_t machine_combo_running = 0U;
@@ -227,11 +234,14 @@ static uint32_t machine_startup_home_axis_start_ms = 0U;
 static uint8_t machine_startup_home_initialized = 0U;
 static uint8_t machine_startup_home_complete = 0U;
 static uint8_t machine_startup_home_failed = 0U;
+static MachineMotorResetState_e machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+static uint8_t machine_motor_reset_running = 0U;
 
 static uint32_t Machine_GetMs(void);
 static void Machine_EnterStartupHomeState(MachineStartupHomeState_e next_state);
 static void Machine_FailStartupHome(void);
 static void Machine_UpdateStartupHome(void);
+static void Machine_UpdateMotorReset(void);
 static uint32_t Machine_GetPrepCapacityUl(void);
 static uint16_t Machine_GetPrepCapacityMlX100(void);
 static uint32_t Machine_SubtractVolumeUl(uint32_t volume_ul, uint32_t subtract_ul);
@@ -987,14 +997,13 @@ static uint8_t Machine_IsActivityWaitReadyForCombo(MachineActivityWaitResult_e r
  */
 static void Machine_NotifyFlowStarted(MachineFlowOwner_e owner)
 {
-    Communication_SetSystemState(COMMUNICATION_SYS_RUNNING);
     if (owner == MACHINE_FLOW_OWNER_REMOTE)
     {
+        Communication_OnRemoteFlowStarted();
         machine_remote_hold_step = COMMUNICATION_STEP_IDLE;
         machine_remote_hold_until_ms = 0U;
     }
-
-    if (owner == MACHINE_FLOW_OWNER_LOCAL)
+    else
     {
         Communication_OnLocalFlowStarted();
     }
@@ -1018,7 +1027,7 @@ static void Machine_NotifyFlowStopped(MachineFlowOwner_e owner, uint8_t step)
     }
     else
     {
-        Communication_SetSystemState(COMMUNICATION_SYS_IDLE);
+        Communication_OnRemoteFlowStopped();
     }
 
     if ((owner == MACHINE_FLOW_OWNER_REMOTE) &&
@@ -2641,6 +2650,9 @@ static void Machine_AbortDirectDispense(void)
  */
 void Machine_EmergencyStop(void)
 {
+    machine_motor_reset_running = 0U;
+    machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+
     if (machine_combo_running != 0U)
     {
         Machine_AbortCombo();
@@ -2665,6 +2677,69 @@ void Machine_ResetRuntimeState(void)
     Machine_StopComboOutputs();
     Machine_StopDispensePumpOutput();
     MachineInit();
+}
+
+uint8_t Machine_StartMotorReset(void)
+{
+    if (machine_motor_reset_running != 0U)
+    {
+        return 1U;
+    }
+
+    if ((machine_startup_home_complete == 0U) ||
+        (machine_combo_running != 0U) ||
+        (machine_direct_dispense_running != 0U))
+    {
+        return 0U;
+    }
+
+    StepMotor_StopAll();
+    machine_motor_reset_running = 1U;
+    machine_motor_reset_state = MACHINE_MOTOR_RESET_NEEDLE;
+
+    if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_NEEDLE_RAIL,
+                                      0U,
+                                      MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
+    {
+        machine_motor_reset_running = 0U;
+        machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+        return 0U;
+    }
+
+    return 1U;
+}
+
+static void Machine_UpdateMotorReset(void)
+{
+    if (machine_motor_reset_running == 0U)
+    {
+        return;
+    }
+
+    if (machine_motor_reset_state == MACHINE_MOTOR_RESET_NEEDLE)
+    {
+        if (StepMotor_IsBusy(STEP_MOTOR_ID_NEEDLE_RAIL) != 0U)
+        {
+            return;
+        }
+
+        machine_motor_reset_state = MACHINE_MOTOR_RESET_TANK;
+        if (StepMotor_RunToPositionMmX100(STEP_MOTOR_ID_TANK_RAIL,
+                                          0U,
+                                          MACHINE_COMBO_STEP_SPEED_MM_S_X100) == 0U)
+        {
+            machine_motor_reset_running = 0U;
+            machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+        }
+        return;
+    }
+
+    if ((machine_motor_reset_state == MACHINE_MOTOR_RESET_TANK) &&
+        (StepMotor_IsBusy(STEP_MOTOR_ID_TANK_RAIL) == 0U))
+    {
+        machine_motor_reset_running = 0U;
+        machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+    }
 }
 
 void Machine_ClearRemoteStepHold(void)
@@ -2945,6 +3020,8 @@ void MachineInit(void)
     machine_transfer_done = 0U;
     machine_activity_wait_active = 0U;
     machine_activity_wait_started = 0U;
+    machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+    machine_motor_reset_running = 0U;
 
     Machine_UseDefaultPipeVolumes();
     Machine_StopComboOutputs();
@@ -2986,6 +3063,14 @@ void MachineControl(void)
         }
 
         Machine_StopComboOutputs();
+        machine_motor_reset_running = 0U;
+        machine_motor_reset_state = MACHINE_MOTOR_RESET_IDLE;
+        return;
+    }
+
+    if (machine_motor_reset_running != 0U)
+    {
+        Machine_UpdateMotorReset();
         return;
     }
 
@@ -3612,5 +3697,6 @@ uint8_t Machine_IsFlowRunning(void)
 {
     return (((machine_combo_running != 0U) &&
              (machine_combo_state != MACHINE_COMBO_STATE_WAIT_REMOTE_PREPARE)) ||
-            (machine_direct_dispense_running != 0U)) ? 1U : 0U;
+            (machine_direct_dispense_running != 0U) ||
+            (machine_motor_reset_running != 0U)) ? 1U : 0U;
 }

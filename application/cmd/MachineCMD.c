@@ -2342,6 +2342,7 @@ static void MachineCMD_ExecuteRemoteCommand(const CommunicationHostCommand_s *co
         machine_cmd.activity_request_pending = 0U;
         machine_cmd.activity_request_started = 0U;
         Communication_OnRemoteResetError();
+        (void)Machine_StartMotorReset();
         MachineCMD_SyncRemoteState();
         machine_cmd.remote_paused = 0U;
         MachineCMD_EnterPage(MACHINE_CMD_PAGE_REMOTE);
@@ -4038,6 +4039,19 @@ static void MachineCMD_ShowRemotePage(void)
     {
         MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_remote_switching);
         MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_host);
+    }
+    else if ((mode == COMMUNICATION_CONTROL_REMOTE) &&
+             (Communication_IsUnlocked() == 0U))
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_auth);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, &machine_cmd_text_wait_host);
+    }
+    else if ((mode == COMMUNICATION_CONTROL_REMOTE) &&
+             (control != NULL) &&
+             (control->pc_connected == 0U))
+    {
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_2, &machine_cmd_text_wait_host);
+        MachineCMD_WriteText(DISPLAY_LCD_ROW_3, NULL);
     }
     else if (mode == COMMUNICATION_CONTROL_REMOTE)
     {

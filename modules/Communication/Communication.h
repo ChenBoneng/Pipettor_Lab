@@ -77,7 +77,7 @@
 /** 下位机 -> 上位机：控制权事件。 */
 #define COMMUNICATION_CAN_ID_CONTROL_EVENT       0x184U
 
-/** 上位机在线判定超时时间，超过该时间未收到有效帧则暂停远控。 */
+/** 上位机在线判定超时；超时后拒绝新命令，但不打断已经开始的完整流程。 */
 #define COMMUNICATION_PC_ONLINE_TIMEOUT_MS       3000U
 
 /** 本地下位机申请远控后等待 0x103 响应的超时时间。 */
@@ -462,6 +462,7 @@ typedef struct
     uint8_t pc_authorized;            /**< 当前板卡授权是否有效。 */
     uint8_t local_takeover_latched;   /**< 本地接管锁存。 */
     uint8_t local_flow_running;       /**< 本地流程运行中。 */
+    uint8_t remote_flow_running;      /**< 已接受的完整远程流程运行中。 */
     uint8_t alarm_active;             /**< 普通报警有效。 */
     uint8_t estop_active;             /**< 急停有效。 */
     uint8_t sys_state;                /**< 对外系统状态。 */
@@ -711,6 +712,12 @@ void Communication_OnLocalFlowStarted(void);
 
 /** 通知通信层本地流程已经结束。 */
 void Communication_OnLocalFlowStopped(void);
+
+/** 通知通信层完整远程流程已经开始，掉线时允许该流程执行完。 */
+void Communication_OnRemoteFlowStarted(void);
+
+/** 通知通信层完整远程流程已经结束。 */
+void Communication_OnRemoteFlowStopped(void);
 
 /** 同步普通报警状态。 */
 void Communication_OnAlarmChanged(uint8_t active);

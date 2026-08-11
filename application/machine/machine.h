@@ -14,6 +14,9 @@ uint8_t Machine_IsStartupHomeFailed(void);
 void Machine_EmergencyStop(void);
 void Machine_ResetRuntimeState(void);
 
+/* 按软件记录的当前位置依次将插针导轨、进罐导轨退回 0，不执行系统复位。 */
+uint8_t Machine_StartMotorReset(void);
+
 /* 清除远控流程结束/失败后的短暂步骤保持，用于上位机复位后立即回到 IDLE 步骤。 */
 void Machine_ClearRemoteStepHold(void);
 

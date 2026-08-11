@@ -214,10 +214,7 @@ void Communication_Process(void)
     if ((communication_auth.state == COMMUNICATION_AUTH_UNLOCKED) &&
         ((uint32_t)(now - communication_auth.last_heartbeat) > COMMUNICATION_SESSION_TIMEOUT_MS))
     {
-        /*
-         * 授权心跳超时只撤销动作资格。若此时处于 REMOTE，
-         * 控制权状态机会进一步转入 REMOTE_PAUSED 并要求业务层停机。
-         */
+        /* 授权失效后拒绝新命令；已经开始的完整流程仍按断线策略执行完。 */
         communication_auth.state = COMMUNICATION_AUTH_LOCKED;
         Communication_SyncAuthState();
     }
@@ -226,19 +223,15 @@ void Communication_Process(void)
         ((uint32_t)(now - communication_control.last_remote_frame_tick) >
          COMMUNICATION_PC_ONLINE_TIMEOUT_MS))
     {
-        communication_control.pc_connected = 0U;
         /*
-         * 新版控制调度把“在线状态”和“授权状态”分开处理。
-         * REMOTE 下 3 秒没有任何有效上位机帧时，必须撤销动作权限并进入
-         * REMOTE_PAUSED；即使当前没有输出，也不能继续让上位机按钮显示为可动作。
+         * 掉线关闭新命令入口但不改变 REMOTE 控制权。
+         * 已经开始的完整流程继续运行到自身结束；没有完整流程时仍关闭可能锁存的直控输出。
          */
-        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+        communication_control.pc_connected = 0U;
+        if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) &&
+            (communication_control.remote_flow_running == 0U))
         {
-            communication_control.remote_resume_allowed = 0U;
-            communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
             Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
-            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
-                                         COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
         }
     }
 
@@ -725,6 +718,22 @@ void Communication_OnLocalFlowStarted(void)
 void Communication_OnLocalFlowStopped(void)
 {
     communication_control.local_flow_running = 0U;
+    if ((communication_control.alarm_active == 0U) &&
+        (communication_control.estop_active == 0U))
+    {
+        communication_control.sys_state = COMMUNICATION_SYS_IDLE;
+    }
+}
+
+void Communication_OnRemoteFlowStarted(void)
+{
+    communication_control.remote_flow_running = 1U;
+    communication_control.sys_state = COMMUNICATION_SYS_RUNNING;
+}
+
+void Communication_OnRemoteFlowStopped(void)
+{
+    communication_control.remote_flow_running = 0U;
     if ((communication_control.alarm_active == 0U) &&
         (communication_control.estop_active == 0U))
     {
@@ -1460,17 +1469,14 @@ static void Communication_SyncAuthState(void)
     if (communication_control.pc_authorized == 0U)
     {
         communication_control.remote_resume_allowed = 0U;
-        if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE)
+        /*
+         * REMOTE 下授权失效只拒绝后续动作命令，不改变控制权或打断已开始流程。
+         * 上位机重新完成授权后可直接继续发送下一条命令。
+         */
+        if ((communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE) &&
+            (communication_control.remote_flow_running == 0U))
         {
-            /*
-             * 授权失效只撤销上位机动作资格，不等于本地已经接管。
-             * 按新版调度文档，REMOTE 下授权丢失统一进入不可直接恢复的
-             * REMOTE_PAUSED，等待重新授权或本地复位接管。
-             */
-            communication_control.sys_state = COMMUNICATION_SYS_PAUSED;
             Communication_RequestSafetyAction(COMMUNICATION_SAFETY_ACTION_PAUSE_REMOTE);
-            Communication_SetControlMode(COMMUNICATION_CONTROL_REMOTE_PAUSED,
-                                         COMMUNICATION_CONTROL_REASON_HEARTBEAT_TIMEOUT);
         }
         else if (communication_control.control_mode == COMMUNICATION_CONTROL_REMOTE_SWITCHING)
         {
