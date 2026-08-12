@@ -162,8 +162,8 @@ uint8_t StepMotor_RunDebugSteps(StepMotorId_e motor,
  * @param distance_mm_x100 目标距离，单位 0.01mm。比如 3000 表示 30.00mm。
  * @return 换算后的脉冲数。
  *
- * @note 当前换算基于丝杆数据：驱动器细分 1600 脉冲/圈，丝杆导程 4mm/圈，
- *       因此 1mm = 400 个脉冲，30mm = 12000 个脉冲。
+ * @note 当前换算基于丝杆数据：驱动器细分 400 脉冲/圈，丝杆导程 4mm/圈，
+ *       因此 1mm = 100 个脉冲，30mm = 3000 个脉冲。
  */
 uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100);
 
@@ -173,8 +173,8 @@ uint32_t StepMotor_MmX100ToSteps(uint32_t distance_mm_x100);
  * @param speed_mm_s_x100 目标速度，单位 0.01mm/s。比如 357 表示 3.57mm/s。
  * @return 换算后的 PPS，即每秒需要输出的脉冲数。
  *
- * @note 当前换算基于丝杆数据：驱动器细分 1600 脉冲/圈，丝杆导程 4mm/圈，
- *       因此 1mm/s = 400 PPS。
+ * @note 当前换算基于丝杆数据：驱动器细分 400 脉冲/圈，丝杆导程 4mm/圈，
+ *       因此 1mm/s = 100 PPS。
  */
 uint32_t StepMotor_MmPerSecX100ToPps(uint32_t speed_mm_s_x100);
 

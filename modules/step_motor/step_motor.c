@@ -36,17 +36,17 @@
  * 丝杆位移换算参数。
  *
  * 已确认机械数据：
- * - 驱动器细分数：1600 脉冲/圈；
+ * - 驱动器细分数：400 脉冲/圈；
  * - 丝杆导程：4mm/圈，也就是电机转 1 圈滑台移动 4mm；
  * - 插针导轨（电机A）所在滑台有效行程：150mm；
  * - 进罐导轨（电机B）所在滑台有效行程：300mm。
  *
  * 因此：
- * - 脉冲/毫米 = 1600 / 4 = 400 pulse/mm；
- * - 30mm 位移 = 30 * 400 = 12000 pulse；
+ * - 脉冲/毫米 = 400 / 4 = 100 pulse/mm；
+ * - 30mm 位移 = 30 * 100 = 3000 pulse；
  * - 应用层不直接使用浮点数，而是统一换算到 um 后用整数计算。
  */
-#define STEP_MOTOR_DRIVER_MICROSTEP_PPR     1600UL
+#define STEP_MOTOR_DRIVER_MICROSTEP_PPR     400UL
 #define STEP_MOTOR_SCREW_LEAD_UM            4000UL
 #define STEP_MOTOR_A_TRAVEL_UM              150000UL
 #define STEP_MOTOR_B_TRAVEL_UM              300000UL
@@ -392,7 +392,7 @@ static uint8_t StepMotor_CalcTargetPosition(StepMotorId_e motor,
  * @param distance_um 目标距离，单位 um。
  * @return 换算后的脉冲数。
  *
- * @note 公式：steps = distance_um * 1600 / 4000。
+ * @note 公式：steps = distance_um * 400 / 4000。
  *       这里加上除数的一半做四舍五入，减少整数截断误差。
  */
 static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
@@ -411,7 +411,7 @@ static uint32_t StepMotor_UmToSteps(uint32_t distance_um)
  * @param steps 脉冲数。
  * @return 四舍五入后的距离，单位 um。
  *
- * @note 公式：distance_um = steps * 4000 / 1600。
+ * @note 公式：distance_um = steps * 4000 / 400。
  */
 static uint32_t StepMotor_StepsToUm(uint32_t steps)
 {
@@ -429,7 +429,7 @@ static uint32_t StepMotor_StepsToUm(uint32_t steps)
  * @param speed_um_s 目标速度，单位 um/s。
  * @return 换算后的 PPS。
  *
- * @note 公式：pps = speed_um_s * 1600 / 4000。
+ * @note 公式：pps = speed_um_s * 400 / 4000。
  */
 static uint32_t StepMotor_UmPerSecToPps(uint32_t speed_um_s)
 {
